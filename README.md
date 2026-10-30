@@ -189,7 +189,7 @@ If card numbers only ever exist inside one tiny, purpose-built service, then onl
 |---|---|---|
 | **Audit effort** | Every service, database, queue, log pipeline, CI/CD runner and admin path is assessed | One service, its database, KMS and secrets |
 | **Engineering speed** | Change control, segregation of duties and evidence collection for every team | Most teams ship normally; only vault changes need the strict process |
-| **Attack surface** | Hundreds of components, any of which can leak a card number | One Go file (about 4,000 lines) and four SQL functions, which stays the same size as providers are added |
+| **Attack surface** | Hundreds of components, any of which can leak a card number | One Go package (about 4,000 lines) and four SQL functions, which stays the same size as providers are added |
 | **Breach impact** | Platform compromise means a card breach and forensic investigation | Platform compromise exposes tokens, which are useless outside the vault |
 | **Logging and observability** | Logs must be scrubbed or treated as card data | Logs are free of card data by construction |
 | **Third-party tools** | APM, error trackers and analytics all risk receiving card numbers | No card number reaches them |
@@ -544,8 +544,8 @@ Security code that is easy to read is easier to trust.
 
 Each decision below gives the choice, the reason, and the trade-off we accepted.
 
-**One Go file (`main.go`), no packages.**
-*Why:* a reviewer or auditor can read the whole service top to bottom, and nothing hides in a corner of a package tree. *Trade-off:* a long file, and some repetition. Repetition is preferred over abstraction because abstraction hides behaviour.
+**One Go package, a handful of files, no sub-packages.**
+*Why:* a reviewer or auditor can still read the whole service top to bottom, and nothing hides in a corner of a package tree: it is one `package main` at the repo root. The files are split by responsibility so the security core (`scan.go`, `policy.go`, `render.go`, `catalog.go`) can be audited on its own, without paging through boot and HTTP plumbing. The split adds no abstraction: no exported APIs, interfaces or generics, and any file can use anything in the package, exactly as when it was one file. *Trade-off:* a reader jumps between files instead of scrolling one, and file boundaries are a convention, not a compiler-enforced wall. There is still some repetition. Repetition is preferred over abstraction because abstraction hides behaviour.
 
 **Standard library plus exactly one dependency (pgx, the Postgres driver).**
 *Why:* every third-party module is supply-chain risk inside the CDE. There is no HTTP framework, logging library, ORM or cloud SDK. Google APIs are called with plain `net/http`. *Enforced by:* `make deps-check` (go.mod and a go.sum baseline) and `make vendor-check` (the vendored code must match the official module byte for byte). *Trade-off:* a little more code for KMS and Secret Manager calls.
@@ -760,12 +760,29 @@ The first catalog ships Stripe only (see [§6.4](#64-the-current-catalog)). Adye
 1. **Edit `catalog.json`.** This is a data-only change. If the request shape needs something the rule format doesn't have (a new body format, signer or placeholder), stop: that is a code change with its own design review.
 2. **Create the secret in Secret Manager** in the account's environment project, under the resource name the catalog gives. For local dev, set its `VAULT_DEV_SECRET_<ACCOUNT>_<NAME>` variable.
 3. **Update the egress host list.** `egress-hosts.dev.txt` and `egress-hosts.prod.txt` must list exactly that environment's account hosts (`TestEgressHostsMatchCatalog` checks this), and the matching egress firewall rule must allow only that provider's published IP ranges.
-4. **Add an example request** for every new endpoint to `embeddedFixtures` in `main_test.go`. If the change introduces a new shape, also add it to the synthetic test catalog (`testCatalogJSON`) and its tests.
+4. **Add an example request** for every new endpoint to `embeddedFixtures` in `catalog_test.go`. If the change introduces a new shape, also add it to the synthetic test catalog (`testCatalogJSON`) and its tests.
 5. **Fill in the review checklist** in the pull request description (it lives in `CLAUDE.md`, "Catalog changes"). The description must link the provider document showing that each card endpoint charges or creates a single-use token, never one that stores the card. It must also list every card-saving or reuse flag the endpoint has, and the `forbid` entry covering each one.
 
 #### 11.3 Repository layout
 
-`main.go` (the whole service), `main_test.go`, `catalog.json` (providers and accounts, compiled in), `egress-hosts.dev.txt` / `egress-hosts.prod.txt` (egress hosts per environment, checked against the catalog), `schema.sql` (tables, functions and roles, applied by CI as `vault_owner`), `Makefile`, `Dockerfile`, `deps-baseline.txt`, `vendor/`, `CLAUDE.md` (rules for AI coding agents, including the catalog review checklist and the known limitations), `docs/superpowers/specs/` (design documents).
+The service is one Go package (`package main`) at the repo root:
+
+- `main.go`: configuration, dev variables, database pool, DEK loading and rotation, secrets, client CA, listeners, `main()`.
+- `gcp.go`: metadata access token, KMS encrypt/decrypt and Secret Manager, over plain REST.
+- `card.go`: card validation, encryption, token format, and the in-memory CVV cache.
+- `vault.go`: vault state, logging, the request guard, error bodies.
+- `tokenize.go`: session tokens and the public `POST /tokenize` with CORS.
+- `scan.go`: the placeholder vocabulary and the strict JSON and form scanners.
+- `catalog.go`: the embedded `catalog.json` and its parser.
+- `policy.go`: the `/proxy` request checks.
+- `render.go`: filling placeholders, header templates, signers and the account URL.
+- `outbound.go`: the outbound provider client and PAN masking in provider responses.
+- `proxy.go`: the internal `POST /proxy` and `GET /healthz`.
+- `db.go`: calls to the four SQL functions.
+
+Tests sit next to the code in matching `*_test.go` files (`boot_test.go` covers `main.go` and `gcp.go`; `integration_test.go` holds the database, end-to-end and Stripe tests). Shared test helpers and the leak-scanning `TestMain` are in `helpers_test.go`.
+
+Other files: `catalog.json` (providers and accounts, compiled in), `egress-hosts.dev.txt` / `egress-hosts.prod.txt` (egress hosts per environment, checked against the catalog), `schema.sql` (tables, functions and roles, applied by CI as `vault_owner`), `Makefile`, `Dockerfile`, `deps-baseline.txt`, `vendor/`, `CLAUDE.md` (rules for AI coding agents, including the catalog review checklist and the known limitations), `docs/superpowers/specs/` (design documents).
 
 ---
 

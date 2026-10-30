@@ -11,8 +11,8 @@ You are implementing spec/original.md. Read it fully before writing code. These 
 - **Rollback bypass of the audit row (accepted 2026-10-30).** `access_log` rows are written inside the caller's transaction. A holder of the `vault_app` DB role can call `get_card` in an explicit transaction and roll it back. The ciphertext is still returned, but the audit row and its velocity count disappear, so that role holder bypasses the velocity limits. pgaudit (`pgaudit.log='function'`) still logs every call, whether or not it is rolled back. The vault itself only makes single-statement autocommit calls, so it cannot trigger this. The fix, an autonomous write (`dblink`), is planned for v1.1. Do not edit `schema.sql` for this: it must stay byte-identical to spec §7.
 
 ## Structure
-- ALL application code goes in `main.go`. Do not create packages, subdirectories, or additional .go files other than `main_test.go`.
-- Do not introduce interfaces, generics, or abstractions to "clean up" the file. Repetition is acceptable; indirection is not.
+- All code is one Go package (`package main`) at the repo root, split into files by responsibility (see README §11). No sub-packages, subdirectories, exported APIs, interfaces or generics. Tests live in matching `*_test.go` files; shared test helpers and the leak-scan `TestMain` are in `helpers_test.go`.
+- Do not introduce interfaces, generics, or abstractions to "clean up" the code. Repetition is acceptable; indirection is not.
 - `schema.sql` is the only SQL. The Go code calls `vault.put_card`, `vault.get_card`, `vault.list_deks`, `vault.add_dek` and nothing else. No table names appear in Go.
 - Code comments explain behaviour and reasons; they never reference the spec, its section numbers, the design or plan documents.
 
@@ -53,7 +53,7 @@ Every PR that adds or changes a provider, endpoint or account in `catalog.json` 
 - [ ] List every card-saving or reuse flag the endpoint accepts (save, attach, customer, recurring, setup-for-future-use and the like) and show the `forbid` entry covering each one.
 - [ ] Check every form key against the grammar above (no `.`, `[]` only at the end).
 - [ ] Update `egress-hosts.<env>.txt` (`egress-hosts.dev.txt` / `egress-hosts.prod.txt`) to the hosts of that environment's accounts (`TestEgressHostsMatchCatalog`), and the matching egress firewall rule in the infra repo.
-- [ ] Add an example request for every new endpoint to `embeddedFixtures` in `main_test.go` (`TestEmbeddedCatalog` fails without one).
+- [ ] Add an example request for every new endpoint to `embeddedFixtures` in `catalog_test.go` (`TestEmbeddedCatalog` fails without one).
 - [ ] Add a fixture to `testCatalogJSON` (and the tests that use it) if the change introduces a new shape: a new body format, pin kind, placeholder modifier, signer or header template form.
 - [ ] Create each new account secret in Secret Manager under the resource name the catalog gives.
 - [ ] Verify the endpoint against the provider's sandbox (D§6) and record it in the catalog review notes below.
@@ -69,6 +69,6 @@ Every PR that adds or changes a provider, endpoint or account in `catalog.json` 
 ## Deliverables, in order
 1. `go.mod`, vendored `pgx/v5`, `Makefile`, `Dockerfile`.
 2. `schema.sql` exactly as in SPEC §7.
-3. `main.go` with every section of SPEC §5–§11 implemented.
-4. `main_test.go` with every test in SPEC §13.1, then §13.2.
+3. The `package main` sources with every section of SPEC §5–§11 implemented.
+4. The `*_test.go` files with every test in SPEC §13.1, then §13.2.
 5. `make ci` green. Report the final `go list -m all` output and the image digest.
