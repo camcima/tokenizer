@@ -252,7 +252,7 @@ flowchart LR
 |---|---|
 | Browser → vault | A dedicated public listener that serves only `POST /tokenize`. It requires an exact `Origin` match and a short-lived session token minted by the platform. |
 | Platform → vault | A separate internal listener that requires a client certificate (mTLS) signed by one pinned CA. It serves only `POST /proxy` and `GET /healthz`. |
-| Vault → database | The database role can only call four functions. It has no table access at all. |
+| Vault → database | The vault's database role (`vault_app`) can only call three functions: `put_card`, `get_card` and `list_deks`. It has no table access at all. Adding a key (`add_dek`) needs a separate role, `vault_rotator`. |
 | Vault → KMS | The key-encryption key is in a different project and never leaves the HSM. |
 | Vault → internet | Only the hosts of this environment's catalog accounts, enforced in code and by the VPC egress firewall. |
 
@@ -309,7 +309,7 @@ sequenceDiagram
 Key details:
 
 - **The CVV is never stored.** It sits in a memory cache, is deleted when read, and expires after 15 minutes. Expired entries are swept on every write.
-- **The cardholder name is optional.** If given, it must be 1–100 characters of valid UTF-8 with no control characters (`"name": null` is rejected). It is encrypted together with the card, never returned, and only used where a provider request has a `{{name}}` placeholder. A card tokenized without a name can't fill `{{name}}`: that `/proxy` call gets `409 {"error":"name unavailable"}`.
+- **The cardholder name is optional.** If given, it must be 1–100 characters of valid UTF-8 with no control characters (`"name": null` is rejected). It is encrypted together with the card and only used where a provider request has a `{{name}}` placeholder. The vault itself never returns it, but a provider's response may echo it (a Stripe token's `card.name`, for example), and that response reaches the platform as is: the vault masks only card numbers, not names. A card tokenized without a name can't fill `{{name}}`: that `/proxy` call gets `409 {"error":"name unavailable"}`.
 - **A query string is rejected outright.** This guarantees a card number can never end up in a URL, and so never in any URL-based log along the way.
 - **The browser gets the same error format whatever goes wrong**: `{"error":"invalid pan"}` and the like. That format never echoes input back.
 
@@ -323,9 +323,9 @@ The platform sends a JSON **envelope** of at most 64 KiB. Unknown fields are rej
   "token": "tok_4f3a9c…",
   "request": {
     "method": "POST",
-    "path": "/v1/payment_methods",
+    "path": "/v1/tokens",
     "headers": { "Idempotency-Key": "ord-123" },
-    "body": "type=card&card[number]={{pan}}&card[exp_month]={{exp_month}}&card[exp_year]={{exp_year}}&card[cvc]={{cvv}}&billing_details[name]={{name}}"
+    "body": "card[number]={{pan}}&card[exp_month]={{exp_month}}&card[exp_year]={{exp_year}}&card[cvc]={{cvv}}&card[name]={{name}}"
   }
 }
 ```
@@ -404,12 +404,11 @@ The first `catalog.json` ships **Stripe only**, because Stripe is the one provid
 
 | Account (env) | Provider (format) | Endpoint | What it creates | Card positions | Forbidden fields |
 |---|---|---|---|---|---|
-| `stripe_test` (dev) | `stripe` (form) | `POST /v1/payment_methods` | A PaymentMethod that is never attached to a customer, so it can be used only once | `card[number]`, `card[exp_month]`, `card[exp_year]`, `card[cvc]`, `billing_details[name]` | `customer`, `payment_method`, `allow_redisplay`, `setup_future_usage` |
-| `stripe_test` (dev) | `stripe` (form) | `POST /v1/tokens` | A single-use card token | `card[number]`, `card[exp_month]`, `card[exp_year]`, `card[cvc]`, `card[name]` | none |
+| `stripe_test` (dev) | `stripe` (form) | `POST /v1/tokens` | A single-use card token (`tok_…`) | `card[number]`, `card[exp_month]`, `card[exp_year]`, `card[cvc]`, `card[name]` | `customer` (Connect: a token cloned from a customer's saved card) |
 
-The platform then charges with its own Stripe key, for example `POST /v1/payment_intents` with `payment_method=pm_…`. That call carries no card data, so it doesn't go through the vault.
+So the Stripe flow is: the vault creates a single-use `tok_…` through `POST /v1/tokens`, and the platform, with its own Stripe key, charges it or creates a PaymentMethod from it (for example `POST /v1/payment_methods` with `type=card&card[token]=tok_…`). Those calls carry no card data, so they don't go through the vault. The vault itself never calls `POST /v1/payment_methods` with card data: a card PaymentMethod is reusable and can be attached to a customer, which is storage at the provider, so that endpoint is not in the catalog.
 
-> **Why `payment_methods` and not `payment_intents` (SPEC-DECISION, plan Decision 5).** The design preferred charging directly through `POST /v1/payment_intents` with `payment_method_data[card][…]`. Stripe's published API definition, as served by `stripe-mock`, rejects that: `payment_method_data[type]` doesn't accept `card`. So the card endpoint is `POST /v1/payment_methods`. An unattached PaymentMethod is single use, which makes it a hand-off, just like a token. Every field that would attach it to a customer, clone it, or mark it for reuse is forbidden.
+Every catalog endpoint carries card data and lists a `{{pan}}` position, and every `/proxy` request must contain `{{pan}}`. The vault's credential is only lent to card-carrying calls. Anything else (a payment with a provider token, a refund, a query, a Stripe `pii` token) is the platform's own call, made with its own keys.
 
 There is no prod account yet, so `egress-hosts.prod.txt` is empty. To add a provider or an account, see [§11](#11-for-developers).
 
@@ -486,9 +485,9 @@ flowchart LR
 
 #### 7.4 What the vault cannot enforce: hand-off tokens
 
-Some catalog endpoints create a **single-use hand-off**: a Stripe token (`/v1/tokens`), an unattached Stripe PaymentMethod (`/v1/payment_methods`), and later a Mercado Pago card token. The platform then uses that token with its own provider keys, for example to charge it.
+Some catalog endpoints create a **single-use hand-off**: a Stripe token (`/v1/tokens`) today, and later a Mercado Pago card token. The platform then uses that token with its own provider keys, for example to charge it.
 
-With its own keys, the platform could also ask the provider to **save** the card, for example by attaching the PaymentMethod to a Stripe customer. That call carries no card data and never goes through the vault, so the vault cannot stop it. This doesn't break confidentiality: the card stays at a PCI-certified provider, in our own account, and the platform still never sees the card number. It does break the goal that the vault is the only place cards live.
+With its own keys, the platform could also ask the provider to **save** the card, for example by creating a PaymentMethod from the Stripe token and attaching it to a customer. That call carries no card data and never goes through the vault, so the vault cannot stop it. This doesn't break confidentiality: the card stays at a PCI-certified provider, in our own account, and the platform still never sees the card number. It does break the goal that the vault is the only place cards live.
 
 **So this is a platform rule: the platform must never save, attach or reuse a card through a hand-off token.** Platform code review and provider-side monitoring have to enforce it.
 
@@ -740,11 +739,13 @@ Provider secrets are not environment variables. Each catalog account names its s
 
 `catalog.json` is embedded into the binary at build time (`go:embed`) and validated strictly at boot and by `TestEmbeddedCatalog`. It has two parts:
 
-- **`providers`**: each provider has one body `format` (`json` or `form`) and a list of `endpoints`. An endpoint has an `id`, a `method` and a `path` (segments like `{id}` match `[A-Za-z0-9_-]{1,128}`), plus optionally:
+- **`providers`**: each provider has one body `format` (`json` or `form`) and a list of `endpoints`. An endpoint has an `id`, a `method`, a `path` (segments like `{id}` match `[A-Za-z0-9_-]{1,128}`), `"card_data": true` and `positions`:
+  - `card_data` must be `true`: every endpoint carries card data. Calls without card data are the platform's, made with its own keys, and `/proxy` rejects a request that does not contain `{{pan}}`;
+  - `positions`: the body address of each allowed placeholder, including a `{{pan}}` position. Addresses are JSON Pointers for `json` (`/paymentMethod/number`) and field names for `form` (`card[number]`).
+
+  Optionally, it also has:
   - `query`: the allowed query keys;
-  - `card_data`: `true` if card placeholders may be used;
   - `headers`: exact credential header templates, such as `"Authorization": "Bearer {{secret:secretKey}}"`;
-  - `positions`: the body address of each allowed placeholder. Addresses are JSON Pointers for `json` (`/paymentMethod/number`) and field names for `form` (`card[number]`);
   - `pins`: fields that must equal an account value (`{"account": "merchantAccount"}`) or a literal (`{"literal": "SUBMIT_TRANSACTION"}`);
   - `forbid`: fields that must be absent (`[]`) or equal one of the listed literals (`[false]`);
   - `signer`: a named signer, today only `payu`.

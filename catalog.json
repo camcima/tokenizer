@@ -4,28 +4,6 @@
       "format": "form",
       "endpoints": [
         {
-          "id": "payment_methods",
-          "method": "POST",
-          "path": "/v1/payment_methods",
-          "card_data": true,
-          "headers": {
-            "Authorization": "Bearer {{secret:secretKey}}"
-          },
-          "positions": {
-            "card[number]": "{{pan}}",
-            "card[exp_month]": "{{exp_month}}",
-            "card[exp_year]": "{{exp_year}}",
-            "card[cvc]": "{{cvv}}",
-            "billing_details[name]": "{{name}}"
-          },
-          "forbid": {
-            "customer": [],
-            "payment_method": [],
-            "allow_redisplay": [],
-            "setup_future_usage": []
-          }
-        },
-        {
           "id": "tokens",
           "method": "POST",
           "path": "/v1/tokens",
@@ -39,6 +17,9 @@
             "card[exp_year]": "{{exp_year}}",
             "card[cvc]": "{{cvv}}",
             "card[name]": "{{name}}"
+          },
+          "forbid": {
+            "customer": []
           }
         }
       ]

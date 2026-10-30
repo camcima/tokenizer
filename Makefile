@@ -121,8 +121,8 @@ itest:
 	VAULT_TEST_DB_URL='postgres://vault_owner@127.0.0.1:$(PG_PORT)/vault?sslmode=disable' \
 		go test -race -count=1 -run Integration ./...
 
-# Request-shape check of the Stripe ops against stripe-mock (Stripe's OpenAPI definition); the
-# container is always removed and the test's exit status is propagated.
+# Request-shape check of the catalog's Stripe endpoints against stripe-mock (Stripe's OpenAPI
+# definition); the container is always removed and the test's exit status is propagated.
 stripe-mock-test:
 	@docker rm -f $(STRIPE_MOCK_NAME) >/dev/null 2>&1 || true
 	@trap 'docker rm -f $(STRIPE_MOCK_NAME) >/dev/null 2>&1' EXIT; trap 'exit 130' INT TERM; \

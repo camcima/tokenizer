@@ -2295,7 +2295,9 @@ const testCatalogHost = "upstream.test"
 // the four first-wave json shapes of D§6: Adyen (account pin, forbid list, X-API-Key header),
 // Mercado Pago (single-use card token, :int expiry, Bearer), PayU (body credential, account and
 // literal pins, payu signer, yyyy/mm expiry) and Pagar.me (Basic auth, array positions). Every
-// provider has a dev account; adyen_br_live is the one prod account. Endpoint and account entries
+// provider has a dev account; adyen_br_live is the one prod account. Stripe's confirm_payment_intent
+// carries the wildcard path segment and the query key. Every endpoint is card_data with a {{pan}}
+// position: the catalog has no non-card endpoints (D§2, D§5.6). Endpoint and account entries
 // keep their identifying fields on one line so that tests can mutate them with a string replace.
 // Secret resources all start with "projects/", so a test can check that no error names one.
 const testCatalogJSON = `{
@@ -2332,8 +2334,15 @@ const testCatalogJSON = `{
           }
         },
         {
-          "id": "get_payment_intent", "method": "GET", "path": "/v1/payment_intents/{id}", "query": ["expand[]"],
-          "headers": {"Authorization": "Bearer {{secret:secretKey}}"}
+          "id": "confirm_payment_intent", "method": "POST", "path": "/v1/payment_intents/{id}/confirm", "query": ["expand[]"], "card_data": true,
+          "headers": {"Authorization": "Bearer {{secret:secretKey}}"},
+          "positions": {
+            "payment_method_data[card][number]": "{{pan}}",
+            "payment_method_data[card][exp_month]": "{{exp_month}}",
+            "payment_method_data[card][exp_year]": "{{exp_year}}",
+            "payment_method_data[card][cvc]": "{{cvv}}"
+          },
+          "forbid": {"setup_future_usage": [], "save_payment_method": [], "payment_method_options[card][setup_future_usage]": []}
         }
       ]
     },
@@ -2486,10 +2495,10 @@ func TestParseCatalogValid(t *testing.T) {
 			t.Errorf("stripe forbid %s = %v (present %v), want empty", addr, f, ok)
 		}
 	}
-	gpi := catEndpointByID(t, c, "stripe", "get_payment_intent")
-	if gpi.method != "GET" || !slices.Equal(gpi.path, []string{"v1", "payment_intents", "{id}"}) || gpi.cardData ||
-		!gpi.query["expand[]"] || len(gpi.query) != 1 || len(gpi.positions) != 0 {
-		t.Errorf("stripe get_payment_intent decoded as %+v", *gpi)
+	cpi := catEndpointByID(t, c, "stripe", "confirm_payment_intent")
+	if cpi.method != "POST" || !slices.Equal(cpi.path, []string{"v1", "payment_intents", "{id}", "confirm"}) || !cpi.cardData ||
+		!cpi.query["expand[]"] || len(cpi.query) != 1 || len(cpi.positions) != 4 {
+		t.Errorf("stripe confirm_payment_intent decoded as %+v", *cpi)
 	}
 
 	// Adyen: canonical header name, account pin, forbid with an allowed literal.
@@ -2543,7 +2552,7 @@ func TestParseCatalogRejects(t *testing.T) {
 		stripeAcct = `"stripe_t": {"provider": "stripe", "env": "dev", "host": "upstream.test", "base_path": ""`
 		adyenAcct  = `"adyen_br": {"provider": "adyen", "env": "dev", "host": "upstream.test", "base_path": "/checkout"`
 		payuVals   = `"values": {"apiLogin": "pRRXKOl8ikMmt9u", "accountId": "512321", "merchantId": "508029", "hash": "sha256"}`
-		gpiLine    = `"id": "get_payment_intent", "method": "GET", "path": "/v1/payment_intents/{id}", "query": ["expand[]"],`
+		cpiLine    = `"id": "confirm_payment_intent", "method": "POST", "path": "/v1/payment_intents/{id}/confirm", "query": ["expand[]"], "card_data": true,`
 		tokensLine = `"id": "tokens", "method": "POST", "path": "/v1/tokens", "card_data": true,`
 	)
 	cases := []struct{ name, old, new, want string }{
@@ -2574,7 +2583,7 @@ func TestParseCatalogRejects(t *testing.T) {
 		{"duplicate endpoint id", `"id": "tokens"`, `"id": "payment_intents"`, `endpoint "payment_intents": duplicate id`},
 		{"method not allowed", tokensLine, `"id": "tokens", "method": "HEAD", "path": "/v1/tokens", "card_data": true,`, `endpoint "tokens": method`},
 		{"method lowercase", tokensLine, `"id": "tokens", "method": "post", "path": "/v1/tokens", "card_data": true,`, `endpoint "tokens": method`},
-		{"overlapping endpoints", gpiLine, `"id": "get_payment_intent", "method": "POST", "path": "/v1/{id}", "query": ["expand[]"],`, "overlap"},
+		{"overlapping endpoints", cpiLine, `"id": "confirm_payment_intent", "method": "POST", "path": "/v1/{id}", "query": ["expand[]"], "card_data": true,`, "overlap"},
 
 		// Paths.
 		{"path without slash", `"/v1/tokens"`, `"v1/tokens"`, `endpoint "tokens": invalid path`},
@@ -2585,11 +2594,11 @@ func TestParseCatalogRejects(t *testing.T) {
 		{"path percent", `"/v1/tokens"`, `"/v1/tok%65ns"`, `endpoint "tokens": invalid path`},
 		{"path query", `"/v1/tokens"`, `"/v1/tokens?x=1"`, `endpoint "tokens": invalid path`},
 		{"path empty", `"/v1/tokens"`, `""`, `endpoint "tokens": invalid path`},
-		{"wildcard bad name", `{id}"`, `{i-d}"`, `endpoint "get_payment_intent": invalid path`},
-		{"wildcard empty", `{id}"`, `{}"`, `endpoint "get_payment_intent": invalid path`},
-		{"wildcard unclosed", `{id}"`, `{id"`, `endpoint "get_payment_intent": invalid path`},
-		{"wildcard partial segment", `{id}"`, `pi_{id}"`, `endpoint "get_payment_intent": invalid path`},
-		{"wildcard repeated", `/v1/payment_intents/{id}"`, `/v1/{id}/{id}"`, `endpoint "get_payment_intent": invalid path`},
+		{"wildcard bad name", `{id}/confirm"`, `{i-d}/confirm"`, `endpoint "confirm_payment_intent": invalid path`},
+		{"wildcard empty", `{id}/confirm"`, `{}/confirm"`, `endpoint "confirm_payment_intent": invalid path`},
+		{"wildcard unclosed", `{id}/confirm"`, `{id/confirm"`, `endpoint "confirm_payment_intent": invalid path`},
+		{"wildcard partial segment", `{id}/confirm"`, `pi_{id}/confirm"`, `endpoint "confirm_payment_intent": invalid path`},
+		{"wildcard repeated", `/v1/payment_intents/{id}/confirm"`, `/v1/{id}/{id}/confirm"`, `endpoint "confirm_payment_intent": invalid path`},
 		{"query key invalid", `["expand[]"]`, `["expand[]x"]`, `query key`},
 		{"query key duplicate", `["expand[]"]`, `["expand[]", "expand[]"]`, `query key`},
 
@@ -2597,9 +2606,15 @@ func TestParseCatalogRejects(t *testing.T) {
 		{"unknown placeholder", `"card[number]": "{{pan}}"`, `"card[number]": "{{card}}"`, `position "card[number]": unknown placeholder`},
 		{"unknown modifier", `"card[number]": "{{pan}}"`, `"card[number]": "{{pan:int}}"`, `position "card[number]": unknown placeholder`},
 		{"not a placeholder", `"card[number]": "{{pan}}"`, `"card[number]": "4242"`, `position "card[number]": unknown placeholder`},
-		{"card placeholder without card_data", tokensLine, `"id": "tokens", "method": "POST", "path": "/v1/tokens", "card_data": false,`, `position "card[cvc]": card placeholder without card_data`},
-		{"card position on non-card endpoint", gpiLine, gpiLine + ` "positions": {"x": "{{cvv}}"},`, `position "x": card placeholder without card_data`},
-		{"card_data without card position", gpiLine, gpiLine + ` "card_data": true,`, "card_data without a card position"},
+		// F1: every endpoint carries card data (the vault credential is never lent to a non-card call)
+		// and lists a {{pan}} position.
+		{"card_data false", tokensLine, `"id": "tokens", "method": "POST", "path": "/v1/tokens", "card_data": false,`, `endpoint "tokens": card_data must be true`},
+		{"card_data absent", tokensLine, `"id": "tokens", "method": "POST", "path": "/v1/tokens",`, `endpoint "tokens": card_data must be true`},
+		{"non-card endpoint (the old get_payment_intent shape)", `"endpoints": [`,
+			`"endpoints": [{"id": "get_pi", "method": "GET", "path": "/v1/payment_intents/{id}", "headers": {"Authorization": "Bearer {{secret:secretKey}}"}},`,
+			`endpoint "get_pi": card_data must be true`},
+		{"no {{pan}} position, other card positions", `"card[number]": "{{pan}}",`, ``, `endpoint "tokens": no {{pan}} position`},
+		{"no {{pan}} position, only credential positions", `"/transaction/creditCard/number": "{{pan}}",`, ``, `endpoint "submit_transaction": no {{pan}} position`},
 		{"basic in body position", `"/merchant/apiKey": "{{secret:apiKey}}"`, `"/merchant/apiKey": "{{basic:apiKey}}"`, `position "/merchant/apiKey": {{basic:}}`},
 
 		// Headers.
@@ -2730,15 +2745,14 @@ func TestParseCatalogRejects(t *testing.T) {
 	}
 }
 
-// Example platform bodies for the embedded catalog's stripe endpoints (catalog.json), used by
-// TestEmbeddedCatalog, TestStripeMock and TestStripeLive.
+// Example platform bodies for the embedded catalog's stripe tokens endpoint (catalog.json), with and
+// without the CVV, used by TestEmbeddedCatalog, TestProxyEmbeddedCardOnly, TestStripeMock and
+// TestStripeLive.
 const (
-	embeddedPMBody = `type=card&card[number]={{pan}}&card[exp_month]={{exp_month}}&card[exp_year]={{exp_year}}` +
-		`&card[cvc]={{cvv}}&billing_details[name]={{name}}`
-	embeddedPMNoCVV = `type=card&card[number]={{pan}}&card[exp_month]={{exp_month}}&card[exp_year]={{exp_year}}` +
-		`&billing_details[name]={{name}}`
 	embeddedTokensBody = `card[number]={{pan}}&card[exp_month]={{exp_month}}&card[exp_year]={{exp_year}}` +
 		`&card[cvc]={{cvv}}&card[name]={{name}}`
+	embeddedTokensNoCVV = `card[number]={{pan}}&card[exp_month]={{exp_month}}&card[exp_year]={{exp_year}}` +
+		`&card[name]={{name}}`
 )
 
 // embeddedFixtures holds at least one example request per endpoint of the embedded catalog
@@ -2746,9 +2760,8 @@ const (
 // that endpoint. TestEmbeddedCatalog fails for an endpoint without one, so every catalog change
 // adds its fixture here.
 var embeddedFixtures = map[string]*proxyEnvelope{
-	"stripe/payment_methods": newEnvelope("stripe_test", "POST", "/v1/payment_methods",
-		map[string]string{"Idempotency-Key": "ord-1", "Authorization": "Bearer {{secret:secretKey}}"}, embeddedPMBody),
-	"stripe/tokens": newEnvelope("stripe_test", "POST", "/v1/tokens", nil, embeddedTokensBody),
+	"stripe/tokens": newEnvelope("stripe_test", "POST", "/v1/tokens",
+		map[string]string{"Idempotency-Key": "ord-1", "Authorization": "Bearer {{secret:secretKey}}"}, embeddedTokensBody),
 }
 
 func TestEmbeddedCatalog(t *testing.T) {
@@ -2758,18 +2771,27 @@ func TestEmbeddedCatalog(t *testing.T) {
 		}
 	}
 	c, _ := parseCatalog(catalogJSON, "dev")
-	// SPEC-DECISION (plan Decision 5): stripe-mock rejects raw card fields on /v1/payment_intents
-	// (payment_method_data[type] has no "card" value), so the card endpoint is POST
-	// /v1/payment_methods: an unattached PaymentMethod is usable once, a single-use hand-off. Every
-	// field that attaches, clones or marks it for reuse is forbidden (see CLAUDE.md, catalog review notes).
-	pm := catEndpointByID(t, c, "stripe", "payment_methods")
+	// Stripe ships POST /v1/tokens only (D§6): a single-use tok_ hand-off. POST /v1/payment_methods
+	// creates a reusable, attachable PaymentMethod, which is storage, so it is not in the catalog.
+	// customer (Connect: a token cloned from a customer's saved card) must be absent.
 	tk := catEndpointByID(t, c, "stripe", "tokens")
-	if c.providers["stripe"].format != "form" || len(c.providers["stripe"].endpoints) != 2 || !pm.cardData || !tk.cardData {
+	if c.providers["stripe"].format != "form" || len(c.providers["stripe"].endpoints) != 1 || !tk.cardData ||
+		tk.method != "POST" || !slices.Equal(tk.path, []string{"v1", "tokens"}) || tk.positions["card[number]"] != (placeholder{kind: "pan"}) {
 		t.Error("embedded stripe provider shape")
 	}
-	for _, addr := range []string{"customer", "payment_method", "allow_redisplay", "setup_future_usage"} {
-		if f, ok := pm.forbid[addr]; !ok || len(f) != 0 {
-			t.Errorf("embedded stripe payment_methods does not forbid %s", addr)
+	if f, ok := tk.forbid["customer"]; !ok || f == nil || len(f) != 0 || len(tk.forbid) != 1 {
+		t.Error("embedded stripe tokens must forbid exactly customer (must be absent)")
+	}
+	// Every embedded endpoint carries card data and lists {{pan}} (parseCatEndpoint enforces both).
+	for _, prov := range slices.Sorted(maps.Keys(c.providers)) {
+		for _, ep := range c.providers[prov].endpoints {
+			hasPAN := false
+			for _, ph := range ep.positions {
+				hasPAN = hasPAN || ph.kind == "pan"
+			}
+			if !ep.cardData || !hasPAN {
+				t.Errorf("embedded endpoint %s/%s is not a card endpoint with a {{pan}} position", prov, ep.id)
+			}
 		}
 	}
 	if a := c.accounts["stripe_test"]; a == nil || a.host != "api.stripe.com" || a.secretNames["secretKey"] != "projects/pci-cde-dev/secrets/stripe-test-secret-key" {
@@ -2850,6 +2872,8 @@ const (
 	stripePIBody = `amount=1000&currency=usd&confirm=true&payment_method_data[type]=card` +
 		`&payment_method_data[card][number]={{pan}}&payment_method_data[card][exp_month]={{exp_month}}` +
 		`&payment_method_data[card][exp_year]={{exp_year}}&payment_method_data[card][cvc]={{cvv}}`
+	stripeConfirmBody = `payment_method_data[type]=card&payment_method_data[card][number]={{pan}}` +
+		`&payment_method_data[card][exp_month]={{exp_month}}&payment_method_data[card][exp_year]={{exp_year}}`
 	adyenBody = `{"amount":{"currency":"BRL","value":1000},"reference":"ord-1","merchantAccount":"AcmeBR_ECOM",` +
 		`"paymentMethod":{"type":"scheme","number":"{{pan}}","expiryMonth":"{{exp_month}}","expiryYear":"{{exp_year}}",` +
 		`"cvc":"{{cvv}}","holderName":"{{name}}"},"storePaymentMethod":false}`
@@ -2878,9 +2902,9 @@ func validEnvelope(name string) *proxyEnvelope {
 	case "stripe":
 		return newEnvelope("stripe_t", "POST", "/v1/payment_intents",
 			map[string]string{"Idempotency-Key": "ord-1", "Authorization": "Bearer {{secret:secretKey}}"}, stripePIBody)
-	case "stripe_get":
-		return newEnvelope("stripe_t", "GET", "/v1/payment_intents/pi_123?expand[]=latest_charge&expand%5B%5D=customer",
-			map[string]string{"Accept": "application/json"}, "")
+	case "stripe_confirm":
+		return newEnvelope("stripe_t", "POST", "/v1/payment_intents/pi_123/confirm?expand[]=latest_charge&expand%5B%5D=customer",
+			map[string]string{"Accept": "application/json"}, stripeConfirmBody)
 	case "adyen":
 		return newEnvelope("adyen_br", "POST", "/v72/payments",
 			map[string]string{"Idempotency-Key": "ord-1", "X-API-Key": "{{secret:apiKey}}"}, adyenBody)
@@ -2925,8 +2949,9 @@ func TestCheckProxyAccepts(t *testing.T) {
 			"payment_method_data[card][number]={{pan}}", "payment_method_data[card][exp_month]={{exp_month}}",
 			"payment_method_data[card][exp_year]={{exp_year}}", "payment_method_data[card][cvc]={{cvv}}",
 		}, http.Header{"Idempotency-Key": {"ord-1"}}, true, false},
-		{"stripe_get", "stripe", "get_payment_intent", "/v1/payment_intents/pi_123?expand[]=latest_charge&expand%5B%5D=customer",
-			nil, http.Header{"Accept": {"application/json"}}, false, false},
+		{"stripe_confirm", "stripe", "confirm_payment_intent", "/v1/payment_intents/pi_123/confirm?expand[]=latest_charge&expand%5B%5D=customer",
+			[]string{"payment_method_data[card][number]={{pan}}", "payment_method_data[card][exp_month]={{exp_month}}",
+				"payment_method_data[card][exp_year]={{exp_year}}"}, http.Header{"Accept": {"application/json"}}, false, false},
 		{"adyen", "adyen", "payments", "/v72/payments", []string{
 			"/paymentMethod/number={{pan}}", "/paymentMethod/expiryMonth={{exp_month}}", "/paymentMethod/expiryYear={{exp_year}}",
 			"/paymentMethod/cvc={{cvv}}", "/paymentMethod/holderName={{name}}",
@@ -2983,13 +3008,13 @@ func TestCheckProxyAccepts(t *testing.T) {
 	if _, perr := c.checkProxy(e); perr != nil {
 		t.Errorf("adyen without X-API-Key rejected: %+v", *perr)
 	}
-	// Positions are allowed, not required: a card-free body passes.
+	// Positions other than {{pan}} are optional: a body with only {{pan}} passes.
 	e = validEnvelope("stripe")
-	e.Request.Body = "amount=1000&currency=usd"
+	e.Request.Body = "amount=1000&currency=usd&payment_method_data[type]=card&payment_method_data[card][number]={{pan}}"
 	if p, perr := c.checkProxy(e); perr != nil {
-		t.Errorf("stripe card-free body rejected: %+v", *perr)
-	} else if len(p.occs) != 0 || p.usesCVV || p.usesName {
-		t.Errorf("stripe card-free body: %d occs, usesCVV %v, usesName %v", len(p.occs), p.usesCVV, p.usesName)
+		t.Errorf("stripe body with only {{pan}} rejected: %+v", *perr)
+	} else if len(p.occs) != 1 || p.usesCVV || p.usesName {
+		t.Errorf("stripe body with only {{pan}}: %d occs, usesCVV %v, usesName %v", len(p.occs), p.usesCVV, p.usesName)
 	}
 }
 
@@ -3036,24 +3061,24 @@ func TestCheckProxyRejects(t *testing.T) {
 		{"trailing slash", "adyen", path("/v72/payments/"), msgEndpointNotAllowed, ep},
 		{"no leading slash", "adyen", path("v72/payments"), msgEndpointNotAllowed, ep},
 		{"empty path", "adyen", path(""), msgEndpointNotAllowed, ep},
-		{"percent-encoded slash", "stripe_get", path("/v1/payment_intents/pi%2F1"), msgEndpointNotAllowed, ep},
+		{"percent-encoded slash", "stripe_confirm", path("/v1/payment_intents/pi%2F1/confirm"), msgEndpointNotAllowed, ep},
 		{"percent-encoded literal", "adyen", path("/v72/p%61yments"), msgEndpointNotAllowed, ep},
-		{"dot-dot", "stripe_get", path("/v1/payment_intents/../tokens"), msgEndpointNotAllowed, ep},
-		{"dot-dot wildcard", "stripe_get", path("/v1/payment_intents/.."), msgEndpointNotAllowed, ep},
+		{"dot-dot", "stripe_confirm", path("/v1/payment_intents/../tokens"), msgEndpointNotAllowed, ep},
+		{"dot-dot wildcard", "stripe_confirm", path("/v1/payment_intents/../confirm"), msgEndpointNotAllowed, ep},
 		{"double slash", "adyen", path("//v72/payments"), msgEndpointNotAllowed, ep},
 		{"inner double slash", "adyen", path("/v72//payments"), msgEndpointNotAllowed, ep},
-		{"wildcard bad char", "stripe_get", path("/v1/payment_intents/pi.1"), msgEndpointNotAllowed, ep},
-		{"wildcard too long", "stripe_get", path("/v1/payment_intents/" + strings.Repeat("a", 129)), msgEndpointNotAllowed, ep},
-		{"placeholder in path", "stripe_get", path("/v1/payment_intents/{{pan}}"), msgEndpointNotAllowed, ep},
+		{"wildcard bad char", "stripe_confirm", path("/v1/payment_intents/pi.1/confirm"), msgEndpointNotAllowed, ep},
+		{"wildcard too long", "stripe_confirm", path("/v1/payment_intents/" + strings.Repeat("a", 129) + "/confirm"), msgEndpointNotAllowed, ep},
+		{"placeholder in path", "stripe_confirm", path("/v1/payment_intents/{{pan}}/confirm"), msgEndpointNotAllowed, ep},
 		{"fragment", "adyen", path("/v72/payments#x"), msgEndpointNotAllowed, ep},
-		{"unlisted query key", "stripe_get", path("/v1/payment_intents/pi_1?limit=3"), msgEndpointNotAllowed, ep},
+		{"unlisted query key", "stripe_confirm", path("/v1/payment_intents/pi_1/confirm?limit=3"), msgEndpointNotAllowed, ep},
 		{"query on endpoint without keys", "adyen", path("/v72/payments?expand[]=a"), msgEndpointNotAllowed, ep},
-		{"placeholder in query value", "stripe_get", path("/v1/payment_intents/pi_1?expand[]={{pan}}"), msgEndpointNotAllowed, ep},
-		{"encoded placeholder in query value", "stripe_get", path("/v1/payment_intents/pi_1?expand[]=%7B%7Bpan%7D%7D"), msgEndpointNotAllowed, ep},
-		{"bare question mark", "stripe_get", path("/v1/payment_intents/pi_1?"), msgEndpointNotAllowed, ep},
-		{"query without value", "stripe_get", path("/v1/payment_intents/pi_1?expand[]"), msgEndpointNotAllowed, ep},
-		{"query semicolon", "stripe_get", path("/v1/payment_intents/pi_1?expand[]=a;b"), msgEndpointNotAllowed, ep},
-		{"query second question mark", "stripe_get", path("/v1/payment_intents/pi_1?expand[]=a?b"), msgEndpointNotAllowed, ep},
+		{"placeholder in query value", "stripe_confirm", path("/v1/payment_intents/pi_1/confirm?expand[]={{pan}}"), msgEndpointNotAllowed, ep},
+		{"encoded placeholder in query value", "stripe_confirm", path("/v1/payment_intents/pi_1/confirm?expand[]=%7B%7Bpan%7D%7D"), msgEndpointNotAllowed, ep},
+		{"bare question mark", "stripe_confirm", path("/v1/payment_intents/pi_1/confirm?"), msgEndpointNotAllowed, ep},
+		{"query without value", "stripe_confirm", path("/v1/payment_intents/pi_1/confirm?expand[]"), msgEndpointNotAllowed, ep},
+		{"query semicolon", "stripe_confirm", path("/v1/payment_intents/pi_1/confirm?expand[]=a;b"), msgEndpointNotAllowed, ep},
+		{"query second question mark", "stripe_confirm", path("/v1/payment_intents/pi_1/confirm?expand[]=a?b"), msgEndpointNotAllowed, ep},
 
 		// Headers.
 		{"content-type header", "adyen", header("Content-Type", "text/plain"), msgHeaderNotAllowed, hdr},
@@ -3101,6 +3126,13 @@ func TestCheckProxyRejects(t *testing.T) {
 		{"form placeholder at unlisted key", "stripe", body(stripePIBody + "&description={{pan}}"), msgPlaceholder, ph},
 		{"form encoded placeholder", "stripe", body(stripePIBody + "&description=%7B%7Bpan%7D%7D"), msgPlaceholder, ph},
 
+		// F1: every request carries {{pan}}; the vault credential is never lent to a non-card call.
+		{"no pan: card-free form body", "stripe", body("amount=1000&currency=usd"), msgPlaceholder, ph},
+		{"no pan: other card placeholders only", "stripe", replace(stripePIBody, "&payment_method_data[card][number]={{pan}}", ""), msgPlaceholder, ph},
+		{"no pan: empty form body", "stripe", body(""), msgPlaceholder, ph},
+		{"no pan: json", "mercadopago", replace(mpBody, `"card_number":"{{pan}}",`, ""), msgPlaceholder, ph},
+		{"no pan: payu with credential and signature only", "payu", replace(payuBody, `"number":"{{pan}}",`, ""), msgPlaceholder, ph},
+
 		// Pins.
 		{"adyen merchantAccount mismatch", "adyen", replace(adyenBody, `"AcmeBR_ECOM"`, `"AcmeBR_LIVE"`), msgPinMismatch, "pin"},
 		{"adyen merchantAccount absent", "adyen", replace(adyenBody, `"merchantAccount":"AcmeBR_ECOM",`, ""), msgPinMismatch, "pin"},
@@ -3138,7 +3170,7 @@ func TestCheckProxyRejects(t *testing.T) {
 				t.Errorf("got %d %q reason %q, want 400 %q reason %q", perr.status, perr.msg, perr.reason, tc.msg, tc.reason)
 			}
 			// The alert names the matched endpoint once there is one (catalog text only).
-			wantEP := map[string]string{"stripe": "payment_intents", "stripe_get": "get_payment_intent", "adyen": "payments",
+			wantEP := map[string]string{"stripe": "payment_intents", "stripe_confirm": "confirm_payment_intent", "adyen": "payments",
 				"mercadopago": "card_tokens", "payu": "submit_transaction", "pagarme": "orders"}[tc.base]
 			if tc.reason == "" || tc.reason == ep {
 				wantEP = ""
@@ -3240,27 +3272,31 @@ func TestCheckProxySignerInputs(t *testing.T) {
 	}
 }
 
-// TestCheckProxyEmptyBody: an empty body skips scanning only on an endpoint with no positions, pins
-// or signer.
+// TestCheckProxyEmptyBody: an empty body never passes, because every request must carry {{pan}}
+// (F1). This holds even on an endpoint stripped in memory of its positions, pins and signer (a shape
+// parseCatEndpoint refuses): there is no empty-body shortcut. A json body must parse (msgBadBody);
+// an empty form body is zero fields, so it lacks {{pan}} (msgPlaceholder).
 func TestCheckProxyEmptyBody(t *testing.T) {
 	c := testCatalog(t, "127.0.0.1:9")
 	ay := catEndpointByID(t, c, "adyen", "payments")
 	e := validEnvelope("adyen")
 	e.Request.Body = ""
 	if _, perr := c.checkProxy(e); perr == nil || perr.msg != msgBadBody {
-		t.Errorf("empty body with positions and pins: got %+v", perr)
+		t.Errorf("json empty body with positions and pins: got %+v", perr)
 	}
-	ay.positions = map[string]placeholder{}
+	ay.positions, ay.pins = map[string]placeholder{}, map[string]catPin{}
 	if _, perr := c.checkProxy(e); perr == nil || perr.msg != msgBadBody {
-		t.Errorf("empty body with pins: got %+v", perr)
+		t.Errorf("json empty body, no positions/pins/signer: got %+v", perr)
 	}
-	ay.pins = map[string]catPin{}
-	p, perr := c.checkProxy(e)
-	if perr != nil {
-		t.Fatalf("empty body, no positions/pins/signer: %+v", *perr)
+
+	tk := catEndpointByID(t, c, "stripe", "tokens")
+	e = newEnvelope("stripe_t", "POST", "/v1/tokens", nil, "")
+	if _, perr := c.checkProxy(e); perr == nil || perr.msg != msgPlaceholder || perr.reason != "placeholder" {
+		t.Errorf("form empty body: got %+v", perr)
 	}
-	if len(p.body) != 0 || len(p.occs) != 0 {
-		t.Errorf("plan body/occs not empty")
+	tk.positions, tk.forbid = map[string]placeholder{}, map[string][]fieldValue{}
+	if _, perr := c.checkProxy(e); perr == nil || perr.msg != msgPlaceholder || perr.reason != "placeholder" {
+		t.Errorf("form empty body, no positions/pins/signer: got %+v", perr)
 	}
 }
 
@@ -3269,23 +3305,35 @@ func TestCheckProxyEmptyBody(t *testing.T) {
 func TestCheckProxyHardening(t *testing.T) {
 	c := testCatalog(t, "127.0.0.1:9")
 
-	// (a) A GET or HEAD endpoint takes no body.
-	e := validEnvelope("stripe_get")
-	e.Request.Body = "expand[]=a"
-	if _, perr := c.checkProxy(e); perr == nil || perr.msg != msgBadBody || perr.reason != "body" || perr.endpoint != "get_payment_intent" {
+	// (a) A GET or HEAD endpoint takes no body. parseCatEndpoint still accepts a GET card endpoint, so
+	// this uses a parse-level fixture: confirm_payment_intent declared as GET. Since every request
+	// must also carry {{pan}} (F1), such an endpoint can never pass: with a body it is msgBadBody, and
+	// without one it lacks {{pan}}.
+	getJSON := strings.Replace(testCatalogJSON, `"id": "confirm_payment_intent", "method": "POST",`, `"id": "confirm_payment_intent", "method": "GET",`, 1)
+	gc, err := parseCatalog([]byte(getJSON), "dev")
+	if err != nil || catEndpointByID(t, gc, "stripe", "confirm_payment_intent").method != "GET" {
+		t.Fatalf("GET fixture: %v", err)
+	}
+	e := validEnvelope("stripe_confirm")
+	e.Request.Method = "GET"
+	if _, perr := gc.checkProxy(e); perr == nil || perr.msg != msgBadBody || perr.reason != "body" || perr.endpoint != "confirm_payment_intent" {
 		t.Errorf("GET with a body: got %+v", perr)
 	}
-	get := catEndpointByID(t, c, "stripe", "get_payment_intent")
-	get.method = "HEAD"
+	e.Request.Body = ""
+	if _, perr := gc.checkProxy(e); perr == nil || perr.msg != msgPlaceholder || perr.reason != "placeholder" {
+		t.Errorf("GET without a body (no {{pan}}): got %+v", perr)
+	}
+	// HEAD is not a catalog method; set it in memory to cover the HEAD half of the check.
+	catEndpointByID(t, gc, "stripe", "confirm_payment_intent").method = "HEAD"
+	e = validEnvelope("stripe_confirm")
 	e.Request.Method = "HEAD"
-	if _, perr := c.checkProxy(e); perr == nil || perr.msg != msgBadBody || perr.reason != "body" {
+	if _, perr := gc.checkProxy(e); perr == nil || perr.msg != msgBadBody || perr.reason != "body" {
 		t.Errorf("HEAD with a body: got %+v", perr)
 	}
 	e.Request.Body = ""
-	if _, perr := c.checkProxy(e); perr != nil {
-		t.Errorf("HEAD without a body rejected: %+v", *perr)
+	if _, perr := gc.checkProxy(e); perr == nil || perr.msg != msgPlaceholder {
+		t.Errorf("HEAD without a body (no {{pan}}): got %+v", perr)
 	}
-	get.method = "GET"
 
 	// (b) An unknown signer fails closed (parseCatEndpoint already refuses one).
 	pu := catEndpointByID(t, c, "payu", "submit_transaction")
@@ -3459,16 +3507,17 @@ func TestRenderExpiryFormats(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.ph.String(), func(t *testing.T) {
 			c := renderCatalog(t)
-			catEndpointByID(t, c, "adyen", "payments").positions = map[string]placeholder{"/paymentMethod/expiry": tc.ph}
+			// Every request carries {{pan}} (F1), so each body has it next to the expiry under test.
+			catEndpointByID(t, c, "adyen", "payments").positions = map[string]placeholder{"/paymentMethod/expiry": tc.ph, "/paymentMethod/number": {kind: "pan"}}
 			e := validEnvelope("adyen")
-			e.Request.Body = `{"merchantAccount":"AcmeBR_ECOM","paymentMethod":{"expiry":"` + tc.ph.String() + `"},"x":1}`
+			e.Request.Body = `{"merchantAccount":"AcmeBR_ECOM","paymentMethod":{"number":"{{pan}}","expiry":"` + tc.ph.String() + `"},"x":1}`
 			_, body := renderBody(t, renderPlan(t, c, e), renderCard, "")
-			checkRendered(t, "json", body, `{"merchantAccount":"AcmeBR_ECOM","paymentMethod":{"expiry":`+tc.json+`},"x":1}`)
+			checkRendered(t, "json", body, `{"merchantAccount":"AcmeBR_ECOM","paymentMethod":{"number":"`+testPAN+`","expiry":`+tc.json+`},"x":1}`)
 
-			catEndpointByID(t, c, "stripe", "tokens").positions = map[string]placeholder{"card[expiry]": tc.ph}
-			e = newEnvelope("stripe_t", "POST", "/v1/tokens", nil, "a=1&card[expiry]="+tc.ph.String()+"&b=2")
+			catEndpointByID(t, c, "stripe", "tokens").positions = map[string]placeholder{"card[expiry]": tc.ph, "card[number]": {kind: "pan"}}
+			e = newEnvelope("stripe_t", "POST", "/v1/tokens", nil, "a=1&card[number]={{pan}}&card[expiry]="+tc.ph.String()+"&b=2")
 			_, body = renderBody(t, renderPlan(t, c, e), renderCard, "")
-			checkRendered(t, "form", body, "a=1&card[expiry]="+tc.form+"&b=2")
+			checkRendered(t, "form", body, "a=1&card[number]="+testPAN+"&card[expiry]="+tc.form+"&b=2")
 		})
 	}
 
@@ -3502,11 +3551,13 @@ func TestRenderForm(t *testing.T) {
 		t.Errorf("tokens: rendered form does not decode to the card (parse ok=%v, %d keys)", err == nil, len(q))
 	}
 
-	// GET: no body at all; the validated query is kept.
-	req, body = renderBody(t, renderPlan(t, c, validEnvelope("stripe_get")), renderCard, "")
-	if len(body) != 0 || req.Method != "GET" ||
-		req.URL.String() != "https://127.0.0.1:9/v1/payment_intents/pi_123?expand[]=latest_charge&expand%5B%5D=customer" {
-		t.Errorf("stripe_get: %s %s, body length %d", req.Method, req.URL.Redacted(), len(body))
+	// A wildcard path with a query: the validated query is kept.
+	req, body = renderBody(t, renderPlan(t, c, validEnvelope("stripe_confirm")), renderCard, "")
+	checkRendered(t, "confirm_payment_intent", body,
+		strings.NewReplacer("{{pan}}", testPAN, "{{exp_month}}", "03", "{{exp_year}}", "2030").Replace(stripeConfirmBody))
+	if req.Method != "POST" ||
+		req.URL.String() != "https://127.0.0.1:9/v1/payment_intents/pi_123/confirm?expand[]=latest_charge&expand%5B%5D=customer" {
+		t.Errorf("confirm_payment_intent: %s %s", req.Method, req.URL.Redacted())
 	}
 }
 
@@ -4252,20 +4303,23 @@ func TestProxySuccess(t *testing.T) {
 		t.Error("adyen: outbound credential, Idempotency-Key or Content-Type wrong")
 	}
 
-	// A GET with an allowed query and no body; no CVV is taken.
+	// A wildcard path with an allowed query and no {{cvv}}; no CVV is taken.
 	tok3 := seedCard(t, v, s, testCVV)
-	e = validEnvelope("stripe_get")
+	e = validEnvelope("stripe_confirm")
 	e.Token = tok3
 	if rec := serveInternal(v, newProxyRequest(envelopeJSON(e))); rec.Code != http.StatusOK {
-		t.Fatalf("GET: status %d", rec.Code)
+		t.Fatalf("confirm: status %d", rec.Code)
 	}
 	_, method, path, hdr, sent = fp.last()
-	if method != "GET" || path != "/v1/payment_intents/pi_123" || fp.lastQuery() != "expand[]=latest_charge&expand%5B%5D=customer" || len(sent) != 0 {
-		t.Errorf("GET outbound %s %s, body len %d", method, path, len(sent))
+	if method != "POST" || path != "/v1/payment_intents/pi_123/confirm" || fp.lastQuery() != "expand[]=latest_charge&expand%5B%5D=customer" {
+		t.Errorf("confirm outbound %s %s", method, path)
+	}
+	if want := seededValues("form", stripeConfirmBody); string(sent) != want {
+		t.Errorf("confirm: outbound body is not the platform body plus substitutions (len %d, want %d)", len(sent), len(want))
 	}
 	// The platform supplied no idempotency header, so none is sent.
 	if _, ok := hdr["Idempotency-Key"]; ok || hdr.Get("X-Idempotency-Key") != "" {
-		t.Error("GET: an idempotency header was sent although the platform supplied none")
+		t.Error("confirm: an idempotency header was sent although the platform supplied none")
 	}
 	if v.cvv.take(tok3) != testCVV {
 		t.Error("a request without {{cvv}} consumed the CVV")
@@ -4528,6 +4582,7 @@ func TestProxyNoDBOnPolicyError(t *testing.T) {
 	for i, e := range []*proxyEnvelope{
 		newEnvelope("stripe_t", "POST", "/v1/tokens", map[string]string{"Authorization": "Bearer sk_test_attacker"}, stripeTokensBody),
 		newEnvelope("stripe_t", "POST", "/v1/tokens", nil, strings.Replace(stripeTokensBody, "card[number]", "description", 1)),
+		newEnvelope("stripe_t", "POST", "/v1/tokens", nil, "pii[id_number]=x"), // no {{pan}} (F1)
 		newEnvelope("stripe_t", "POST", "/v1/payment_intents", nil, stripePIBody+"&customer=cus_1"),
 		newEnvelope("adyen_br", "POST", "/v72/payments", nil, strings.Replace(adyenBody, "AcmeBR_ECOM", "Other", 1)),
 		newEnvelope("payu_co", "POST", "/payments-api/4.0/service.cgi", nil, strings.Replace(payuBody, `"referenceCode":"TestPayU",`, "", 1)),
@@ -4552,6 +4607,60 @@ func TestProxyNoDBOnPolicyError(t *testing.T) {
 	}
 	if hits, _, _, _, _ := fp.last(); hits != 0 {
 		t.Fatal("a policy error reached the provider")
+	}
+}
+
+// TestProxyEmbeddedCardOnly (F1, F2) sends the review's probes through the handler with the embedded
+// catalog (catalog.json): a /v1/tokens request that carries no {{pan}} (a pii token, a card-free
+// body, a card body without the number) would only borrow the vault's Stripe credential, so it is
+// refused as a placeholder violation; so are endpoints outside the catalog (payment_methods is
+// storage) and a token cloned through customer. Each is 400 with its alert, before get_card and
+// with nothing sent to the provider.
+func TestProxyEmbeddedCardOnly(t *testing.T) {
+	fp := newFakeProvider(t, nil)
+	v, s := embeddedStripeVault(t, testSecret)
+	pointAccount(t, v, "stripe_test", fp.ts)
+	clk := &fakeClock{t: testNow}
+	v.now = clk.now
+	tok := seedCardNamed(t, v, s, testCVV, testName)
+	var calls atomic.Int32
+	v.getCard = func(context.Context, string, string) ([]byte, int, error) {
+		calls.Add(1)
+		return nil, 0, errUnknownToken
+	}
+	for _, c := range []struct {
+		name, path, body, msg, reason string
+	}{
+		{"tokens pii probe", "/v1/tokens", "pii[id_number]=x", msgPlaceholder, "placeholder"},
+		{"tokens without {{pan}}", "/v1/tokens", strings.Replace(embeddedTokensBody, "card[number]={{pan}}&", "", 1), msgPlaceholder, "placeholder"},
+		{"tokens card-free body", "/v1/tokens", "metadata[k]=v", msgPlaceholder, "placeholder"},
+		{"tokens empty body", "/v1/tokens", "", msgPlaceholder, "placeholder"},
+		{"tokens with customer", "/v1/tokens", embeddedTokensBody + "&customer=cus_1", msgForbiddenField, "forbidden_field"},
+		{"payment_methods", "/v1/payment_methods", "type=card&card[number]={{pan}}", msgEndpointNotAllowed, "endpoint"},
+		{"payment_intents", "/v1/payment_intents", "payment_method_data[card][number]={{pan}}", msgEndpointNotAllowed, "endpoint"},
+	} {
+		clk.advance(time.Second) // one proxy_policy alert per second
+		start := testLog.Len()
+		rec := serveInternal(v, stripeProxyRequest(tok, c.path, nil, c.body))
+		if rec.Code != http.StatusBadRequest || rec.Body.String() != wantErrBody(c.msg) {
+			t.Errorf("%s: status %d, want 400 %q", c.name, rec.Code, c.msg)
+		}
+		endpoint := "tokens"
+		if c.reason == "endpoint" {
+			endpoint = "-"
+		}
+		if line := " ALERT proxy_policy account=stripe_test endpoint=" + endpoint + " reason=" + c.reason + "\n"; !strings.Contains(testLog.since(start), line) {
+			t.Errorf("%s: no alert%s", c.name, strings.TrimSuffix(line, "\n"))
+		}
+	}
+	if n := calls.Load(); n != 0 {
+		t.Errorf("get_card called %d times", n)
+	}
+	if hits, _, _, _, _ := fp.last(); hits != 0 {
+		t.Errorf("%d requests reached the provider", hits)
+	}
+	if v.cvv.take(tok) != testCVV {
+		t.Error("a refused request consumed the CVV")
 	}
 }
 
@@ -6873,7 +6982,8 @@ func stripeProxyRequest(tok, path string, headers map[string]string, body string
 
 // TestStripeLive runs tokenize (with a cardholder name) → /proxy against the real Stripe test-mode
 // API (§15) through the embedded catalog's stripe_test account, with a forged inbound Authorization
-// header: POST /v1/payment_methods with the CVV, then POST /v1/tokens without it (the CVV was used).
+// header: POST /v1/tokens with the CVV, then again without it (the CVV was used). Each returns a
+// single-use tok_; the platform charges or creates a PaymentMethod from it with its own keys.
 // It runs only when VAULT_TEST_STRIPE_SECRET holds a test-mode key (sk_test_…), which is never
 // printed. That the objects show up in the vault's Stripe dashboard is still checked by hand.
 func TestStripeLive(t *testing.T) {
@@ -6894,8 +7004,8 @@ func TestStripeLive(t *testing.T) {
 		name, path, body string
 		wantID           *regexp.Regexp
 	}{
-		{"payment_methods", "/v1/payment_methods", embeddedPMBody, regexp.MustCompile(`"id":\s*"pm_`)},
-		{"tokens (CVV used)", "/v1/tokens", strings.Replace(embeddedTokensBody, "&card[cvc]={{cvv}}", "", 1), regexp.MustCompile(`"id":\s*"tok_`)},
+		{"tokens", "/v1/tokens", embeddedTokensBody, regexp.MustCompile(`"id":\s*"tok_`)},
+		{"tokens (CVV used)", "/v1/tokens", embeddedTokensNoCVV, regexp.MustCompile(`"id":\s*"tok_`)},
 	} {
 		r := stripeProxyRequest(tr.Token, c.path, nil, c.body)
 		r.Header.Set("Authorization", "Bearer sk_test_attacker")
@@ -6918,10 +7028,8 @@ func TestStripeLive(t *testing.T) {
 // the unmodified, fully verifying newOutboundClient. The relay forwards method, path, headers and
 // body unchanged to stripe-mock over loopback HTTP and returns its status, headers and body.
 //
-// SPEC-DECISION (plan Decision 5): stripe-mock rejects raw card fields on POST /v1/payment_intents
-// ("payment_method_data[type]": card is not in its enumeration), so catalog.json's card endpoint is
-// POST /v1/payment_methods (an unattached PaymentMethod is single use) with customer, payment_method,
-// allow_redisplay and setup_future_usage forbidden.
+// catalog.json's only Stripe endpoint is POST /v1/tokens (a single-use tok_, D§6), with customer
+// forbidden. POST /v1/payment_methods (storage) and POST /v1/payment_intents are not in the catalog.
 func TestStripeMock(t *testing.T) {
 	raw := os.Getenv("VAULT_TEST_STRIPE_MOCK_URL")
 	if raw == "" {
@@ -7034,31 +7142,29 @@ func TestStripeMock(t *testing.T) {
 			t.Errorf("%s: status %d, body len %d (PAN masked, name redacted): %s", name, rec.Code, rec.Body.Len(), stripeShow(rec.Body.Bytes(), secret))
 		}
 	}
-	pmID := regexp.MustCompile(`"id":\s*"pm_`)
 	tokID := regexp.MustCompile(`"id":\s*"tok_`)
 
-	// 1. payment_methods with {{cvv}} and the platform's Idempotency-Key.
+	// 1. tokens with {{cvv}} and the platform's Idempotency-Key.
 	tokA := seedCardNamed(t, v, s, testCVV, testName)
-	ok("payment_methods", call("payment_methods", tokA, "/v1/payment_methods", embeddedPMBody,
-		map[string]string{"Idempotency-Key": "smock-pm-1"}), pmID)
+	ok("tokens", call("tokens", tokA, "/v1/tokens", embeddedTokensBody,
+		map[string]string{"Idempotency-Key": "smock-tok-1"}), tokID)
 
 	// 2. The CVV of tokA was used: {{cvv}} again is 409 with nothing sent; the platform resends
 	// without card[cvc].
-	refused("payment_methods (CVV used)", tokA, "/v1/payment_methods", embeddedPMBody, http.StatusConflict, msgCVVUnavailable)
-	ok("payment_methods without cvv", call("payment_methods without cvv", tokA, "/v1/payment_methods", embeddedPMNoCVV, nil), pmID)
+	refused("tokens (CVV used)", tokA, "/v1/tokens", embeddedTokensBody, http.StatusConflict, msgCVVUnavailable)
+	ok("tokens without cvv", call("tokens without cvv", tokA, "/v1/tokens", embeddedTokensNoCVV, nil), tokID)
 
-	// 3. tokens with {{cvv}}.
+	// 3. Refused before the relay, leaving the CVV cached: a token cloned through customer, a token
+	// request without {{pan}} (it would only borrow the vault's credential), and the endpoints that
+	// are not in the catalog.
 	tokB := seedCardNamed(t, v, s, testCVV, testName)
-	ok("tokens", call("tokens", tokB, "/v1/tokens", embeddedTokensBody, nil), tokID)
-
-	// 4. Card-saving fields are refused before the relay, and the refusal leaves the CVV cached.
-	tokC := seedCardNamed(t, v, s, testCVV, testName)
-	refused("payment_methods + setup_future_usage", tokC, "/v1/payment_methods",
-		embeddedPMBody+"&setup_future_usage=off_session", http.StatusBadRequest, msgForbiddenField)
-	refused("payment_methods + customer", tokC, "/v1/payment_methods",
-		embeddedPMBody+"&customer=cus_123", http.StatusBadRequest, msgForbiddenField)
-	refused("payment_intents (not in the catalog)", tokC, "/v1/payment_intents",
+	refused("tokens + customer", tokB, "/v1/tokens", embeddedTokensBody+"&customer=cus_123", http.StatusBadRequest, msgForbiddenField)
+	refused("tokens without {{pan}}", tokB, "/v1/tokens", "pii[id_number]=x", http.StatusBadRequest, msgPlaceholder)
+	refused("payment_methods (not in the catalog)", tokB, "/v1/payment_methods",
+		"type=card&card[number]={{pan}}&card[exp_month]={{exp_month}}&card[exp_year]={{exp_year}}&card[cvc]={{cvv}}",
+		http.StatusBadRequest, msgEndpointNotAllowed)
+	refused("payment_intents (not in the catalog)", tokB, "/v1/payment_intents",
 		"amount=1000&currency=usd&confirm=true&payment_method_data[type]=card&payment_method_data[card][number]={{pan}}",
 		http.StatusBadRequest, msgEndpointNotAllowed)
-	ok("payment_methods after refusals", call("payment_methods after refusals", tokC, "/v1/payment_methods", embeddedPMBody, nil), pmID)
+	ok("tokens after refusals", call("tokens after refusals", tokB, "/v1/tokens", embeddedTokensBody, nil), tokID)
 }

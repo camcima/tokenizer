@@ -1403,7 +1403,7 @@ type catAccount struct {
 // Raw decode targets. Their JSON names are the catalog.json schema:
 //
 //	{"providers": {NAME: {"format": "json"|"form", "endpoints": [{"id", "method", "path", "query": [KEY],
-//	   "card_data": BOOL, "headers": {NAME: TEMPLATE}, "positions": {ADDR: PLACEHOLDER},
+//	   "card_data": true, "headers": {NAME: TEMPLATE}, "positions": {ADDR: PLACEHOLDER},
 //	   "pins": {ADDR: {"account": VALUE_NAME} | {"literal": SCALAR}}, "forbid": {ADDR: [SCALAR]},
 //	   "signer": "payu"}]}},
 //	 "accounts": {NAME: {"provider", "env": "dev"|"prod", "host", "base_path",
@@ -1611,15 +1611,23 @@ func parseCatProvider(name string, rp rawProvider) (*catProvider, error) {
 }
 
 // parseCatEndpoint validates one endpoint rule of a provider with body format format.
-// SPEC-DECISION: beyond D§5.3, (1) {{basic:}} is header-only, (2) an endpoint with card_data must
-// list at least one card position, (3) the payu signer needs a json provider (it reads body fields
-// by JSON Pointer), (4) the whole-document address "" and empty JSON Pointer tokens are rejected,
-// and (5) form positions and pins may not use a repeatable "[]" key (it names no single value).
+// SPEC-DECISION: beyond D§5.3, (1) {{basic:}} is header-only, (2) the payu signer needs a json
+// provider (it reads body fields by JSON Pointer), (3) the whole-document address "" and empty JSON
+// Pointer tokens are rejected, and (4) form positions and pins may not use a repeatable "[]" key (it
+// names no single value).
+// SPEC-DECISION: every endpoint must have "card_data": true and list a {{pan}} position. D§5.6 scopes
+// the account credential to card-carrying calls, and D§2 leaves calls without card data (payments
+// with a provider token, refunds, queries) to the platform, with its own keys. A non-card endpoint
+// would let the platform borrow the vault's credential for a call the vault has no reason to make,
+// so it is refused here, and checkProxy refuses a request without a {{pan}} occurrence.
 func parseCatEndpoint(format string, i int, re rawEndpoint) (*catEndpoint, error) {
 	if !catNameRe.MatchString(re.ID) {
 		return nil, fmt.Errorf("endpoint #%d: invalid id", i)
 	}
 	id := re.ID
+	if !re.CardData {
+		return nil, fmt.Errorf("endpoint %q: card_data must be true (non-card calls are made by the platform)", id)
+	}
 	switch re.Method {
 	case "GET", "POST", "PUT", "PATCH", "DELETE":
 	default:
@@ -1663,7 +1671,7 @@ func parseCatEndpoint(format string, i int, re rawEndpoint) (*catEndpoint, error
 		e.headers[name] = re.Headers[k]
 	}
 
-	hasCard := false
+	hasPAN := false
 	for _, addr := range slices.Sorted(maps.Keys(re.Positions)) {
 		if !validCatAddress(format, addr) || (format == "form" && strings.HasSuffix(addr, "[]")) {
 			return nil, fmt.Errorf("endpoint %q: position %q: invalid address", id, addr)
@@ -1675,15 +1683,12 @@ func parseCatEndpoint(format string, i int, re rawEndpoint) (*catEndpoint, error
 		if ph.kind == "basic" {
 			return nil, fmt.Errorf("endpoint %q: position %q: {{basic:}} is only allowed in headers", id, addr)
 		}
-		if ph.isCard() && !re.CardData {
-			return nil, fmt.Errorf("endpoint %q: position %q: card placeholder without card_data", id, addr)
-		}
-		hasCard = hasCard || ph.isCard()
+		hasPAN = hasPAN || ph.kind == "pan"
 		usesSignature = usesSignature || ph.kind == "signature"
 		e.positions[addr] = ph
 	}
-	if re.CardData && !hasCard {
-		return nil, fmt.Errorf("endpoint %q: card_data without a card position", id)
+	if !hasPAN {
+		return nil, fmt.Errorf("endpoint %q: no {{pan}} position", id)
 	}
 
 	for _, addr := range slices.Sorted(maps.Keys(re.Pins)) {
@@ -2060,19 +2065,24 @@ var payuSignerInputs = []string{
 var proxyWildcardRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 // checkProxy applies the catalog's rules to e. Checks run in a fixed order and the first failure
-// wins: token, account, endpoint (method, path, query), headers, body parse, placeholder positions,
-// pins, forbid, signer inputs. It touches no network and no database. Every rejection is 400.
+// wins: token, account, endpoint (method, path, query), headers, body parse, placeholder positions
+// (including the required {{pan}}), pins, forbid, signer inputs. It touches no network and no
+// database, and handleProxy runs it before any database call. Every rejection is 400.
 // A GET or HEAD endpoint must have an empty body (checked right after the headers).
 //
-// SPEC-DECISION: an empty body skips the body checks only on an endpoint with no positions, no pins
-// (every pin requires the field to be present) and no signer, i.e. where an empty body cannot fail
-// them (a forbid field is absent, which passes). Anywhere else the empty body goes through scanBody
-// as normal, so an empty json body is msgBadBody, and an empty form body (zero fields) fails the
-// pins and signer as any body lacking those fields would.
+// SPEC-DECISION: every request must contain a {{pan}} occurrence, or it is msgPlaceholder (reason
+// "placeholder", so ALERT proxy_policy fires). The vault's credential is only for card-carrying calls
+// (D§5.6); a request without the card, such as POST /v1/tokens with pii[id_number], would borrow it
+// for a call the platform makes with its own keys (D§2). parseCatEndpoint requires a {{pan}} position
+// on every endpoint, so a request that carries the card always can. There is no empty-body
+// shortcut: an empty json body is msgBadBody, and an empty form body (zero fields) lacks {{pan}}.
+// SPEC-DECISION: a GET or HEAD endpoint still parses, and its request must have no body; with the
+// {{pan}} rule above, no request to one can pass. The body rule is kept so that the two stay
+// independent if either changes.
 // SPEC-DECISION: a position address present in the body must hold exactly its placeholder; any
 // literal there (an object, a number, the platform's own API key at /merchant/apiKey, a raw PAN) is
-// msgPlaceholder. D§5.6: credential fields only accept vault placeholders. Positions stay optional:
-// a body may omit the field entirely.
+// msgPlaceholder. D§5.6: credential fields only accept vault placeholders. Positions other than the
+// {{pan}} one stay optional: a body may omit such a field entirely.
 // SPEC-DECISION: a body field whose address differs from a position, pin or forbid address only in
 // case ("/MerchantAccount" next to or instead of "/merchantAccount") fails that check (placeholder,
 // pin or forbidden_field). Some provider parsers bind keys case-insensitively (Go's encoding/json,
@@ -2108,9 +2118,6 @@ func (c *catalog) checkProxy(e *proxyEnvelope) (*proxyPlan, *policyError) {
 	// defined meaning to the provider, so it is refused rather than sent or dropped.
 	if (ep.method == http.MethodGet || ep.method == http.MethodHead) && len(body) != 0 {
 		return fail(msgBadBody, "body")
-	}
-	if len(body) == 0 && len(ep.positions) == 0 && len(ep.pins) == 0 && ep.signer == "" {
-		return plan, nil
 	}
 
 	occs, err := scanBody(prov.format, body)
@@ -2156,6 +2163,9 @@ func (c *catalog) checkProxy(e *proxyEnvelope) (*proxyPlan, *policyError) {
 		if caseVariant(addr) {
 			return fail(msgPlaceholder, "placeholder")
 		}
+	}
+	if !cardKinds["pan"] {
+		return fail(msgPlaceholder, "placeholder") // no card in the request: see the {{pan}} SPEC-DECISION above
 	}
 	plan.occs = occs
 	plan.usesCVV, plan.usesName = cardKinds["cvv"], cardKinds["name"]
