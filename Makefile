@@ -1,4 +1,4 @@
-.PHONY: build test lint vuln deps-check vendor-check image image-repro ci tools itest ci-all
+.PHONY: build test lint vuln deps-check vendor-check image image-repro ci tools itest stripe-mock-test ci-all
 
 # Tools from the module's toolchain (go.mod `toolchain go1.27.3`), not whatever is first on PATH.
 GOFMT   = $(shell go env GOROOT)/bin/gofmt
@@ -20,6 +20,13 @@ IMAGE_BUILD = docker buildx build --provenance=false --build-arg SOURCE_DATE_EPO
 
 PG_NAME = pan-vault-pg
 PG_PORT ?= 55432
+
+# stripe/stripe-mock v0.206.0 (index digest of :latest on 2026-10-01). Only its plain-HTTP port is
+# published, on loopback: its HTTPS cert has no SANs, so TestStripeMock relays the vault's TLS
+# requests through a test-only httptest TLS server (see the test's comment).
+STRIPE_MOCK_IMAGE := stripe/stripe-mock@sha256:aeb96b83e87a893d2ac005e363ac01ffa6e59a5ad85b49c155dfc9129de02e78
+STRIPE_MOCK_NAME  = pan-vault-stripe-mock
+STRIPE_MOCK_PORT ?= 12111
 
 build:
 	CGO_ENABLED=0 go build -mod=vendor -trimpath -ldflags="-s -w -buildid=" -o vault .
@@ -114,4 +121,18 @@ itest:
 	VAULT_TEST_DB_URL='postgres://vault_owner@127.0.0.1:$(PG_PORT)/vault?sslmode=disable' \
 		go test -race -count=1 -run Integration ./...
 
-ci-all: ci itest image-repro
+# Request-shape check of the Stripe ops against stripe-mock (Stripe's OpenAPI definition); the
+# container is always removed and the test's exit status is propagated.
+stripe-mock-test:
+	@docker rm -f $(STRIPE_MOCK_NAME) >/dev/null 2>&1 || true
+	@trap 'docker rm -f $(STRIPE_MOCK_NAME) >/dev/null 2>&1' EXIT; trap 'exit 130' INT TERM; \
+	docker run -d --name $(STRIPE_MOCK_NAME) -p 127.0.0.1:$(STRIPE_MOCK_PORT):12111 $(STRIPE_MOCK_IMAGE) >/dev/null || exit 1; \
+	ready=0; for i in $$(seq 1 60); do \
+		if curl -s -o /dev/null http://127.0.0.1:$(STRIPE_MOCK_PORT)/; then ready=1; break; fi; \
+		sleep 1; \
+	done; \
+	[ $$ready -eq 1 ] || { echo "stripe-mock-test: stripe-mock did not become ready"; exit 1; }; \
+	VAULT_TEST_STRIPE_MOCK_URL=http://127.0.0.1:$(STRIPE_MOCK_PORT) \
+		go test -race -count=1 -run StripeMock -v ./...
+
+ci-all: ci itest stripe-mock-test image-repro

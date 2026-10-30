@@ -27,6 +27,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/exec"
@@ -4223,5 +4224,164 @@ func TestStripeLive(t *testing.T) {
 		masked, _ := maskPAN(rec.Body.Bytes(), testPAN)
 		t.Fatalf("create_payment_method: status %d, body (PAN masked, key redacted): %s",
 			rec.Code, strings.ReplaceAll(string(masked), secret, "<redacted>"))
+	}
+}
+
+// TestStripeMock checks the vault's real outbound Stripe requests against Stripe's published API
+// definition by sending them to stripe/stripe-mock (`make stripe-mock-test`). It runs only when
+// VAULT_TEST_STRIPE_MOCK_URL names stripe-mock's plain-HTTP port on a loopback address.
+//
+// stripe-mock's built-in HTTPS certificate is an X.509 v1 cert with CN=localhost and no SANs, which
+// Go cannot hostname-verify for any ServerName, and stripe-mock takes no cert flags. So the vault
+// talks TLS to a test-only relay (an httptest TLS server whose certificate is the only root in the
+// vault client's pool, exactly as pointStripe does for the fake provider): the vault's client is
+// the unmodified, fully verifying newOutboundClient. The relay forwards method, path, headers and
+// body unchanged to stripe-mock over loopback HTTP and returns its status, headers and body.
+func TestStripeMock(t *testing.T) {
+	raw := os.Getenv("VAULT_TEST_STRIPE_MOCK_URL")
+	if raw == "" {
+		t.Skip("set VAULT_TEST_STRIPE_MOCK_URL (e.g. via `make stripe-mock-test`) to run")
+	}
+	target, err := url.Parse(raw)
+	if err != nil || target.Scheme != "http" || target.Path != "" && target.Path != "/" {
+		t.Fatal("VAULT_TEST_STRIPE_MOCK_URL must be http://<loopback>:<port>")
+	}
+	if h := target.Hostname(); h != "localhost" && !(net.ParseIP(h) != nil && net.ParseIP(h).IsLoopback()) {
+		t.Fatalf("VAULT_TEST_STRIPE_MOCK_URL host %q is not loopback", h)
+	}
+	const secret = "sk_test_123" // stripe-mock accepts any sk_test_ key
+
+	// What stripe-mock received for the latest request; recorded by the relay, never printed.
+	type seen struct {
+		hits                       int
+		method, path               string
+		authOK, formOK, userAgent  bool
+		hasCVC, hasCustomer, hasPM bool
+	}
+	var mu sync.Mutex
+	var last seen
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetURL(target) // no SetXForwarded: headers reach stripe-mock as the vault sent them
+		},
+		Transport:     &http.Transport{Proxy: nil},
+		ErrorLog:      log.New(io.Discard, "", 0),
+		FlushInterval: -1,
+	}
+	relay := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "relay read failed", http.StatusBadGateway)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		form, _ := url.ParseQuery(string(body))
+		mu.Lock()
+		last = seen{
+			hits:        last.hits + 1,
+			method:      r.Method,
+			path:        r.URL.Path,
+			authOK:      slices.Equal(r.Header.Values("Authorization"), []string{"Bearer " + secret}),
+			formOK:      r.Header.Get("Content-Type") == "application/x-www-form-urlencoded",
+			userAgent:   r.Header.Get("User-Agent") == "pan-vault/1",
+			hasCVC:      form.Has("card[cvc]"),
+			hasCustomer: form.Get("customer") == "cus_123",
+			hasPM:       form.Get("type") == "card",
+		}
+		mu.Unlock()
+		proxy.ServeHTTP(w, r)
+	}))
+	t.Cleanup(relay.Close)
+
+	v, s := newTestVault(t)
+	v.providers = newProviders(secret)
+	pointStripe(t, v, relay.URL, relay.Certificate())
+
+	// show makes a response body printable: PAN masked, key redacted, at most 2 KiB.
+	show := func(b []byte) string {
+		m, _ := maskPAN(b, testPAN)
+		out := strings.ReplaceAll(string(m), secret, "<redacted>")
+		if len(out) > 2048 {
+			out = out[:2048] + "…"
+		}
+		return out
+	}
+	pmID := regexp.MustCompile(`"id":\s*"pm_`)
+	tokID := regexp.MustCompile(`"id":\s*"tok_`)
+
+	call := func(name, op, tok string, params map[string]string, wantPath string, wantCVC bool) (*httptest.ResponseRecorder, seen) {
+		t.Helper()
+		mu.Lock()
+		before := last.hits
+		mu.Unlock()
+		rec := serveInternal(v, newProxyRequest(proxyBody("stripe", op, tok, params)))
+		mu.Lock()
+		got := last
+		mu.Unlock()
+		if got.hits != before+1 {
+			t.Fatalf("%s: stripe-mock got %d requests, want 1 (vault status %d)", name, got.hits-before, rec.Code)
+		}
+		if got.method != "POST" || got.path != wantPath {
+			t.Errorf("%s: outbound %s %s, want POST %s", name, got.method, got.path, wantPath)
+		}
+		if !got.authOK {
+			t.Errorf("%s: stripe-mock did not receive exactly the vault credential", name) // never print it
+		}
+		if !got.formOK || !got.userAgent {
+			t.Errorf("%s: outbound Content-Type or User-Agent wrong", name)
+		}
+		if got.hasCVC != wantCVC {
+			t.Errorf("%s: card[cvc] sent = %v, want %v", name, got.hasCVC, wantCVC)
+		}
+		return rec, got
+	}
+
+	// 1. create_payment_method, no params, CVV present.
+	tok1 := seedCard(t, v, s, testCVV)
+	rec, got := call("create_payment_method", "create_payment_method", tok1, nil, "/v1/payment_methods", true)
+	if !got.hasPM || got.hasCustomer {
+		t.Error("create_payment_method: outbound type=card missing or unexpected customer")
+	}
+	if rec.Code != http.StatusOK || !pmID.Match(rec.Body.Bytes()) {
+		t.Errorf("create_payment_method: status %d, body len %d (PAN masked): %s", rec.Code, rec.Body.Len(), show(rec.Body.Bytes()))
+	}
+
+	// 2. create_payment_method with customer: assert success if stripe-mock accepts it; a rejection
+	// is a FINDING for the catalog owner, logged without card data, not a test failure.
+	tok2 := seedCard(t, v, s, testCVV)
+	rec, got = call("create_payment_method+customer", "create_payment_method", tok2, map[string]string{"customer": "cus_123"}, "/v1/payment_methods", true)
+	if !got.hasPM || !got.hasCustomer {
+		t.Error("create_payment_method+customer: outbound type=card or customer missing")
+	}
+	switch {
+	case rec.Code == http.StatusOK:
+		if !pmID.Match(rec.Body.Bytes()) {
+			t.Errorf("create_payment_method+customer: 200 without a pm_ id, body len %d (PAN masked): %s", rec.Body.Len(), show(rec.Body.Bytes()))
+		} else {
+			t.Log("create_payment_method with customer: accepted by stripe-mock (200, pm_ id)")
+		}
+	default:
+		var e struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &e)
+		msg, _ := maskPAN([]byte(e.Error.Message), testPAN)
+		t.Logf("FINDING (create_payment_method with customer): stripe-mock rejected it: status %d, message %q",
+			rec.Code, strings.ReplaceAll(string(msg), secret, "<redacted>"))
+	}
+
+	// 3. create_token, CVV present.
+	tok3 := seedCard(t, v, s, testCVV)
+	rec, _ = call("create_token", "create_token", tok3, nil, "/v1/tokens", true)
+	if rec.Code != http.StatusOK || !tokID.Match(rec.Body.Bytes()) {
+		t.Errorf("create_token: status %d, body len %d (PAN masked): %s", rec.Code, rec.Body.Len(), show(rec.Body.Bytes()))
+	}
+
+	// 4. create_payment_method on tok1 again: its CVV was consumed by case 1, so no card[cvc].
+	rec, _ = call("create_payment_method (CVV consumed)", "create_payment_method", tok1, nil, "/v1/payment_methods", false)
+	if rec.Code != http.StatusOK || !pmID.Match(rec.Body.Bytes()) {
+		t.Errorf("create_payment_method (CVV consumed): status %d, body len %d (PAN masked): %s", rec.Code, rec.Body.Len(), show(rec.Body.Bytes()))
 	}
 }
