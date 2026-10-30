@@ -8,6 +8,8 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -16,6 +18,7 @@ import (
 	"log"
 	"mime"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -252,6 +255,8 @@ type vault struct {
 	cvv         *cvvCache
 	now         func() time.Time
 	log         *log.Logger
+	providers   map[string]provider // the catalog (§6.3); see newProviders
+	client      *http.Client        // the single shared outbound client (§9.2)
 
 	lastSessionAlert atomic.Int64 // unix second of last session_token_invalid alert
 }
@@ -693,4 +698,167 @@ func (v *vault) handleTokenize(w http.ResponseWriter, r *http.Request) {
 		v.cvv.put(token, *req.CVV)
 	}
 	writeJSON(w, http.StatusOK, tokenizeResponse{Token: token, Last4: last4, ExpMonth: req.ExpMonth, ExpYear: req.ExpYear})
+}
+
+// ---------------------------------------------------------------------------
+// Provider catalog, egress invariant, PAN masking, outbound client (SPEC §6.3, §6.4, §9)
+// ---------------------------------------------------------------------------
+
+// opBuilder constructs the ENTIRE provider request for one op: path, content type and body.
+// The PAN, expiry and CVV appear only where the builder puts them; nothing from the caller but
+// declared param values ever reaches the body (§6.3).
+type opBuilder func(params map[string]string, c card, cvv string) (path string, contentType string, body []byte, err error)
+
+type provider struct {
+	base   *url.URL                             // e.g. https://api.stripe.com
+	secret string                               // loaded at boot; never from a request
+	auth   func(r *http.Request, secret string) // how to attach the credential
+	ops    map[string]op
+}
+
+type op struct {
+	params map[string]bool // allowed param keys
+	build  opBuilder
+}
+
+const (
+	maxProviderResponse = 4 << 20 // §6.4 step 9: provider response body limit
+	formContentType     = "application/x-www-form-urlencoded"
+)
+
+var (
+	errBuild  = errors.New("invalid params")
+	errEgress = errors.New("egress invariant")
+)
+
+// newProviders returns the provider catalog (§6.3 v1). Adding a provider or op is a PR that also
+// updates egress-hosts.txt and the egress firewall rule (§9.1, §12.4); TestCatalogMatchesEgressHosts
+// keeps the catalog and egress-hosts.txt in step.
+func newProviders(stripeSecret string) map[string]provider {
+	return map[string]provider{
+		"stripe": {
+			base:   &url.URL{Scheme: "https", Host: "api.stripe.com"},
+			secret: stripeSecret,
+			auth:   stripeAuth,
+			ops: map[string]op{
+				"create_payment_method": {params: map[string]bool{"customer": true}, build: stripeCreatePaymentMethod},
+				"create_token":          {params: map[string]bool{}, build: stripeCreateToken},
+			},
+		},
+	}
+}
+
+// stripeAuth attaches "Authorization: Bearer <secret>", replacing any value already present.
+func stripeAuth(r *http.Request, secret string) {
+	r.Header.Set("Authorization", "Bearer "+secret)
+}
+
+// stripeCard returns the card fields shared by both Stripe ops: card[number], card[exp_month],
+// card[exp_year], and card[cvc] only if a CVV is available.
+func stripeCard(c card, cvv string) url.Values {
+	v := url.Values{
+		"card[number]":    {c.PAN},
+		"card[exp_month]": {c.ExpMonth},
+		"card[exp_year]":  {c.ExpYear},
+	}
+	if cvv != "" {
+		v.Set("card[cvc]", cvv)
+	}
+	return v
+}
+
+// stripeCreatePaymentMethod builds POST /v1/payment_methods (§6.3): type=card, the card fields,
+// and customer if given.
+// SPEC-DECISION: the builder re-checks its params even though the handler already enforced
+// op.params: any undeclared key, or a customer that is present but empty, is an error rather
+// than being dropped or sent.
+func stripeCreatePaymentMethod(params map[string]string, c card, cvv string) (string, string, []byte, error) {
+	for k := range params {
+		if k != "customer" {
+			return "", "", nil, errBuild
+		}
+	}
+	v := stripeCard(c, cvv)
+	v.Set("type", "card")
+	if cus, ok := params["customer"]; ok {
+		if cus == "" {
+			return "", "", nil, errBuild
+		}
+		v.Set("customer", cus)
+	}
+	return "/v1/payment_methods", formContentType, []byte(v.Encode()), nil
+}
+
+// stripeCreateToken builds POST /v1/tokens (§6.3): the card fields only. It takes no params.
+func stripeCreateToken(params map[string]string, c card, cvv string) (string, string, []byte, error) {
+	if len(params) != 0 {
+		return "", "", nil, errBuild
+	}
+	return "/v1/tokens", formContentType, []byte(stripeCard(c, cvv).Encode()), nil
+}
+
+// providerURL is the egress invariant (§6.4 step 6): it builds https://<base.Host><path> and
+// returns errEgress unless the scheme is https and the host is exactly base.Host, both on the
+// constructed URL and on a reparse of its string form (what the transport actually dials).
+// SPEC-DECISION: also refused: a path not starting with "/", a base that is not https with a
+// host, and a reparse that gains userinfo, a query or a fragment or changes the path.
+func providerURL(base *url.URL, path string) (*url.URL, error) {
+	if base == nil || base.Scheme != "https" || base.Host == "" || !strings.HasPrefix(path, "/") {
+		return nil, errEgress
+	}
+	u := &url.URL{Scheme: "https", Host: base.Host, Path: path}
+	if u.Scheme != "https" || u.Host != base.Host {
+		return nil, errEgress
+	}
+	re, err := url.Parse(u.String())
+	if err != nil || re.Scheme != "https" || re.Host != base.Host || re.User != nil ||
+		re.RawQuery != "" || re.ForceQuery || re.Fragment != "" || re.Path != path {
+		return nil, errEgress
+	}
+	return u, nil
+}
+
+// maskPAN replaces every occurrence of pan, and of pan grouped in fours from the left with single
+// spaces ("4242 4242 4242 4242", "3782 8224 6310 005"), with "****"+last4 (§6.4 step 9). found
+// reports whether anything was replaced; if not, body is returned unchanged.
+func maskPAN(body []byte, pan string) ([]byte, bool) {
+	if len(pan) < 4 { // never a real PAN; also keeps an empty needle out of bytes.ReplaceAll
+		return body, false
+	}
+	var spaced strings.Builder
+	for i := 0; i < len(pan); i++ {
+		if i > 0 && i%4 == 0 {
+			spaced.WriteByte(' ')
+		}
+		spaced.WriteByte(pan[i])
+	}
+	mask := []byte("****" + pan[len(pan)-4:])
+	found := false
+	for _, form := range []string{pan, spaced.String()} {
+		if bytes.Contains(body, []byte(form)) {
+			body = bytes.ReplaceAll(body, []byte(form), mask)
+			found = true
+		}
+	}
+	return body, found
+}
+
+// newOutboundClient returns the single shared provider client (§6.4 step 8, §9.2): 30s hard
+// timeout, redirects never followed, no proxy from the environment, TLS >= 1.2 verified against
+// roots (nil = system roots; tests pass an httptest server's CA), 16 idle conns per host.
+func newOutboundClient(roots *x509.CertPool) *http.Client {
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Transport: &http.Transport{
+			Proxy:               nil, // never HTTP_PROXY/HTTPS_PROXY
+			TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots},
+			ForceAttemptHTTP2:   true,
+			MaxIdleConnsPerHost: 16,
+			TLSHandshakeTimeout: 10 * time.Second,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
 }

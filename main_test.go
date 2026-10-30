@@ -13,11 +13,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -388,7 +391,8 @@ func (s *fakeStore) getCard(_ context.Context, token, _ string) ([]byte, int, er
 }
 
 // newTestVault returns a vault wired to an in-memory fakeStore: DEK v1 = 32×0x01, session key
-// testHMACKey, origin testOrigin, logger → &testLog, clock fixed at testNow. The CVV cache reads
+// testHMACKey, origin testOrigin, logger → &testLog, clock fixed at testNow, providers =
+// newProviders(testSecret) (client stays nil; proxy tests set it). The CVV cache reads
 // the clock through v.now, so a test that replaces v.now moves both.
 func newTestVault(t *testing.T) (*vault, *fakeStore) {
 	t.Helper()
@@ -404,6 +408,7 @@ func newTestVault(t *testing.T) (*vault, *fakeStore) {
 		allowOrigin: testOrigin,
 		now:         now,
 		log:         log.New(&testLog, "", 0),
+		providers:   newProviders(testSecret),
 	}
 	v.cvv = newCVVCache(15*time.Minute, func() time.Time { return v.now() })
 	return v, s
@@ -1530,5 +1535,266 @@ func TestTokenizeDuplicateContentType(t *testing.T) {
 	r.Header.Add("Content-Type", "application/json")
 	if rec := serveTokenize(v, r); rec.Code != http.StatusBadRequest || rec.Body.String() != `{"error":"content type must be application/json"}`+"\n" {
 		t.Fatalf("status %d, body len %d", rec.Code, rec.Body.Len())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Provider catalog, egress invariant, PAN masking, outbound client (§6.3, §6.4, §9)
+// ---------------------------------------------------------------------------
+
+// redactBody makes a provider request body printable in a failure message: the PAN (both forms)
+// goes through maskPAN, then the values of card[cvc]/card[exp_month]/card[exp_year] and any
+// stray test CVV are replaced, so only structure, field names and non-card values show.
+func redactBody(b []byte) string {
+	m, _ := maskPAN(b, testPAN)
+	s := cardFieldRe.ReplaceAllString(string(m), "${1}<redacted>")
+	return strings.ReplaceAll(s, testCVV, "<cvv>")
+}
+
+var cardFieldRe = regexp.MustCompile(`(card%5B(?:cvc|exp_month|exp_year)%5D=)[^&]*`)
+
+func TestStripeBuilders(t *testing.T) {
+	c := card{PAN: testPAN, ExpMonth: "12", ExpYear: "2030"}
+	const form = "application/x-www-form-urlencoded"
+	for _, tc := range []struct {
+		name               string
+		build              opBuilder
+		params             map[string]string
+		cvv                string
+		wantPath, wantBody string
+	}{
+		{"create_payment_method customer+cvv", stripeCreatePaymentMethod, map[string]string{"customer": "cus_123"}, testCVV,
+			"/v1/payment_methods",
+			"card%5Bcvc%5D=9071&card%5Bexp_month%5D=12&card%5Bexp_year%5D=2030&card%5Bnumber%5D=4242424242424242&customer=cus_123&type=card"},
+		{"create_payment_method bare", stripeCreatePaymentMethod, nil, "",
+			"/v1/payment_methods",
+			"card%5Bexp_month%5D=12&card%5Bexp_year%5D=2030&card%5Bnumber%5D=4242424242424242&type=card"},
+		{"create_payment_method empty params map", stripeCreatePaymentMethod, map[string]string{}, "",
+			"/v1/payment_methods",
+			"card%5Bexp_month%5D=12&card%5Bexp_year%5D=2030&card%5Bnumber%5D=4242424242424242&type=card"},
+		{"create_payment_method customer is encoded", stripeCreatePaymentMethod, map[string]string{"customer": "a&type=x"}, "",
+			"/v1/payment_methods",
+			"card%5Bexp_month%5D=12&card%5Bexp_year%5D=2030&card%5Bnumber%5D=4242424242424242&customer=a%26type%3Dx&type=card"},
+		{"create_token cvv", stripeCreateToken, nil, testCVV,
+			"/v1/tokens",
+			"card%5Bcvc%5D=9071&card%5Bexp_month%5D=12&card%5Bexp_year%5D=2030&card%5Bnumber%5D=4242424242424242"},
+		{"create_token bare", stripeCreateToken, map[string]string{}, "",
+			"/v1/tokens",
+			"card%5Bexp_month%5D=12&card%5Bexp_year%5D=2030&card%5Bnumber%5D=4242424242424242"},
+	} {
+		path, ct, body, err := tc.build(tc.params, c, tc.cvv)
+		if err != nil {
+			t.Errorf("%s: unexpected error", tc.name)
+			continue
+		}
+		if path != tc.wantPath || ct != form {
+			t.Errorf("%s: path %q content type %q", tc.name, path, ct)
+		}
+		if string(body) != tc.wantBody {
+			t.Errorf("%s: body mismatch (card values redacted)\n got  %s\n want %s", tc.name, redactBody(body), redactBody([]byte(tc.wantBody)))
+		}
+	}
+
+	// Builders fail closed on any param they do not declare, and on an empty customer.
+	for _, tc := range []struct {
+		name   string
+		build  opBuilder
+		params map[string]string
+	}{
+		{"create_payment_method unknown key", stripeCreatePaymentMethod, map[string]string{"amount": "1"}},
+		{"create_payment_method empty customer", stripeCreatePaymentMethod, map[string]string{"customer": ""}},
+		{"create_token customer", stripeCreateToken, map[string]string{"customer": "cus_123"}},
+		{"create_token card override", stripeCreateToken, map[string]string{"card[number]": "4000056655665556"}},
+	} {
+		if _, _, body, err := tc.build(tc.params, c, testCVV); err == nil || body != nil {
+			t.Errorf("%s: accepted (err nil=%v, body len %d)", tc.name, err == nil, len(body))
+		}
+	}
+}
+
+func TestStripeAuth(t *testing.T) {
+	r := httptest.NewRequest("POST", "https://api.stripe.com/v1/tokens", nil)
+	r.Header.Set("Authorization", "Bearer sk_test_attacker")
+	stripeAuth(r, testSecret)
+	if got := r.Header.Values("Authorization"); len(got) != 1 || got[0] != "Bearer "+testSecret {
+		t.Fatalf("Authorization not exactly the vault credential (%d values)", len(got)) // never print the value
+	}
+}
+
+func TestCatalogShape(t *testing.T) {
+	ps := newProviders(testSecret)
+	if len(ps) != 1 {
+		t.Fatalf("catalog has %d providers, want 1", len(ps))
+	}
+	p, ok := ps["stripe"]
+	if !ok {
+		t.Fatal("no stripe provider")
+	}
+	if p.base == nil || p.base.Scheme != "https" || p.base.Host != "api.stripe.com" || p.base.User != nil ||
+		p.base.Path != "" || p.base.RawQuery != "" || p.base.Fragment != "" {
+		t.Fatal("stripe base is not exactly https://api.stripe.com")
+	}
+	if p.secret != testSecret || p.auth == nil {
+		t.Fatal("stripe secret or auth not wired") // never print the secret
+	}
+	want := map[string]struct {
+		params []string
+		path   string
+	}{
+		"create_payment_method": {[]string{"customer"}, "/v1/payment_methods"},
+		"create_token":          {nil, "/v1/tokens"},
+	}
+	if len(p.ops) != len(want) {
+		t.Fatalf("stripe has %d ops, want %d", len(p.ops), len(want))
+	}
+	for name, w := range want {
+		o, ok := p.ops[name]
+		if !ok || o.build == nil {
+			t.Errorf("op %s missing or has no builder", name)
+			continue
+		}
+		wantParams := map[string]bool{}
+		for _, k := range w.params {
+			wantParams[k] = true
+		}
+		if !maps.Equal(o.params, wantParams) {
+			t.Errorf("op %s params %v, want %v", name, o.params, wantParams)
+		}
+		if path, _, _, err := o.build(nil, card{PAN: testPAN, ExpMonth: "12", ExpYear: "2030"}, ""); err != nil || path != w.path {
+			t.Errorf("op %s builds path %q (err nil=%v), want %q", name, path, err == nil, w.path)
+		}
+	}
+
+	v, _ := newTestVault(t)
+	if s, ok := v.providers["stripe"]; !ok || s.secret != testSecret || s.base.Host != "api.stripe.com" {
+		t.Fatal("newTestVault does not wire newProviders(testSecret)")
+	}
+	if v.client != nil {
+		t.Fatal("newTestVault must leave client nil; proxy tests set it per fake provider")
+	}
+}
+
+// egress-hosts.txt is the file the infra repo's firewall check diffs against (§9.1); it must list
+// exactly the catalog's hosts.
+func TestCatalogMatchesEgressHosts(t *testing.T) {
+	raw, err := os.ReadFile("egress-hosts.txt")
+	if err != nil {
+		t.Fatal("cannot read egress-hosts.txt")
+	}
+	file := map[string]bool{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if h := strings.TrimSpace(line); h != "" {
+			file[h] = true
+		}
+	}
+	catalog := map[string]bool{}
+	for _, p := range newProviders("x") {
+		catalog[p.base.Host] = true
+	}
+	if len(catalog) == 0 || !maps.Equal(file, catalog) {
+		t.Fatalf("egress-hosts.txt %v != catalog hosts %v", slices.Sorted(maps.Keys(file)), slices.Sorted(maps.Keys(catalog)))
+	}
+}
+
+func TestProviderURLInvariant(t *testing.T) {
+	base, _ := url.Parse("https://api.stripe.com")
+	crafted := []string{
+		"/v1/tokens", "//evil.com/x", "https://evil.com/x", "/v1/../../x", "@evil.com", "/%2F%2Fevil.com",
+		"/\\evil.com/x", "/v1/tokens?x=https://evil.com#frag", "/v1/tokens\r\nHost: evil.com", "/@evil.com",
+		"/:443@evil.com", "///evil.com", "/v1/tokens%00", "http://evil.com", "//api.stripe.com@evil.com/",
+	}
+	for i, p := range crafted {
+		u, err := providerURL(base, p)
+		if err != nil {
+			continue
+		}
+		if u.Scheme != "https" || u.Host != "api.stripe.com" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			t.Errorf("case %d: constructed URL escapes scheme/host", i)
+			continue
+		}
+		re, err := url.Parse(u.String())
+		if err != nil || re.Scheme != "https" || re.Host != "api.stripe.com" || re.User != nil || re.RawQuery != "" || re.Fragment != "" {
+			t.Errorf("case %d: reparsed URL escapes scheme/host", i)
+		}
+	}
+
+	u, err := providerURL(base, "/v1/tokens")
+	if err != nil || u.String() != "https://api.stripe.com/v1/tokens" {
+		t.Fatalf("valid path rejected or altered (err nil=%v)", err == nil)
+	}
+	for i, p := range []string{"", "v1/tokens", "@evil.com", "https://evil.com/x", "evil.com/x", " /v1/tokens"} {
+		if _, err := providerURL(base, p); err == nil {
+			t.Errorf("relative case %d accepted", i)
+		}
+	}
+
+	// A base that is not plain https with a host is itself refused (fail closed).
+	for i, b := range []*url.URL{nil, {Scheme: "http", Host: "api.stripe.com"}, {Scheme: "https"}} {
+		if _, err := providerURL(b, "/v1/tokens"); err == nil {
+			t.Errorf("bad base %d accepted", i)
+		}
+	}
+	// A test server base keeps its port.
+	tb, _ := url.Parse("https://127.0.0.1:8443")
+	if u, err := providerURL(tb, "/v1/tokens"); err != nil || u.Host != "127.0.0.1:8443" {
+		t.Fatal("host:port base not preserved")
+	}
+}
+
+func TestMaskPAN(t *testing.T) {
+	body := []byte(`{"n":"4242424242424242","f":"4242 4242 4242 4242"}`)
+	got, found := maskPAN(body, testPAN)
+	if !found || string(got) != `{"n":"****4242","f":"****4242"}` {
+		t.Errorf("masked: found=%v, still has PAN=%v, len %d", found, bytes.Contains(got, []byte("4242424242")), len(got))
+	}
+
+	// Every occurrence; a 15-digit PAN groups in fours from the left.
+	amex := "378282246310005"
+	got, found = maskPAN([]byte(amex+" x "+amex+" y 3782 8224 6310 005"), amex)
+	if !found || string(got) != "****0005 x ****0005 y ****0005" {
+		t.Errorf("amex: found=%v, len %d", found, len(got))
+	}
+
+	clean := []byte(`{"id":"pm_123","last4":"4242","n":"4242 4242 4242"}`)
+	got, found = maskPAN(clean, testPAN)
+	if found || !bytes.Equal(got, clean) {
+		t.Errorf("clean body changed or flagged (found=%v)", found)
+	}
+
+	// A PAN too short to be real masks nothing (and never loops on an empty needle).
+	for _, pan := range []string{"", "42"} {
+		if got, found := maskPAN(clean, pan); found || !bytes.Equal(got, clean) {
+			t.Errorf("short pan len %d: found=%v", len(pan), found)
+		}
+	}
+}
+
+func TestOutboundClientConfig(t *testing.T) {
+	pool := x509.NewCertPool()
+	for _, roots := range []*x509.CertPool{nil, pool} {
+		c := newOutboundClient(roots)
+		if c.Timeout != 30*time.Second {
+			t.Errorf("timeout %v", c.Timeout)
+		}
+		if c.CheckRedirect == nil || c.CheckRedirect(nil, nil) != http.ErrUseLastResponse {
+			t.Error("CheckRedirect does not return http.ErrUseLastResponse")
+		}
+		tr, ok := c.Transport.(*http.Transport)
+		if !ok {
+			t.Fatal("transport is not *http.Transport")
+		}
+		if tr.Proxy != nil {
+			t.Error("transport reads a proxy")
+		}
+		if tr.TLSClientConfig == nil || tr.TLSClientConfig.MinVersion != tls.VersionTLS12 ||
+			tr.TLSClientConfig.InsecureSkipVerify || tr.TLSClientConfig.RootCAs != roots {
+			t.Error("TLS config wrong (min version, verification, or roots)")
+		}
+		if tr.MaxIdleConnsPerHost != 16 {
+			t.Errorf("MaxIdleConnsPerHost %d", tr.MaxIdleConnsPerHost)
+		}
+	}
+	if maxProviderResponse != 4<<20 {
+		t.Errorf("maxProviderResponse %d", maxProviderResponse)
 	}
 }
