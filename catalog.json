@@ -1,0 +1,59 @@
+{
+  "providers": {
+    "stripe": {
+      "format": "form",
+      "endpoints": [
+        {
+          "id": "payment_intents",
+          "method": "POST",
+          "path": "/v1/payment_intents",
+          "card_data": true,
+          "headers": {
+            "Authorization": "Bearer {{secret:secretKey}}"
+          },
+          "positions": {
+            "payment_method_data[card][number]": "{{pan}}",
+            "payment_method_data[card][exp_month]": "{{exp_month}}",
+            "payment_method_data[card][exp_year]": "{{exp_year}}",
+            "payment_method_data[card][cvc]": "{{cvv}}",
+            "payment_method_data[billing_details][name]": "{{name}}"
+          },
+          "forbid": {
+            "setup_future_usage": [],
+            "customer": [],
+            "save_payment_method": [],
+            "payment_method_options[card][setup_future_usage]": []
+          }
+        },
+        {
+          "id": "tokens",
+          "method": "POST",
+          "path": "/v1/tokens",
+          "card_data": true,
+          "headers": {
+            "Authorization": "Bearer {{secret:secretKey}}"
+          },
+          "positions": {
+            "card[number]": "{{pan}}",
+            "card[exp_month]": "{{exp_month}}",
+            "card[exp_year]": "{{exp_year}}",
+            "card[cvc]": "{{cvv}}",
+            "card[name]": "{{name}}"
+          }
+        }
+      ]
+    }
+  },
+  "accounts": {
+    "stripe_test": {
+      "provider": "stripe",
+      "env": "dev",
+      "host": "api.stripe.com",
+      "base_path": "",
+      "secrets": {
+        "secretKey": "projects/pci-cde-dev/secrets/stripe-test-secret-key"
+      },
+      "values": {}
+    }
+  }
+}

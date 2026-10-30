@@ -1838,28 +1838,6 @@ func TestCatalogShape(t *testing.T) {
 	}
 }
 
-// egress-hosts.txt is the file the infra repo's firewall check diffs against (§9.1); it must list
-// exactly the catalog's hosts.
-func TestCatalogMatchesEgressHosts(t *testing.T) {
-	raw, err := os.ReadFile("egress-hosts.txt")
-	if err != nil {
-		t.Fatal("cannot read egress-hosts.txt")
-	}
-	file := map[string]bool{}
-	for _, line := range strings.Split(string(raw), "\n") {
-		if h := strings.TrimSpace(line); h != "" {
-			file[h] = true
-		}
-	}
-	catalog := map[string]bool{}
-	for _, p := range newProviders("x") {
-		catalog[p.base.Host] = true
-	}
-	if len(catalog) == 0 || !maps.Equal(file, catalog) {
-		t.Fatalf("egress-hosts.txt %v != catalog hosts %v", slices.Sorted(maps.Keys(file)), slices.Sorted(maps.Keys(catalog)))
-	}
-}
-
 func TestProviderURLInvariant(t *testing.T) {
 	base, _ := url.Parse("https://api.stripe.com")
 	crafted := []string{
@@ -2455,6 +2433,495 @@ func TestSubstitute(t *testing.T) {
 			}()
 			substitute(in, c.occs, c.repl)
 		}()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Provider catalog: catalog.json (D§5.1, D§5.5-5.7, D§5.10)
+// ---------------------------------------------------------------------------
+
+// testCatalogHost is the host of every testCatalogJSON account. testCatalog replaces it (quoted, so
+// only host values change) with the host under test, e.g. an httptest server's 127.0.0.1:port. A
+// test that needs different hosts per account sets c.accounts[name].host after parsing.
+const testCatalogHost = "upstream.test"
+
+// testCatalogJSON is the synthetic catalog the proxy tests run against. It models Stripe (form) and
+// the four first-wave json shapes of D§6: Adyen (account pin, forbid list, X-API-Key header),
+// Mercado Pago (single-use card token, :int expiry, Bearer), PayU (body credential, account and
+// literal pins, payu signer, yyyy/mm expiry) and Pagar.me (Basic auth, array positions). Every
+// provider has a dev account; adyen_br_live is the one prod account. Endpoint and account entries
+// keep their identifying fields on one line so that tests can mutate them with a string replace.
+// Secret resources all start with "projects/", so a test can check that no error names one.
+const testCatalogJSON = `{
+  "providers": {
+    "stripe": {
+      "format": "form",
+      "endpoints": [
+        {
+          "id": "payment_intents", "method": "POST", "path": "/v1/payment_intents", "card_data": true,
+          "headers": {"Authorization": "Bearer {{secret:secretKey}}"},
+          "positions": {
+            "payment_method_data[card][number]": "{{pan}}",
+            "payment_method_data[card][exp_month]": "{{exp_month}}",
+            "payment_method_data[card][exp_year]": "{{exp_year}}",
+            "payment_method_data[card][cvc]": "{{cvv}}",
+            "payment_method_data[billing_details][name]": "{{name}}"
+          },
+          "forbid": {
+            "setup_future_usage": [],
+            "customer": [],
+            "save_payment_method": [],
+            "payment_method_options[card][setup_future_usage]": []
+          }
+        },
+        {
+          "id": "tokens", "method": "POST", "path": "/v1/tokens", "card_data": true,
+          "headers": {"Authorization": "Bearer {{secret:secretKey}}"},
+          "positions": {
+            "card[number]": "{{pan}}",
+            "card[exp_month]": "{{exp_month}}",
+            "card[exp_year]": "{{exp_year}}",
+            "card[cvc]": "{{cvv}}",
+            "card[name]": "{{name}}"
+          }
+        },
+        {
+          "id": "get_payment_intent", "method": "GET", "path": "/v1/payment_intents/{id}", "query": ["expand[]"],
+          "headers": {"Authorization": "Bearer {{secret:secretKey}}"}
+        }
+      ]
+    },
+    "adyen": {
+      "format": "json",
+      "endpoints": [
+        {
+          "id": "payments", "method": "POST", "path": "/v72/payments", "card_data": true,
+          "headers": {"X-API-Key": "{{secret:apiKey}}"},
+          "positions": {
+            "/paymentMethod/number": "{{pan}}",
+            "/paymentMethod/expiryMonth": "{{exp_month}}",
+            "/paymentMethod/expiryYear": "{{exp_year}}",
+            "/paymentMethod/cvc": "{{cvv}}",
+            "/paymentMethod/holderName": "{{name}}"
+          },
+          "pins": {"/merchantAccount": {"account": "merchantAccount"}},
+          "forbid": {"/storePaymentMethod": [false], "/recurringProcessingModel": [], "/shopperReference": []}
+        }
+      ]
+    },
+    "mercadopago": {
+      "format": "json",
+      "endpoints": [
+        {
+          "id": "card_tokens", "method": "POST", "path": "/v1/card_tokens", "card_data": true,
+          "headers": {"Authorization": "Bearer {{secret:accessToken}}"},
+          "positions": {
+            "/card_number": "{{pan}}",
+            "/expiration_month": "{{exp_month:int}}",
+            "/expiration_year": "{{exp_year:int}}",
+            "/security_code": "{{cvv}}",
+            "/cardholder/name": "{{name}}"
+          }
+        }
+      ]
+    },
+    "payu": {
+      "format": "json",
+      "endpoints": [
+        {
+          "id": "submit_transaction", "method": "POST", "path": "/payments-api/4.0/service.cgi", "card_data": true,
+          "positions": {
+            "/merchant/apiKey": "{{secret:apiKey}}",
+            "/transaction/order/signature": "{{signature}}",
+            "/transaction/creditCard/number": "{{pan}}",
+            "/transaction/creditCard/securityCode": "{{cvv}}",
+            "/transaction/creditCard/expirationDate": "{{exp:yyyy/mm}}",
+            "/transaction/creditCard/name": "{{name}}"
+          },
+          "pins": {
+            "/merchant/apiLogin": {"account": "apiLogin"},
+            "/command": {"literal": "SUBMIT_TRANSACTION"},
+            "/transaction/order/accountId": {"account": "accountId"}
+          },
+          "signer": "payu"
+        }
+      ]
+    },
+    "pagarme": {
+      "format": "json",
+      "endpoints": [
+        {
+          "id": "orders", "method": "POST", "path": "/core/v5/orders", "card_data": true,
+          "headers": {"Authorization": "Basic {{basic:secretKey}}"},
+          "positions": {
+            "/payments/0/credit_card/card/number": "{{pan}}",
+            "/payments/0/credit_card/card/exp_month": "{{exp_month:int}}",
+            "/payments/0/credit_card/card/exp_year": "{{exp_year:int}}",
+            "/payments/0/credit_card/card/cvv": "{{cvv}}",
+            "/payments/0/credit_card/card/holder_name": "{{name}}"
+          }
+        }
+      ]
+    }
+  },
+  "accounts": {
+    "stripe_t": {"provider": "stripe", "env": "dev", "host": "upstream.test", "base_path": "", "secrets": {"secretKey": "projects/pci-cde-dev/secrets/stripe-t-key"}},
+    "adyen_br": {"provider": "adyen", "env": "dev", "host": "upstream.test", "base_path": "/checkout", "secrets": {"apiKey": "projects/pci-cde-dev/secrets/adyen-br-key"}, "values": {"merchantAccount": "AcmeBR_ECOM"}},
+    "adyen_br_live": {"provider": "adyen", "env": "prod", "host": "upstream.test", "base_path": "/checkout", "secrets": {"apiKey": "projects/pci-cde-prod/secrets/adyen-br-key"}, "values": {"merchantAccount": "AcmeBR_LIVE"}},
+    "mp_ar": {"provider": "mercadopago", "env": "dev", "host": "upstream.test", "secrets": {"accessToken": "projects/pci-cde-dev/secrets/mp-ar-token"}},
+    "payu_co": {"provider": "payu", "env": "dev", "host": "upstream.test", "secrets": {"apiKey": "projects/pci-cde-dev/secrets/payu-co-key"}, "values": {"apiLogin": "pRRXKOl8ikMmt9u", "accountId": "512321", "merchantId": "508029", "hash": "sha256"}},
+    "pagarme_br": {"provider": "pagarme", "env": "dev", "host": "upstream.test", "secrets": {"secretKey": "projects/pci-cde-dev/secrets/pagarme-br-key"}}
+  }
+}`
+
+// testCatalog parses testCatalogJSON for env "dev" with every account host replaced by host.
+func testCatalog(t *testing.T, host string) *catalog {
+	t.Helper()
+	data := strings.ReplaceAll(testCatalogJSON, `"`+testCatalogHost+`"`, `"`+host+`"`)
+	c, err := parseCatalog([]byte(data), "dev")
+	if err != nil {
+		t.Fatalf("test catalog: %v", err)
+	}
+	return c
+}
+
+// catEndpointByID returns provider's endpoint id, failing the test if there is none.
+func catEndpointByID(t *testing.T, c *catalog, provider, id string) *catEndpoint {
+	t.Helper()
+	if p := c.providers[provider]; p != nil {
+		for _, e := range p.endpoints {
+			if e.id == id {
+				return e
+			}
+		}
+	}
+	t.Fatalf("no endpoint %s/%s", provider, id)
+	return nil
+}
+
+func TestParseCatalogValid(t *testing.T) {
+	c := testCatalog(t, "127.0.0.1:9")
+	if got := slices.Sorted(maps.Keys(c.accounts)); !slices.Equal(got, []string{"adyen_br", "mp_ar", "pagarme_br", "payu_co", "stripe_t"}) {
+		t.Errorf("dev accounts = %v", got)
+	}
+	if got := slices.Sorted(maps.Keys(c.providers)); !slices.Equal(got, []string{"adyen", "mercadopago", "pagarme", "payu", "stripe"}) {
+		t.Errorf("providers = %v", got)
+	}
+	prod, err := parseCatalog([]byte(testCatalogJSON), "prod")
+	if err != nil {
+		t.Fatalf("prod: %v", err)
+	}
+	if got := slices.Sorted(maps.Keys(prod.accounts)); !slices.Equal(got, []string{"adyen_br_live"}) {
+		t.Errorf("prod accounts = %v", got)
+	}
+	if len(prod.providers) != 5 {
+		t.Errorf("prod has %d providers, want all 5", len(prod.providers))
+	}
+
+	a := c.accounts["adyen_br"]
+	if a.name != "adyen_br" || a.provider != "adyen" || a.env != "dev" || a.host != "127.0.0.1:9" || a.basePath != "/checkout" ||
+		a.secretNames["apiKey"] != "projects/pci-cde-dev/secrets/adyen-br-key" || a.values["merchantAccount"] != "AcmeBR_ECOM" ||
+		a.secrets == nil || len(a.secrets) != 0 {
+		t.Errorf("adyen_br decoded as %+v", *a)
+	}
+	if s := c.accounts["stripe_t"]; s.basePath != "" || len(s.values) != 0 {
+		t.Errorf("stripe_t decoded as %+v", *s)
+	}
+
+	// Stripe: form positions, forbid lists ("must be absent"), wildcard path and query keys.
+	pi := catEndpointByID(t, c, "stripe", "payment_intents")
+	if c.providers["stripe"].format != "form" || pi.method != "POST" || !slices.Equal(pi.path, []string{"v1", "payment_intents"}) || !pi.cardData ||
+		pi.headers["Authorization"] != "Bearer {{secret:secretKey}}" || len(pi.headers) != 1 ||
+		pi.positions["payment_method_data[card][number]"] != (placeholder{kind: "pan"}) || len(pi.positions) != 5 || pi.signer != "" {
+		t.Errorf("stripe payment_intents decoded as %+v", *pi)
+	}
+	for _, addr := range []string{"setup_future_usage", "customer", "save_payment_method", "payment_method_options[card][setup_future_usage]"} {
+		if f, ok := pi.forbid[addr]; !ok || f == nil || len(f) != 0 {
+			t.Errorf("stripe forbid %s = %v (present %v), want empty", addr, f, ok)
+		}
+	}
+	gpi := catEndpointByID(t, c, "stripe", "get_payment_intent")
+	if gpi.method != "GET" || !slices.Equal(gpi.path, []string{"v1", "payment_intents", "{id}"}) || gpi.cardData ||
+		!gpi.query["expand[]"] || len(gpi.query) != 1 || len(gpi.positions) != 0 {
+		t.Errorf("stripe get_payment_intent decoded as %+v", *gpi)
+	}
+
+	// Adyen: canonical header name, account pin, forbid with an allowed literal.
+	ay := catEndpointByID(t, c, "adyen", "payments")
+	if ay.headers["X-Api-Key"] != "{{secret:apiKey}}" || len(ay.headers) != 1 {
+		t.Errorf("adyen headers = %v", ay.headers)
+	}
+	if p := ay.pins["/merchantAccount"]; p.account != "merchantAccount" || p.literal != nil || len(ay.pins) != 1 {
+		t.Errorf("adyen pin = %+v", p)
+	}
+	if f := ay.forbid["/storePaymentMethod"]; !slices.Equal(f, []fieldValue{{kind: "bool", text: "false"}}) {
+		t.Errorf("adyen forbid storePaymentMethod = %v", f)
+	}
+	if f, ok := ay.forbid["/shopperReference"]; !ok || f == nil || len(f) != 0 {
+		t.Errorf("adyen forbid shopperReference = %v", f)
+	}
+
+	// Mercado Pago: integer expiry.
+	mp := catEndpointByID(t, c, "mercadopago", "card_tokens")
+	if mp.positions["/expiration_month"] != (placeholder{kind: "exp_month", mod: "int"}) || mp.positions["/expiration_year"] != (placeholder{kind: "exp_year", mod: "int"}) {
+		t.Errorf("mercadopago positions = %v", mp.positions)
+	}
+
+	// PayU: body secret, literal and account pins, signer.
+	pu := catEndpointByID(t, c, "payu", "submit_transaction")
+	if p := pu.pins["/command"]; p.account != "" || p.literal == nil || *p.literal != (fieldValue{kind: "string", text: "SUBMIT_TRANSACTION"}) {
+		t.Errorf("payu /command pin = %+v", p)
+	}
+	if pu.pins["/merchant/apiLogin"].account != "apiLogin" || pu.pins["/transaction/order/accountId"].account != "accountId" ||
+		pu.signer != "payu" || len(pu.headers) != 0 ||
+		pu.positions["/merchant/apiKey"] != (placeholder{kind: "secret", arg: "apiKey"}) ||
+		pu.positions["/transaction/order/signature"] != (placeholder{kind: "signature"}) ||
+		pu.positions["/transaction/creditCard/expirationDate"] != (placeholder{kind: "exp", mod: "yyyy/mm"}) {
+		t.Errorf("payu decoded as %+v", *pu)
+	}
+
+	// Pagar.me: Basic auth header, array-index position.
+	pg := catEndpointByID(t, c, "pagarme", "orders")
+	if pg.positions["/payments/0/credit_card/card/number"] != (placeholder{kind: "pan"}) || pg.headers["Authorization"] != "Basic {{basic:secretKey}}" {
+		t.Errorf("pagarme decoded as %+v", *pg)
+	}
+}
+
+// TestParseCatalogRejects applies one mutation per validation rule to testCatalogJSON. Each must be
+// rejected with an error naming the rule (want), and no error may name a secret resource.
+func TestParseCatalogRejects(t *testing.T) {
+	if _, err := parseCatalog([]byte(testCatalogJSON), "dev"); err != nil {
+		t.Fatalf("fixture rejected: %v", err)
+	}
+	const (
+		stripeAcct = `"stripe_t": {"provider": "stripe", "env": "dev", "host": "upstream.test", "base_path": ""`
+		adyenAcct  = `"adyen_br": {"provider": "adyen", "env": "dev", "host": "upstream.test", "base_path": "/checkout"`
+		payuVals   = `"values": {"apiLogin": "pRRXKOl8ikMmt9u", "accountId": "512321", "merchantId": "508029", "hash": "sha256"}`
+		gpiLine    = `"id": "get_payment_intent", "method": "GET", "path": "/v1/payment_intents/{id}", "query": ["expand[]"],`
+		tokensLine = `"id": "tokens", "method": "POST", "path": "/v1/tokens", "card_data": true,`
+	)
+	cases := []struct{ name, old, new, want string }{
+		// Strict JSON, unknown keys, wrong types.
+		{"duplicate key", `"format": "form",`, `"format": "form", "format": "form",`, "strict JSON"},
+		{"trailing data", "", "", "strict JSON"}, // special-cased below
+		{"invalid utf-8", `AcmeBR_ECOM`, "Acme\xffBR", "strict JSON"},
+		{"unknown root key", `"providers": {`, `"extra": {}, "providers": {`, `unknown key "extra"`},
+		{"unknown provider key", `"format": "form",`, `"format": "form", "base": "x",`, `unknown key "base"`},
+		{"unknown endpoint key", tokensLine, tokensLine + ` "bogus": true,`, `unknown key "bogus"`},
+		{"unknown pin key", `{"account": "merchantAccount"}`, `{"account": "merchantAccount", "x": 1}`, `unknown key "x"`},
+		{"unknown account key", stripeAcct, stripeAcct + `, "port": 1`, `unknown key "port"`},
+		{"case-variant provider key", `"format": "form",`, `"Format": "form",`, `unknown key "Format"`},
+		{"case-variant endpoint key", tokensLine, `"ID": "tokens", "method": "POST", "path": "/v1/tokens", "card_data": true,`, `unknown key "ID"`},
+		{"case-variant account key", stripeAcct, `"stripe_t": {"provider": "stripe", "env": "dev", "Host": "upstream.test", "base_path": ""`, `unknown key "Host"`},
+		{"case-variant pin key", `{"literal": "SUBMIT_TRANSACTION"}`, `{"Literal": "SUBMIT_TRANSACTION"}`, `unknown key "Literal"`},
+		{"wrong type", tokensLine, `"id": "tokens", "method": "POST", "path": "/v1/tokens", "card_data": "yes",`, "wrong type"},
+		{"root not an object", "", "", "strict JSON"}, // special-cased below
+
+		// Names.
+		{"bad provider name", `"stripe": {`, `"Stripe": {`, `provider "Stripe": invalid name`},
+		{"bad endpoint id", `"id": "tokens"`, `"id": "to kens"`, "invalid id"},
+		{"bad account name", `"stripe_t": {`, `"stripe-t": {`, `account "stripe-t": invalid name`},
+
+		// Provider format and endpoints.
+		{"format not json/form", `"format": "form",`, `"format": "xml",`, `provider "stripe": format`},
+		{"empty endpoints", `"providers": {`, `"providers": {"empty": {"format": "json", "endpoints": []},`, `provider "empty": no endpoints`},
+		{"duplicate endpoint id", `"id": "tokens"`, `"id": "payment_intents"`, `endpoint "payment_intents": duplicate id`},
+		{"method not allowed", tokensLine, `"id": "tokens", "method": "HEAD", "path": "/v1/tokens", "card_data": true,`, `endpoint "tokens": method`},
+		{"method lowercase", tokensLine, `"id": "tokens", "method": "post", "path": "/v1/tokens", "card_data": true,`, `endpoint "tokens": method`},
+		{"overlapping endpoints", gpiLine, `"id": "get_payment_intent", "method": "POST", "path": "/v1/{id}", "query": ["expand[]"],`, "overlap"},
+
+		// Paths.
+		{"path without slash", `"/v1/tokens"`, `"v1/tokens"`, `endpoint "tokens": invalid path`},
+		{"path empty segment", `"/v1/tokens"`, `"/v1//tokens"`, `endpoint "tokens": invalid path`},
+		{"path trailing slash", `"/v1/tokens"`, `"/v1/tokens/"`, `endpoint "tokens": invalid path`},
+		{"path dot-dot", `"/v1/tokens"`, `"/v1/../tokens"`, `endpoint "tokens": invalid path`},
+		{"path dot", `"/v1/tokens"`, `"/v1/./tokens"`, `endpoint "tokens": invalid path`},
+		{"path percent", `"/v1/tokens"`, `"/v1/tok%65ns"`, `endpoint "tokens": invalid path`},
+		{"path query", `"/v1/tokens"`, `"/v1/tokens?x=1"`, `endpoint "tokens": invalid path`},
+		{"path empty", `"/v1/tokens"`, `""`, `endpoint "tokens": invalid path`},
+		{"wildcard bad name", `{id}"`, `{i-d}"`, `endpoint "get_payment_intent": invalid path`},
+		{"wildcard empty", `{id}"`, `{}"`, `endpoint "get_payment_intent": invalid path`},
+		{"wildcard unclosed", `{id}"`, `{id"`, `endpoint "get_payment_intent": invalid path`},
+		{"wildcard partial segment", `{id}"`, `pi_{id}"`, `endpoint "get_payment_intent": invalid path`},
+		{"wildcard repeated", `/v1/payment_intents/{id}"`, `/v1/{id}/{id}"`, `endpoint "get_payment_intent": invalid path`},
+		{"query key invalid", `["expand[]"]`, `["expand[]x"]`, `query key`},
+		{"query key duplicate", `["expand[]"]`, `["expand[]", "expand[]"]`, `query key`},
+
+		// Placeholders and positions.
+		{"unknown placeholder", `"card[number]": "{{pan}}"`, `"card[number]": "{{card}}"`, `position "card[number]": unknown placeholder`},
+		{"unknown modifier", `"card[number]": "{{pan}}"`, `"card[number]": "{{pan:int}}"`, `position "card[number]": unknown placeholder`},
+		{"not a placeholder", `"card[number]": "{{pan}}"`, `"card[number]": "4242"`, `position "card[number]": unknown placeholder`},
+		{"card placeholder without card_data", tokensLine, `"id": "tokens", "method": "POST", "path": "/v1/tokens", "card_data": false,`, `position "card[cvc]": card placeholder without card_data`},
+		{"card position on non-card endpoint", gpiLine, gpiLine + ` "positions": {"x": "{{cvv}}"},`, `position "x": card placeholder without card_data`},
+		{"card_data without card position", gpiLine, gpiLine + ` "card_data": true,`, "card_data without a card position"},
+		{"basic in body position", `"/merchant/apiKey": "{{secret:apiKey}}"`, `"/merchant/apiKey": "{{basic:apiKey}}"`, `position "/merchant/apiKey": {{basic:}}`},
+
+		// Headers.
+		{"header Host", `"X-API-Key": "{{secret:apiKey}}"`, `"Host": "{{secret:apiKey}}"`, `header "Host": vault-owned`},
+		{"header Content-Type", `"X-API-Key": "{{secret:apiKey}}"`, `"content-type": "{{secret:apiKey}}"`, `header "Content-Type": vault-owned`},
+		{"header Content-Length", `"X-API-Key": "{{secret:apiKey}}"`, `"Content-Length": "{{secret:apiKey}}"`, `header "Content-Length": vault-owned`},
+		{"header User-Agent", `"X-API-Key": "{{secret:apiKey}}"`, `"User-Agent": "{{secret:apiKey}}"`, `header "User-Agent": vault-owned`},
+		{"header Transfer-Encoding", `"X-API-Key": "{{secret:apiKey}}"`, `"Transfer-Encoding": "{{secret:apiKey}}"`, `header "Transfer-Encoding": vault-owned`},
+		{"header platform-allowlisted", `"X-API-Key": "{{secret:apiKey}}"`, `"Idempotency-Key": "{{secret:apiKey}}"`, `header "Idempotency-Key": vault-owned`},
+		{"header duplicate after canonicalization", `"X-API-Key": "{{secret:apiKey}}"`, `"X-API-Key": "{{secret:apiKey}}", "x-api-key": "{{secret:apiKey}}"`, "duplicate header"},
+		{"header bad name", `"X-API-Key": "{{secret:apiKey}}"`, `"X API Key": "{{secret:apiKey}}"`, "invalid header name"},
+		{"header card placeholder", `"X-API-Key": "{{secret:apiKey}}"`, `"X-API-Key": "{{pan}}"`, `header "X-Api-Key": card placeholder`},
+		{"header card placeholder in template", `"X-API-Key": "{{secret:apiKey}}"`, `"X-API-Key": "Card {{exp:mm/yy}}"`, `header "X-Api-Key": card placeholder`},
+		{"header no placeholder", `"X-API-Key": "{{secret:apiKey}}"`, `"X-API-Key": "static"`, `header "X-Api-Key": template`},
+		{"header two placeholders", `"X-API-Key": "{{secret:apiKey}}"`, `"X-API-Key": "{{secret:apiKey}}{{secret:apiKey}}"`, `header "X-Api-Key": template`},
+		{"header unknown placeholder", `"X-API-Key": "{{secret:apiKey}}"`, `"X-API-Key": "{{secret:api-key}}"`, `header "X-Api-Key": template`},
+		{"header stray brace", `"X-API-Key": "{{secret:apiKey}}"`, `"X-API-Key": "{{secret:apiKey}}}"`, `header "X-Api-Key": template`},
+		{"header control char", `"X-API-Key": "{{secret:apiKey}}"`, `"X-API-Key": "{{secret:apiKey}}\r\nX: y"`, `header "X-Api-Key": template`},
+
+		// Signers.
+		{"signature without signer", `"signer": "payu"`, `"signer": ""`, "{{signature}} without signer"},
+		{"signature header without signer", `"X-API-Key": "{{secret:apiKey}}"`, `"X-API-Key": "{{secret:apiKey}}", "X-Signature": "{{signature}}"`, "{{signature}} without signer"},
+		{"signer without signature", `"/transaction/order/signature": "{{signature}}",`, ``, "signer without {{signature}}"},
+		{"unknown signer", `"signer": "payu"`, `"signer": "hmac"`, `unknown signer`},
+
+		// Addresses.
+		{"position and forbid", `"customer": [],`, `"customer": [], "payment_method_data[card][number]": [],`, `address "payment_method_data[card][number]" appears in more than one`},
+		{"position and pin", `"pins": {"/merchantAccount"`, `"pins": {"/paymentMethod/cvc": {"literal": "1"}, "/merchantAccount"`, `address "/paymentMethod/cvc" appears in more than one`},
+		{"pin and forbid", `"/shopperReference": []`, `"/shopperReference": [], "/merchantAccount": []`, `address "/merchantAccount" appears in more than one`},
+		{"json pointer without slash", `"/paymentMethod/cvc"`, `"paymentMethod/cvc"`, `position "paymentMethod/cvc": invalid address`},
+		{"json pointer bad escape", `"/paymentMethod/cvc"`, `"/payment~2Method/cvc"`, `position "/payment~2Method/cvc": invalid address`},
+		{"json pointer trailing tilde", `"/paymentMethod/cvc"`, `"/paymentMethod/cvc~"`, `invalid address`},
+		{"json pointer empty", `"/paymentMethod/cvc"`, `""`, `position "": invalid address`},
+		{"json pointer empty token", `"/paymentMethod/cvc"`, `"/paymentMethod//cvc"`, `invalid address`},
+		{"json pin bad pointer", `"/command": {`, `"command": {`, `pin "command": invalid address`},
+		{"json forbid bad pointer", `"/shopperReference": []`, `"shopperReference": []`, `forbid "shopperReference": invalid address`},
+		{"form forbid bad key", `"customer": []`, `"customer]": []`, `forbid "customer]": invalid address`},
+		{"form position bad key", `"card[name]": "{{name}}"`, `"card.name": "{{name}}"`, `position "card.name": invalid address`},
+		{"form position repeatable key", `"card[name]": "{{name}}"`, `"card[name][]": "{{name}}"`, `position "card[name][]": invalid address`},
+
+		// Pins and forbid literals.
+		{"pin both account and literal", `{"literal": "SUBMIT_TRANSACTION"}`, `{"literal": "SUBMIT_TRANSACTION", "account": "apiLogin"}`, `pin "/command": needs exactly one`},
+		{"pin neither", `{"literal": "SUBMIT_TRANSACTION"}`, `{}`, `pin "/command": needs exactly one`},
+		{"pin null literal", `{"literal": "SUBMIT_TRANSACTION"}`, `{"literal": null}`, `pin "/command": needs exactly one`},
+		{"pin object literal", `{"literal": "SUBMIT_TRANSACTION"}`, `{"literal": {"a": 1}}`, `pin "/command": invalid literal`},
+		{"pin placeholder literal", `{"literal": "SUBMIT_TRANSACTION"}`, `{"literal": "{{pan}}"}`, `pin "/command": invalid literal`},
+		{"pin bad value name", `{"account": "merchantAccount"}`, `{"account": "merchant-account"}`, `pin "/merchantAccount": invalid account value name`},
+		{"forbid not a list", `"/shopperReference": []`, `"/shopperReference": null`, `forbid "/shopperReference": must be a list`},
+		{"forbid object literal", `"/shopperReference": []`, `"/shopperReference": [{}]`, `forbid "/shopperReference": invalid literal`},
+		{"form forbid non-string literal", `"customer": []`, `"customer": [false]`, `forbid "customer": invalid literal`},
+
+		// Accounts.
+		{"account env", stripeAcct, `"stripe_t": {"provider": "stripe", "env": "staging", "host": "upstream.test", "base_path": ""`, `account "stripe_t": env`},
+		{"account env missing", stripeAcct, `"stripe_t": {"provider": "stripe", "host": "upstream.test", "base_path": ""`, `account "stripe_t": env`},
+		{"account unknown provider", stripeAcct, `"stripe_t": {"provider": "strype", "env": "dev", "host": "upstream.test", "base_path": ""`, `account "stripe_t": unknown provider`},
+		{"host uppercase", stripeAcct, `"stripe_t": {"provider": "stripe", "env": "dev", "host": "Upstream.test", "base_path": ""`, `account "stripe_t": invalid host`},
+		{"host scheme", stripeAcct, `"stripe_t": {"provider": "stripe", "env": "dev", "host": "https://upstream.test", "base_path": ""`, `account "stripe_t": invalid host`},
+		{"host path", stripeAcct, `"stripe_t": {"provider": "stripe", "env": "dev", "host": "upstream.test/x", "base_path": ""`, `account "stripe_t": invalid host`},
+		{"host userinfo", stripeAcct, `"stripe_t": {"provider": "stripe", "env": "dev", "host": "a@upstream.test", "base_path": ""`, `account "stripe_t": invalid host`},
+		{"host port too long", stripeAcct, `"stripe_t": {"provider": "stripe", "env": "dev", "host": "upstream.test:123456", "base_path": ""`, `account "stripe_t": invalid host`},
+		{"host port out of range", stripeAcct, `"stripe_t": {"provider": "stripe", "env": "dev", "host": "upstream.test:65536", "base_path": ""`, `account "stripe_t": invalid host`},
+		{"host empty label", stripeAcct, `"stripe_t": {"provider": "stripe", "env": "dev", "host": "upstream..test", "base_path": ""`, `account "stripe_t": invalid host`},
+		{"host empty", stripeAcct, `"stripe_t": {"provider": "stripe", "env": "dev", "host": "", "base_path": ""`, `account "stripe_t": invalid host`},
+		{"base_path trailing slash", adyenAcct, `"adyen_br": {"provider": "adyen", "env": "dev", "host": "upstream.test", "base_path": "/checkout/"`, `account "adyen_br": invalid base_path`},
+		{"base_path relative", adyenAcct, `"adyen_br": {"provider": "adyen", "env": "dev", "host": "upstream.test", "base_path": "checkout"`, `account "adyen_br": invalid base_path`},
+		{"base_path slash", adyenAcct, `"adyen_br": {"provider": "adyen", "env": "dev", "host": "upstream.test", "base_path": "/"`, `account "adyen_br": invalid base_path`},
+		{"base_path dot-dot", adyenAcct, `"adyen_br": {"provider": "adyen", "env": "dev", "host": "upstream.test", "base_path": "/a/.."`, `account "adyen_br": invalid base_path`},
+		{"base_path wildcard", adyenAcct, `"adyen_br": {"provider": "adyen", "env": "dev", "host": "upstream.test", "base_path": "/{id}"`, `account "adyen_br": invalid base_path`},
+		{"secret resource invalid", `"projects/pci-cde-dev/secrets/stripe-t-key"`, `"projects/pci-cde-dev/secrets/stripe-t-key/versions/1"`, `account "stripe_t": secret "secretKey": invalid Secret Manager resource`},
+		{"secret resource not a resource", `"projects/pci-cde-dev/secrets/stripe-t-key"`, `"sk_test_123"`, `account "stripe_t": secret "secretKey": invalid Secret Manager resource`},
+		{"secret name invalid", `{"secretKey": "projects/pci-cde-dev/secrets/stripe-t-key"}`, `{"secret-key": "projects/pci-cde-dev/secrets/stripe-t-key"}`, `account "stripe_t": invalid secret name`},
+		{"value name invalid", `"merchantAccount": "AcmeBR_ECOM"`, `"merchant.account": "AcmeBR_ECOM"`, `account "adyen_br": invalid value name`},
+		{"value empty", `"merchantAccount": "AcmeBR_ECOM"`, `"merchantAccount": ""`, `account "adyen_br": value "merchantAccount": invalid`},
+		{"value placeholder", `"merchantAccount": "AcmeBR_ECOM"`, `"merchantAccount": "{{pan}}"`, `account "adyen_br": value "merchantAccount": invalid`},
+		{"missing header secret", `{"secretKey": "projects/pci-cde-dev/secrets/stripe-t-key"}`, `{"secretKey2": "projects/pci-cde-dev/secrets/stripe-t-key"}`, `account "stripe_t": endpoint "payment_intents": missing secret "secretKey"`},
+		{"missing basic secret", `"secretKey": "projects/pci-cde-dev/secrets/pagarme-br-key"`, `"key": "projects/pci-cde-dev/secrets/pagarme-br-key"`, `account "pagarme_br": endpoint "orders": missing secret "secretKey"`},
+		{"missing position secret", `"apiKey": "projects/pci-cde-dev/secrets/payu-co-key"`, `"key": "projects/pci-cde-dev/secrets/payu-co-key"`, `account "payu_co": endpoint "submit_transaction": missing secret "apiKey"`},
+		{"missing pin value", `"merchantAccount": "AcmeBR_ECOM"`, `"merchant": "AcmeBR_ECOM"`, `account "adyen_br": endpoint "payments": missing value "merchantAccount"`},
+		{"missing pin value in prod account", `"merchantAccount": "AcmeBR_LIVE"`, `"merchant": "AcmeBR_LIVE"`, `account "adyen_br_live": endpoint "payments": missing value "merchantAccount"`},
+		{"payu missing merchantId", payuVals, `"values": {"apiLogin": "pRRXKOl8ikMmt9u", "accountId": "512321", "hash": "sha256"}`, `account "payu_co": payu needs`},
+		{"payu missing hash", payuVals, `"values": {"apiLogin": "pRRXKOl8ikMmt9u", "accountId": "512321", "merchantId": "508029"}`, `account "payu_co": payu needs`},
+		{"payu bad hash", payuVals, `"values": {"apiLogin": "pRRXKOl8ikMmt9u", "accountId": "512321", "merchantId": "508029", "hash": "crc32"}`, `account "payu_co": payu needs`},
+		{"payu hash case", payuVals, `"values": {"apiLogin": "pRRXKOl8ikMmt9u", "accountId": "512321", "merchantId": "508029", "hash": "SHA256"}`, `account "payu_co": payu needs`},
+	}
+	for _, c := range cases {
+		data := testCatalogJSON
+		switch c.name {
+		case "trailing data":
+			data += ` {}`
+		case "root not an object":
+			data = `[]`
+		default:
+			if !strings.Contains(data, c.old) {
+				t.Errorf("%s: mutation target not in fixture", c.name)
+				continue
+			}
+			data = strings.Replace(data, c.old, c.new, 1)
+		}
+		_, err := parseCatalog([]byte(data), "dev")
+		if err == nil {
+			t.Errorf("%s: accepted", c.name)
+			continue
+		}
+		if !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: error %q does not contain %q", c.name, err, c.want)
+		}
+		if strings.Contains(err.Error(), "projects/") || strings.Contains(err.Error(), "sk_test") {
+			t.Errorf("%s: error names a secret resource", c.name)
+		}
+	}
+
+	// The environment argument itself.
+	for _, env := range []string{"", "staging", "Dev", "PROD"} {
+		if _, err := parseCatalog([]byte(testCatalogJSON), env); err == nil {
+			t.Errorf("env %q accepted", env)
+		}
+	}
+}
+
+func TestEmbeddedCatalog(t *testing.T) {
+	for _, env := range []string{"dev", "prod"} {
+		if _, err := parseCatalog(catalogJSON, env); err != nil {
+			t.Fatalf("embedded catalog (%s): %v", env, err)
+		}
+	}
+	c, _ := parseCatalog(catalogJSON, "dev")
+	pi := catEndpointByID(t, c, "stripe", "payment_intents")
+	tk := catEndpointByID(t, c, "stripe", "tokens")
+	if c.providers["stripe"].format != "form" || len(c.providers["stripe"].endpoints) != 2 || !pi.cardData || !tk.cardData {
+		t.Error("embedded stripe provider shape")
+	}
+	for _, addr := range []string{"setup_future_usage", "customer", "save_payment_method", "payment_method_options[card][setup_future_usage]"} {
+		if f, ok := pi.forbid[addr]; !ok || len(f) != 0 {
+			t.Errorf("embedded stripe payment_intents does not forbid %s", addr)
+		}
+	}
+	if a := c.accounts["stripe_test"]; a == nil || a.host != "api.stripe.com" || a.secretNames["secretKey"] != "projects/pci-cde-dev/secrets/stripe-test-secret-key" {
+		t.Error("embedded stripe_test account")
+	}
+}
+
+// egress-hosts.<env>.txt are the files the infra repo's firewall check diffs against (§9.1, D§5.1):
+// each must list exactly its environment's catalog account hosts, without ports.
+func TestEgressHostsMatchCatalog(t *testing.T) {
+	for _, env := range []string{"dev", "prod"} {
+		raw, err := os.ReadFile("egress-hosts." + env + ".txt")
+		if err != nil {
+			t.Fatalf("cannot read egress-hosts.%s.txt", env)
+		}
+		var file []string
+		for _, line := range strings.Split(string(raw), "\n") {
+			if h := strings.TrimSpace(line); h != "" {
+				file = append(file, h)
+			}
+		}
+		slices.Sort(file)
+		c, err := parseCatalog(catalogJSON, env)
+		if err != nil {
+			t.Fatalf("embedded catalog (%s): %v", env, err)
+		}
+		hosts := map[string]bool{}
+		for _, a := range c.accounts {
+			h, _, _ := strings.Cut(a.host, ":")
+			hosts[h] = true
+		}
+		if want := slices.Sorted(maps.Keys(hosts)); !slices.Equal(file, want) {
+			t.Errorf("egress-hosts.%s.txt %v != catalog hosts %v", env, file, want)
+		}
 	}
 }
 
