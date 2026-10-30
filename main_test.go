@@ -2223,7 +2223,7 @@ func TestScanRejectsDisguisedPlaceholders(t *testing.T) {
 func TestJSONStrict(t *testing.T) {
 	for _, b := range []string{
 		`{"a":1}`, `[]`, `"x"`, `1`, `true`, `null`, " {\"a\":[1,{\"a\":2}],\"b\":{\"a\":3}} \n",
-		`{"a":{"b":1},"c":{"b":1}}`, `{"é":1,"e":2}`, `{"a":"\ufffe"}`,
+		`{"a":{"b":1},"c":{"b":1}}`, `{"é":1,"e":2}`, `{"a":"\ufffe"}`, `{"a\u007f ":"\u0000\n"}`,
 	} {
 		if err := jsonStrict([]byte(b)); err != nil {
 			t.Errorf("%s rejected: %v", b, err)
@@ -2245,6 +2245,9 @@ func TestJSONStrict(t *testing.T) {
 		``, ` `, "\n",
 		// Malformed.
 		`{`, `{"a"}`, `{"a":}`, `{"a" 1}`, `[1,]`, `{"a":1,}`, `[,1]`, `{'a':1}`, `[01]`, `NaN`, `"\x"`,
+		// Control characters in keys (a NUL-truncating parser would alias them).
+		`{"merchantAccount\u0000":"x"}`, `{"merchantAccount":"a","merchantAccount\u0000":"b"}`,
+		`{"a\n":1}`, `{"x":{"\u001f":1}}`, `{"\u0000":1}`, `{"a\tb":1}`,
 		// Replacement character and lone surrogates.
 		`"\ud800"`, `{"\udc00":1}`, `"\ufffd"`, "\"\xef\xbf\xbd\"",
 		// Too deep.
@@ -2266,7 +2269,10 @@ func TestJSONStrict(t *testing.T) {
 
 func TestScanFormDuplicates(t *testing.T) {
 	for _, b := range []string{
-		"a=1&a=2", "a=1&a=1", "card[number]={{pan}}&card[number]=4242", "a=1&%61=2", "a+b=1&a%20b=2",
+		"a=1&a=2", "a=1&a=1", "card[number]={{pan}}&card[number]=4242", "a=1&%61=2",
+		"card%5Bnumber%5D=1&card[number]=2",
+		// Aliases a bracket parser would merge with an earlier key are not canonical.
+		"customer]=x&customer=y", "customer=y&[customer=x", "a=1&a%00=2",
 	} {
 		if _, err := scanBody("form", []byte(b)); !errors.Is(err, errBody) {
 			t.Errorf("%s: %v", b, err)
@@ -2276,6 +2282,41 @@ func TestScanFormDuplicates(t *testing.T) {
 		if _, err := scanBody("form", []byte(b)); err != nil {
 			t.Errorf("%s rejected: %v", b, err)
 		}
+	}
+}
+
+// TestScanFormKeys: form keys must be canonical (a name, [segment] groups, an optional final "[]"),
+// so a provider's bracket parsing cannot alias one key onto another.
+func TestScanFormKeys(t *testing.T) {
+	for _, k := range []string{
+		"card[number]", "payment_method_data[card][exp_month]", "expand[]", "metadata[order_id]",
+		"type", "items[0][price]", "x-y", "A_9", "a[b-c][]",
+	} {
+		if _, err := scanBody("form", []byte(url.QueryEscape(k)+"=1")); err != nil {
+			t.Errorf("escaped key %s rejected: %v", k, err)
+		}
+		if _, err := scanBody("form", []byte(k+"=1")); err != nil {
+			t.Errorf("raw key %s rejected: %v", k, err)
+		}
+	}
+	for _, k := range []string{
+		"customer]", "[customer", "a[b]c", "a[[b]]", "a%00", "]]customer]]", "card[number]]", "a[]b",
+		"a[][b]", "a[", "a]", "[]", "a[b", "a.b", "a+b", "a%20b", "a%0A", "a%7F", "caf%C3%A9", "a%5B%5Db",
+		"a[b%00]",
+	} {
+		if _, err := scanBody("form", []byte(k+"=1")); !errors.Is(err, errBody) {
+			t.Errorf("key %s: %v", k, err)
+		}
+		if _, _, err := readField("form", []byte(k+"=1"), "a"); !errors.Is(err, errBody) {
+			t.Errorf("readField key %s: %v", k, err)
+		}
+	}
+	// A key containing "{{" is still errPlaceholder, but a strictness failure anywhere wins.
+	if _, err := scanBody("form", []byte("{{pan}}=1&a=2")); !errors.Is(err, errPlaceholder) {
+		t.Errorf("placeholder key: %v", err)
+	}
+	if _, err := scanBody("form", []byte("{{pan}}=1&customer]=2")); !errors.Is(err, errBody) {
+		t.Errorf("placeholder key then bad key: %v", err)
 	}
 }
 

@@ -1069,6 +1069,9 @@ var jsonPointerEscaper = strings.NewReplacer("~", "~0", "/", "~1")
 // silently decodes a lone surrogate escape ("\ud800") to U+FFFD, which other parsers reject or
 // keep, so such a body could be read differently by the provider; a literal or escaped U+FFFD is
 // indistinguishable after decoding and goes with it. A UTF-8 BOM is invalid JSON and rejected.
+// SPEC-DECISION: a key whose decoded text contains a control character (U+0000-U+001F) is
+// rejected, so a provider parser that truncates at NUL or strips control characters cannot alias
+// "merchantAccount\u0000" to "merchantAccount" and bypass a pin or forbid rule.
 //
 // Raw spans: Token() leaves InputOffset at the end of the token it returned, and the separators
 // before the next token (whitespace, ':' and ',') are consumed only by the next call. So a token
@@ -1114,7 +1117,8 @@ func jsonWalk(b []byte) ([]jsonNode, error) {
 		// An object member key.
 		if top != nil && !top.array && top.key == "" && tok != json.Delim('}') {
 			k, ok := tok.(string)
-			if !ok || !jsonStringSpan(b, start, end) || strings.ContainsRune(k, utf8.RuneError) || top.keys[k] {
+			if !ok || !jsonStringSpan(b, start, end) || strings.ContainsRune(k, utf8.RuneError) ||
+				strings.ContainsFunc(k, func(r rune) bool { return r < 0x20 }) || top.keys[k] {
 				return nil, errBody
 			}
 			top.keys[k] = true
@@ -1215,8 +1219,9 @@ type formField struct {
 	start, end int
 }
 
-// formFields parses a form body strictly into its fields, in order. Keys must be unique unless
-// they end in "[]". Any failure is errBody.
+// formFields parses a form body strictly into its fields, in order. Keys must be canonical (see
+// validFormKey) and unique unless they end in "[]". Any failure is errBody, except that a body
+// whose only failure is a key containing "{{" is errPlaceholder (strictness failures win).
 // SPEC-DECISION: stricter than url.ParseQuery, so no two parsers can split the body differently:
 // every raw byte must be visible ASCII (0x21-0x7E; spaces as "+", everything else percent-encoded),
 // ';' is rejected outright (some parsers treat it as a separator), every '&'-separated segment must
@@ -1233,6 +1238,7 @@ func formFields(b []byte) ([]formField, error) {
 	}
 	var fields []formField
 	seen := map[string]bool{}
+	placeholderKey := false
 	pos := 0
 	for _, seg := range strings.Split(string(b), "&") {
 		rawKey, rawVal, ok := strings.Cut(seg, "=")
@@ -1244,6 +1250,12 @@ func formFields(b []byte) ([]formField, error) {
 		if err1 != nil || err2 != nil || !utf8.ValidString(key) || !utf8.ValidString(val) {
 			return nil, errBody
 		}
+		if !validFormKey(key) {
+			if !strings.Contains(key, "{{") {
+				return nil, errBody
+			}
+			placeholderKey = true
+		}
 		if seen[key] && !strings.HasSuffix(key, "[]") {
 			return nil, errBody
 		}
@@ -1252,7 +1264,26 @@ func formFields(b []byte) ([]formField, error) {
 		fields = append(fields, formField{key: key, value: val, start: vstart, end: vstart + len(rawVal)})
 		pos += len(seg) + 1
 	}
+	if placeholderKey {
+		return nil, errPlaceholder
+	}
 	return fields, nil
+}
+
+// formKeyRe is the canonical form key grammar: a name, then [segment] groups, then an optional
+// final "[]".
+var formKeyRe = regexp.MustCompile(`^[A-Za-z0-9_-]+(\[[A-Za-z0-9_-]+\])*(\[\])?$`)
+
+// validFormKey reports whether a decoded form key is canonical.
+// SPEC-DECISION: bracket-parsing servers (Rack, PHP, qs) normalize malformed keys, mapping
+// "customer]", "[customer" or "a[b]c" onto other names, and NUL or control bytes can truncate a
+// key. Such aliases would bypass duplicate detection and the pin/forbid rules, which match the
+// flat decoded name. So a key must be a name of [A-Za-z0-9_-] followed by zero or more non-empty
+// [segment] groups of the same characters and at most one trailing "[]". Stricter than a plain
+// bracket grammar: "." is excluded (PHP rewrites "a.b" to "a_b") and "[]" is allowed only last
+// (a mid-key "[]" appends to an array whose element a name cannot address uniquely).
+func validFormKey(k string) bool {
+	return formKeyRe.MatchString(k)
 }
 
 // scanBody parses body strictly in format ("json" or "form") and returns every placeholder
@@ -1315,7 +1346,7 @@ func scanBody(format string, body []byte) ([]occurrence, error) {
 
 // readField returns the value at addr (a JSON Pointer for json, a decoded field name for form).
 // found is false when the body is valid but has no such field. A body failing the strict parse is
-// errBody. Form values are always kind "string".
+// errBody (errPlaceholder for a form key containing "{{"). Form values are always kind "string".
 // SPEC-DECISION: a form key that appears more than once (only possible for "[]" keys) has no single
 // value, so reading it is errBody rather than picking one.
 func readField(format string, body []byte, addr string) (fieldValue, bool, error) {
