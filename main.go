@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -11,7 +12,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"mime"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -487,4 +490,207 @@ func (c *cvvCache) take(token string) string {
 		return ""
 	}
 	return e.cvv
+}
+
+// ---------------------------------------------------------------------------
+// Public API: POST /tokenize and CORS (SPEC §3.2, §5)
+// ---------------------------------------------------------------------------
+
+const maxPublicBody = 4 << 10 // §5.2: 4 KiB request body limit
+
+type tokenizeRequest struct {
+	PAN      string `json:"pan"`
+	ExpMonth string `json:"exp_month"`
+	ExpYear  string `json:"exp_year"`
+	// SPEC-DECISION: nil means absent; JSON null also decodes to nil and is treated as absent
+	// (the plan's *string + "validate if non-nil"). "" is present and fails validation.
+	CVV *string `json:"cvv"`
+}
+
+type tokenizeResponse struct {
+	Token    string `json:"token"`
+	Last4    string `json:"last4"`
+	ExpMonth string `json:"exp_month"`
+	ExpYear  string `json:"exp_year"`
+}
+
+// publicHandler is the complete handler for the public listener.
+func (v *vault) publicHandler() http.Handler {
+	return v.guard("public", http.HandlerFunc(v.handleTokenize))
+}
+
+// singleHeader returns the value of header name if it is present exactly once.
+// SPEC-DECISION: a repeated Origin, Authorization or Content-Type header is ambiguous (proxies
+// and Go's Header.Get may disagree on which one counts) and is treated as invalid.
+func singleHeader(h http.Header, name string) (string, bool) {
+	vals := h.Values(name)
+	if len(vals) != 1 {
+		return "", false
+	}
+	return vals[0], true
+}
+
+// tokenizeFields is the exact set of keys a /tokenize body may contain.
+var tokenizeFields = map[string]bool{"pan": true, "exp_month": true, "exp_year": true, "cvv": true}
+
+// exactKeys reports whether body is a JSON object whose keys are all in tokenizeFields, spelled
+// exactly, each at most once.
+// SPEC-DECISION: encoding/json matches keys case-insensitively and keeps the last of duplicate
+// keys, so DisallowUnknownFields alone accepts {"PAN":…} and {"pan":A,"pan":B}. Both are
+// rejected as unknown fields: a body that different JSON parsers would read differently is
+// never tokenized.
+func exactKeys(body []byte) bool {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return false
+	}
+	seen := make(map[string]bool, len(tokenizeFields))
+	for dec.More() {
+		t, err := dec.Token()
+		if err != nil {
+			return false
+		}
+		k, ok := t.(string)
+		if !ok || !tokenizeFields[k] || seen[k] {
+			return false
+		}
+		seen[k] = true
+		var val json.RawMessage
+		err = dec.Decode(&val)
+		zero(val)
+		if err != nil {
+			return false
+		}
+	}
+	t, err := dec.Token()
+	return err == nil && t == json.Delim('}')
+}
+
+// handleTokenize implements POST /tokenize (§3.2, §5). The checks run in a fixed order and each
+// failing check returns immediately; error bodies use only the msg* constants. Nothing from the
+// request is logged.
+func (v *vault) handleTokenize(w http.ResponseWriter, r *http.Request) {
+	// SPEC-DECISION: a percent-encoded spelling of the path (e.g. /%74okenize) decodes to
+	// "/tokenize" but is not the exact path, so it is 404 (RawPath is set only for such forms).
+	if r.URL.Path != "/tokenize" || r.URL.RawPath != "" {
+		writeError(w, http.StatusNotFound, msgNotFound)
+		return
+	}
+	if r.Method != http.MethodPost && r.Method != http.MethodOptions {
+		w.Header().Set("Allow", "POST, OPTIONS")
+		writeError(w, http.StatusMethodNotAllowed, msgMethod)
+		return
+	}
+	// SPEC-DECISION: a bare trailing "?" (empty but present query) is rejected like any query.
+	if r.URL.RawQuery != "" || r.URL.ForceQuery {
+		writeError(w, http.StatusBadRequest, msgQuery)
+		return
+	}
+	// The Origin must match exactly on POST as well as on the preflight (globals ruling 3). An
+	// unset allow-origin matches nothing.
+	if origin, ok := singleHeader(r.Header, "Origin"); !ok || v.allowOrigin == "" || origin != v.allowOrigin {
+		writeError(w, http.StatusForbidden, msgOrigin)
+		return
+	}
+	h := w.Header()
+	if r.Method == http.MethodOptions {
+		h.Set("Access-Control-Allow-Origin", v.allowOrigin)
+		h.Set("Access-Control-Allow-Methods", "POST")
+		h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		h.Set("Access-Control-Max-Age", "600")
+		h.Set("Vary", "Origin")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	// From here on every response, errors included, is readable by the checkout page.
+	h.Set("Access-Control-Allow-Origin", v.allowOrigin)
+	h.Set("Vary", "Origin")
+
+	authz, ok := singleHeader(r.Header, "Authorization")
+	reason := "format"
+	if ok {
+		reason = checkSession(v.hmacKey, authz, v.now())
+	}
+	if reason != "" {
+		v.alertSession(reason)
+		writeError(w, http.StatusUnauthorized, msgUnauthorized)
+		return
+	}
+
+	// SPEC-DECISION: the media type must be application/json (case-insensitive, per RFC 9110);
+	// the only parameter allowed is charset=utf-8, since JSON is UTF-8 (RFC 8259).
+	ct, ok := singleHeader(r.Header, "Content-Type")
+	if !ok {
+		writeError(w, http.StatusBadRequest, msgContentType)
+		return
+	}
+	mt, params, err := mime.ParseMediaType(ct)
+	if err != nil || mt != "application/json" || len(params) > 1 ||
+		(len(params) == 1 && !strings.EqualFold(params["charset"], "utf-8")) {
+		writeError(w, http.StatusBadRequest, msgContentType)
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxPublicBody+1))
+	defer zero(body) // best effort (§8.5)
+	if len(body) > maxPublicBody {
+		writeError(w, http.StatusRequestEntityTooLarge, msgTooLarge)
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, msgBadBody)
+		return
+	}
+
+	var req tokenizeRequest
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, msgBadBody)
+		return
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF || !exactKeys(body) {
+		writeError(w, http.StatusBadRequest, msgBadBody)
+		return
+	}
+
+	pan, ok := normalizePAN(req.PAN)
+	if !ok {
+		writeError(w, http.StatusBadRequest, msgInvalidPAN)
+		return
+	}
+	if !validExpiry(req.ExpMonth, req.ExpYear, v.now()) {
+		writeError(w, http.StatusBadRequest, msgInvalidExpiry)
+		return
+	}
+	if req.CVV != nil && !validCVV(*req.CVV) {
+		writeError(w, http.StatusBadRequest, msgInvalidCVV)
+		return
+	}
+
+	dek, ok := v.deks[v.currentDEK]
+	if !ok {
+		writeError(w, http.StatusInternalServerError, msgInternal)
+		return
+	}
+	plaintext, err := json.Marshal(card{PAN: pan, ExpMonth: req.ExpMonth, ExpYear: req.ExpYear})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, msgInternal)
+		return
+	}
+	ciphertext := seal(dek, plaintext)
+	zero(plaintext) // best effort (§8.5)
+
+	token := newToken()
+	last4 := pan[len(pan)-4:]
+	if err := v.putCard(r.Context(), token, ciphertext, last4, v.currentDEK); err != nil {
+		// The error is never logged or returned: it could carry driver or query detail.
+		writeError(w, http.StatusInternalServerError, msgInternal)
+		return
+	}
+	if req.CVV != nil {
+		v.cvv.put(token, *req.CVV)
+	}
+	writeJSON(w, http.StatusOK, tokenizeResponse{Token: token, Last4: last4, ExpMonth: req.ExpMonth, ExpYear: req.ExpYear})
 }
