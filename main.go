@@ -171,7 +171,7 @@ func newToken() string {
 	var b [16]byte
 	// crypto/rand.Read is deliberately called without error handling: since Go 1.24 it never
 	// returns an error and irrecoverably crashes the process if the OS RNG fails, which is
-	// exactly what is wanted: a crypto/rand failure panics and is not recoverable.
+	// exactly the wanted behaviour (a crypto/rand failure panics and is not recoverable).
 	rand.Read(b[:])
 	return "tok_" + hex.EncodeToString(b[:])
 }
@@ -806,11 +806,11 @@ var errEgress = errors.New("egress invariant")
 
 // maskPAN replaces every occurrence of pan, and of pan grouped in fours from the left with single
 // spaces ("4242 4242 4242 4242", "3782 8224 6310 005") or single hyphens ("4242-4242-4242-4242"),
-// with "****"+last4. found reports whether anything was replaced; if not, body is
-// returned unchanged.
+// with "****"+last4. found reports whether anything was replaced; if not, body is returned
+// unchanged.
 // The hyphen-grouped form is masked too, since hyphens are the other separator normalizePAN
-// accepts. The replacement repeats until no
-// form remains: one bytes.ReplaceAll pass over pan+pan[4:] leaves a full PAN when the last 4
+// accepts. The replacement repeats until no form remains: one bytes.ReplaceAll pass over
+// pan+pan[4:] leaves a full PAN when the last 4
 // digits equal the first 4 ("4242…4242" + "4242…" → "****4242" + "4242…"). Each pass replaces a
 // needle of >= 13 bytes with an 8-byte mask, so the body strictly shrinks and the loop ends.
 func maskPAN(body []byte, pan string) ([]byte, bool) {
@@ -1615,9 +1615,9 @@ func parseCatProvider(name string, rp rawProvider) (*catProvider, error) {
 // Pointer tokens are rejected, and (4) form positions and pins may not use a repeatable "[]" key (it
 // names no single value).
 // Every endpoint must have "card_data": true and list a {{pan}} position. The account credential
-// is only for card-carrying calls; calls without card data (payments
-// with a provider token, refunds, queries) are the platform's to make, with its own keys. A non-card endpoint
-// would let the platform borrow the vault's credential for a call the vault has no reason to make,
+// is only for card-carrying calls; calls without card data (payments with a provider token,
+// refunds, queries) are the platform's to make, with its own keys. A non-card endpoint would let
+// the platform borrow the vault's credential for a call the vault has no reason to make,
 // so it is refused here, and checkProxy refuses a request without a {{pan}} occurrence.
 func parseCatEndpoint(format string, i int, re rawEndpoint) (*catEndpoint, error) {
 	if !catNameRe.MatchString(re.ID) {
@@ -2274,7 +2274,7 @@ func proxyPathMatch(rule, segs []string) bool {
 
 // validProxyQuery reports whether the raw query q is allowed by ep: parsed like a strict form body
 // (formFields), every key listed in ep.query, and no decoded value containing "{{".
-// Stricter still: the raw query may only hold [A-Za-z0-9._~%+=&[]-] (anything
+// Beyond that, the raw query may only hold [A-Za-z0-9._~%+=&[]-] (anything
 // else percent-encoded), so no '#', '?', ';' or space reaches the URL builder, and a decoded value
 // may not hold control characters (U+0000-U+001F, U+007F).
 func validProxyQuery(ep *catEndpoint, q string) bool {

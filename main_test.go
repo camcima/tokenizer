@@ -2606,7 +2606,7 @@ func TestParseCatalogRejects(t *testing.T) {
 		{"unknown placeholder", `"card[number]": "{{pan}}"`, `"card[number]": "{{card}}"`, `position "card[number]": unknown placeholder`},
 		{"unknown modifier", `"card[number]": "{{pan}}"`, `"card[number]": "{{pan:int}}"`, `position "card[number]": unknown placeholder`},
 		{"not a placeholder", `"card[number]": "{{pan}}"`, `"card[number]": "4242"`, `position "card[number]": unknown placeholder`},
-		// F1: every endpoint carries card data (the vault credential is never lent to a non-card call)
+		// Every endpoint carries card data (the vault credential is never lent to a non-card call)
 		// and lists a {{pan}} position.
 		{"card_data false", tokensLine, `"id": "tokens", "method": "POST", "path": "/v1/tokens", "card_data": false,`, `endpoint "tokens": card_data must be true`},
 		{"card_data absent", tokensLine, `"id": "tokens", "method": "POST", "path": "/v1/tokens",`, `endpoint "tokens": card_data must be true`},
@@ -3126,7 +3126,7 @@ func TestCheckProxyRejects(t *testing.T) {
 		{"form placeholder at unlisted key", "stripe", body(stripePIBody + "&description={{pan}}"), msgPlaceholder, ph},
 		{"form encoded placeholder", "stripe", body(stripePIBody + "&description=%7B%7Bpan%7D%7D"), msgPlaceholder, ph},
 
-		// F1: every request carries {{pan}}; the vault credential is never lent to a non-card call.
+		// Every request carries {{pan}}; the vault credential is never lent to a non-card call.
 		{"no pan: card-free form body", "stripe", body("amount=1000&currency=usd"), msgPlaceholder, ph},
 		{"no pan: other card placeholders only", "stripe", replace(stripePIBody, "&payment_method_data[card][number]={{pan}}", ""), msgPlaceholder, ph},
 		{"no pan: empty form body", "stripe", body(""), msgPlaceholder, ph},
@@ -3201,7 +3201,7 @@ func TestCheckProxyDuplicateCardPlaceholder(t *testing.T) {
 	}
 }
 
-// TestCheckProxyArrayPosition (Review Focus 2): positions match array indexes exactly.
+// TestCheckProxyArrayPosition: positions match array indexes exactly.
 func TestCheckProxyArrayPosition(t *testing.T) {
 	c := testCatalog(t, "127.0.0.1:9")
 	e := validEnvelope("pagarme")
@@ -3212,7 +3212,7 @@ func TestCheckProxyArrayPosition(t *testing.T) {
 	}
 }
 
-// TestCheckProxyHeaderCaseVariant (Review Focus 3): a credential header under any spelling of its
+// TestCheckProxyHeaderCaseVariant: a credential header under any spelling of its
 // name must exactly equal the template, and is never carried into the plan.
 func TestCheckProxyHeaderCaseVariant(t *testing.T) {
 	c := testCatalog(t, "127.0.0.1:9")
@@ -3233,7 +3233,7 @@ func TestCheckProxyHeaderCaseVariant(t *testing.T) {
 	}
 }
 
-// TestCheckProxySignerInputs (Review Focus 4): the payu signer's inputs must be present,
+// TestCheckProxySignerInputs: the payu signer's inputs must be present,
 // non-placeholder strings or numbers.
 func TestCheckProxySignerInputs(t *testing.T) {
 	c := testCatalog(t, "127.0.0.1:9")
@@ -3273,7 +3273,7 @@ func TestCheckProxySignerInputs(t *testing.T) {
 }
 
 // TestCheckProxyEmptyBody: an empty body never passes, because every request must carry {{pan}}
-// (F1). This holds even on an endpoint stripped in memory of its positions, pins and signer (a shape
+// (the card-only rule). This holds even on an endpoint stripped in memory of its positions, pins and signer (a shape
 // parseCatEndpoint refuses): there is no empty-body shortcut. A json body must parse (msgBadBody);
 // an empty form body is zero fields, so it lacks {{pan}} (msgPlaceholder).
 func TestCheckProxyEmptyBody(t *testing.T) {
@@ -3300,14 +3300,14 @@ func TestCheckProxyEmptyBody(t *testing.T) {
 	}
 }
 
-// TestCheckProxyHardening covers the checks added after the Task 4 review: no body on GET/HEAD, an
-// unknown signer fails closed, case-variant aliases of signer inputs, and form forbid sub-keys.
+// TestCheckProxyHardening covers additional checks: no body on GET/HEAD, an unknown signer fails
+// closed, case-variant aliases of signer inputs, and form forbid sub-keys.
 func TestCheckProxyHardening(t *testing.T) {
 	c := testCatalog(t, "127.0.0.1:9")
 
 	// (a) A GET or HEAD endpoint takes no body. parseCatEndpoint still accepts a GET card endpoint, so
 	// this uses a parse-level fixture: confirm_payment_intent declared as GET. Since every request
-	// must also carry {{pan}} (F1), such an endpoint can never pass: with a body it is msgBadBody, and
+	// must also carry {{pan}}, such an endpoint can never pass: with a body it is msgBadBody, and
 	// without one it lacks {{pan}}.
 	getJSON := strings.Replace(testCatalogJSON, `"id": "confirm_payment_intent", "method": "POST",`, `"id": "confirm_payment_intent", "method": "GET",`, 1)
 	gc, err := parseCatalog([]byte(getJSON), "dev")
@@ -3507,7 +3507,7 @@ func TestRenderExpiryFormats(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.ph.String(), func(t *testing.T) {
 			c := renderCatalog(t)
-			// Every request carries {{pan}} (F1), so each body has it next to the expiry under test.
+			// Every request carries {{pan}}, so each body has it next to the expiry under test.
 			catEndpointByID(t, c, "adyen", "payments").positions = map[string]placeholder{"/paymentMethod/expiry": tc.ph, "/paymentMethod/number": {kind: "pan"}}
 			e := validEnvelope("adyen")
 			e.Request.Body = `{"merchantAccount":"AcmeBR_ECOM","paymentMethod":{"number":"{{pan}}","expiry":"` + tc.ph.String() + `"},"x":1}`
@@ -4582,7 +4582,7 @@ func TestProxyNoDBOnPolicyError(t *testing.T) {
 	for i, e := range []*proxyEnvelope{
 		newEnvelope("stripe_t", "POST", "/v1/tokens", map[string]string{"Authorization": "Bearer sk_test_attacker"}, stripeTokensBody),
 		newEnvelope("stripe_t", "POST", "/v1/tokens", nil, strings.Replace(stripeTokensBody, "card[number]", "description", 1)),
-		newEnvelope("stripe_t", "POST", "/v1/tokens", nil, "pii[id_number]=x"), // no {{pan}} (F1)
+		newEnvelope("stripe_t", "POST", "/v1/tokens", nil, "pii[id_number]=x"), // no {{pan}}
 		newEnvelope("stripe_t", "POST", "/v1/payment_intents", nil, stripePIBody+"&customer=cus_1"),
 		newEnvelope("adyen_br", "POST", "/v72/payments", nil, strings.Replace(adyenBody, "AcmeBR_ECOM", "Other", 1)),
 		newEnvelope("payu_co", "POST", "/payments-api/4.0/service.cgi", nil, strings.Replace(payuBody, `"referenceCode":"TestPayU",`, "", 1)),
@@ -4610,7 +4610,7 @@ func TestProxyNoDBOnPolicyError(t *testing.T) {
 	}
 }
 
-// TestProxyEmbeddedCardOnly (F1, F2) sends the review's probes through the handler with the embedded
+// TestProxyEmbeddedCardOnly sends card-free and off-catalog probes through the handler with the embedded
 // catalog (catalog.json): a /v1/tokens request that carries no {{pan}} (a pii token, a card-free
 // body, a card body without the number) would only borrow the vault's Stripe credential, so it is
 // refused as a placeholder violation; so are endpoints outside the catalog (payment_methods is
@@ -5138,7 +5138,7 @@ func TestIntegrationPrivileges(t *testing.T) {
 	}
 
 	rot := integrationDB(t, "vault_rotator")
-	// 32 bytes: Task 9's fake KMS reverses bytes and loadDEKs requires a 32-byte DEK for every row.
+	// 32 bytes: the fake KMS reverses bytes and loadDEKs requires a 32-byte DEK for every row.
 	wrapped := bytes.Repeat([]byte{0x07}, 32)
 	v, err := dbAddDEK(ctx, rot, wrapped)
 	if err != nil || v <= 0 {
