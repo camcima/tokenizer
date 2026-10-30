@@ -2683,6 +2683,17 @@ func TestParseCatalogRejects(t *testing.T) {
 		{"payu missing hash", payuVals, `"values": {"apiLogin": "pRRXKOl8ikMmt9u", "accountId": "512321", "merchantId": "508029"}`, `account "payu_co": payu needs`},
 		{"payu bad hash", payuVals, `"values": {"apiLogin": "pRRXKOl8ikMmt9u", "accountId": "512321", "merchantId": "508029", "hash": "crc32"}`, `account "payu_co": payu needs`},
 		{"payu hash case", payuVals, `"values": {"apiLogin": "pRRXKOl8ikMmt9u", "accountId": "512321", "merchantId": "508029", "hash": "SHA256"}`, `account "payu_co": payu needs`},
+		// Dev secret variables (VAULT_DEV_SECRET_<ACCOUNT>_<NAME>, uppercased) must be unique across
+		// every account of every environment.
+		{"dev variable: secret names differ only in case", `"secrets": {"secretKey": "projects/pci-cde-dev/secrets/stripe-t-key"}`,
+			`"secrets": {"secretKey": "projects/pci-cde-dev/secrets/stripe-t-key", "SECRETKEY": "projects/pci-cde-dev/secrets/stripe-t-key2"}`,
+			`account "stripe_t" secret "SECRETKEY" and account "stripe_t" secret "secretKey" share dev variable VAULT_DEV_SECRET_STRIPE_T_SECRETKEY`},
+		{"dev variable: account/secret split", `"accounts": {`,
+			`"accounts": {"stripe": {"provider": "stripe", "env": "dev", "host": "upstream.test", "secrets": {"secretKey": "projects/x/secrets/a", "t_secretKey": "projects/x/secrets/b"}},`,
+			`account "stripe" secret "t_secretKey" and account "stripe_t" secret "secretKey" share dev variable VAULT_DEV_SECRET_STRIPE_T_SECRETKEY`},
+		{"dev variable: collision with a prod account", `"secrets": {"apiKey": "projects/pci-cde-dev/secrets/adyen-br-key"}`,
+			`"secrets": {"apiKey": "projects/pci-cde-dev/secrets/adyen-br-key", "live_apiKey": "projects/pci-cde-dev/secrets/adyen-br-key2"}`,
+			`account "adyen_br" secret "live_apiKey" and account "adyen_br_live" secret "apiKey" share dev variable VAULT_DEV_SECRET_ADYEN_BR_LIVE_APIKEY`},
 	}
 	for _, c := range cases {
 		data := testCatalogJSON
@@ -3278,7 +3289,7 @@ var renderCard = card{PAN: testPAN, ExpMonth: "03", ExpYear: "2030", Name: "Ana 
 
 const payuTestAPIKey = "4Vj8eK4rloUd272L48hsrarnUA" // PayU's documented example key
 
-// renderCatalog is testCatalog with every dev account's secrets set (boot does not load them yet).
+// renderCatalog is testCatalog with every dev account's secrets set (as loadAccountSecrets does at boot).
 func renderCatalog(t *testing.T) *catalog {
 	t.Helper()
 	c := testCatalog(t, "127.0.0.1:9")
@@ -3514,8 +3525,7 @@ func TestRenderHeaders(t *testing.T) {
 	})
 }
 
-// TestRenderFailsClosed: renderRequest refuses, with no request, anything it cannot fill exactly.
-// renderRequest zeroes the body left in p.sent by an earlier render of the same plan before it
+// TestRenderZeroesPreviousSent: renderRequest zeroes the body left in p.sent by an earlier render of the same plan before it
 // renders again (best effort, §8.5), whether or not the new render succeeds.
 func TestRenderZeroesPreviousSent(t *testing.T) {
 	c := renderCatalog(t)
@@ -3543,6 +3553,7 @@ func TestRenderZeroesPreviousSent(t *testing.T) {
 	}
 }
 
+// TestRenderFailsClosed: renderRequest refuses, with no request, anything it cannot fill exactly.
 func TestRenderFailsClosed(t *testing.T) {
 	cases := map[string]func(c *catalog, p *proxyPlan, cd *card, cvv *string){
 		"cvv used but empty":   func(c *catalog, p *proxyPlan, cd *card, cvv *string) { *cvv = "" },
@@ -4191,9 +4202,13 @@ func TestProxySuccess(t *testing.T) {
 	if rec := serveInternal(v, newProxyRequest(envelopeJSON(e))); rec.Code != http.StatusOK {
 		t.Fatalf("GET: status %d", rec.Code)
 	}
-	_, method, path, _, sent = fp.last()
+	_, method, path, hdr, sent = fp.last()
 	if method != "GET" || path != "/v1/payment_intents/pi_123" || fp.lastQuery() != "expand[]=latest_charge&expand%5B%5D=customer" || len(sent) != 0 {
 		t.Errorf("GET outbound %s %s, body len %d", method, path, len(sent))
+	}
+	// The platform supplied no idempotency header, so none is sent.
+	if _, ok := hdr["Idempotency-Key"]; ok || hdr.Get("X-Idempotency-Key") != "" {
+		t.Error("GET: an idempotency header was sent although the platform supplied none")
 	}
 	if v.cvv.take(tok3) != testCVV {
 		t.Error("a request without {{cvv}} consumed the CVV")
@@ -5298,7 +5313,8 @@ func testDevEnv() map[string]string {
 		"VAULT_DB_URL":               "postgres://vault_app:pw-x9q@db.internal/vault",
 		"VAULT_DEV_DEK_HEX":          strings.Repeat("ab", 32),
 		"VAULT_DEV_SESSION_HMAC_HEX": strings.Repeat("cd", 32),
-		"VAULT_DEV_STRIPE_SECRET":    testSecret,
+		// The embedded catalog's one dev account secret (stripe_test/secretKey).
+		"VAULT_DEV_SECRET_STRIPE_TEST_SECRETKEY": testSecret,
 	}
 }
 
@@ -5312,7 +5328,6 @@ func testProdEnv() map[string]string {
 		"VAULT_DB_URL":              "postgres://vault_app@10.1.2.3/vault?sslmode=verify-full",
 		"VAULT_KMS_KEY":             testKMSKey,
 		"VAULT_SESSION_HMAC_SECRET": testHMACName,
-		"VAULT_STRIPE_SECRET":       testStripeName,
 	}
 }
 
@@ -5341,7 +5356,7 @@ func TestLoadConfig(t *testing.T) {
 		{"dev custom addrs", envWith(testDevEnv(), map[string]string{"VAULT_PUBLIC_ADDR": "127.0.0.1:1", "VAULT_INTERNAL_ADDR": "127.0.0.1:2"}), false, ""},
 		{"dev http localhost origin", envWith(testDevEnv(), map[string]string{"VAULT_ALLOW_ORIGIN": "http://localhost:3000"}), false, ""},
 		{"dev KMS instead of dev DEK", envWith(testDevEnv(), map[string]string{"VAULT_DEV_DEK_HEX": omit, "VAULT_KMS_KEY": testKMSKey}), false, ""},
-		{"dev SM instead of dev secrets", envWith(testDevEnv(), map[string]string{"VAULT_DEV_SESSION_HMAC_HEX": omit, "VAULT_SESSION_HMAC_SECRET": testHMACName, "VAULT_DEV_STRIPE_SECRET": omit, "VAULT_STRIPE_SECRET": testStripeName}), false, ""},
+		{"dev SM instead of dev secrets", envWith(testDevEnv(), map[string]string{"VAULT_DEV_SESSION_HMAC_HEX": omit, "VAULT_SESSION_HMAC_SECRET": testHMACName, "VAULT_DEV_SECRET_STRIPE_TEST_SECRETKEY": omit}), false, ""},
 		{"prod", testProdEnv(), false, ""},
 		{"missing VAULT_ENV", envWith(testDevEnv(), map[string]string{"VAULT_ENV": omit}), false, "VAULT_ENV"},
 		{"VAULT_ENV staging", envWith(testDevEnv(), map[string]string{"VAULT_ENV": "staging"}), false, "VAULT_ENV"},
@@ -5362,21 +5377,17 @@ func TestLoadConfig(t *testing.T) {
 		{"prod http origin", envWith(testProdEnv(), map[string]string{"VAULT_ALLOW_ORIGIN": "http://checkout.example.com"}), false, "VAULT_ALLOW_ORIGIN"},
 		{"prod missing VAULT_KMS_KEY", envWith(testProdEnv(), map[string]string{"VAULT_KMS_KEY": omit}), false, "VAULT_KMS_KEY"},
 		{"prod missing VAULT_SESSION_HMAC_SECRET", envWith(testProdEnv(), map[string]string{"VAULT_SESSION_HMAC_SECRET": omit}), false, "VAULT_SESSION_HMAC_SECRET"},
-		{"prod missing VAULT_STRIPE_SECRET", envWith(testProdEnv(), map[string]string{"VAULT_STRIPE_SECRET": omit}), false, "VAULT_STRIPE_SECRET"},
 		{"prod + VAULT_DEV_DEK_HEX", envWith(testProdEnv(), map[string]string{"VAULT_DEV_DEK_HEX": strings.Repeat("ab", 32)}), false, "VAULT_DEV_DEK_HEX"},
 		{"prod + VAULT_DEV_SESSION_HMAC_HEX", envWith(testProdEnv(), map[string]string{"VAULT_DEV_SESSION_HMAC_HEX": strings.Repeat("cd", 32)}), false, "VAULT_DEV_SESSION_HMAC_HEX"},
-		{"prod + VAULT_DEV_STRIPE_SECRET", envWith(testProdEnv(), map[string]string{"VAULT_DEV_STRIPE_SECRET": testSecret}), false, "VAULT_DEV_STRIPE_SECRET"},
 		{"dev DEK 63 hex", envWith(testDevEnv(), map[string]string{"VAULT_DEV_DEK_HEX": strings.Repeat("ab", 31) + "a"}), false, "VAULT_DEV_DEK_HEX"},
 		{"dev DEK 66 hex", envWith(testDevEnv(), map[string]string{"VAULT_DEV_DEK_HEX": strings.Repeat("ab", 33)}), false, "VAULT_DEV_DEK_HEX"},
 		{"dev DEK not hex", envWith(testDevEnv(), map[string]string{"VAULT_DEV_DEK_HEX": strings.Repeat("zq", 32)}), false, "VAULT_DEV_DEK_HEX"},
 		{"dev HMAC 63 hex", envWith(testDevEnv(), map[string]string{"VAULT_DEV_SESSION_HMAC_HEX": strings.Repeat("cd", 31) + "c"}), false, "VAULT_DEV_SESSION_HMAC_HEX"},
 		{"dev no DEK source", envWith(testDevEnv(), map[string]string{"VAULT_DEV_DEK_HEX": omit}), false, "VAULT_KMS_KEY"},
 		{"dev no HMAC source", envWith(testDevEnv(), map[string]string{"VAULT_DEV_SESSION_HMAC_HEX": omit}), false, "VAULT_SESSION_HMAC_SECRET"},
-		{"dev no Stripe source", envWith(testDevEnv(), map[string]string{"VAULT_DEV_STRIPE_SECRET": omit}), false, "VAULT_STRIPE_SECRET"},
 		{"KMS key bad shape", envWith(testProdEnv(), map[string]string{"VAULT_KMS_KEY": "projects/p1/locations/global/keyRings/r1/cryptoKeys/../k1"}), false, "VAULT_KMS_KEY"},
 		{"KMS key with query", envWith(testProdEnv(), map[string]string{"VAULT_KMS_KEY": testKMSKey + "?x=1"}), false, "VAULT_KMS_KEY"},
 		{"HMAC secret bad shape", envWith(testProdEnv(), map[string]string{"VAULT_SESSION_HMAC_SECRET": "projects/p1/secrets/s/versions/3"}), false, "VAULT_SESSION_HMAC_SECRET"},
-		{"Stripe secret bad shape", envWith(testProdEnv(), map[string]string{"VAULT_STRIPE_SECRET": "https://evil.example/x"}), false, "VAULT_STRIPE_SECRET"},
 		{"rotate prod only ENV/DB/KMS", rotEnv, true, ""},
 		{"rotate dev only ENV/DB/KMS", envWith(rotEnv, map[string]string{"VAULT_ENV": "dev"}), true, ""},
 		{"rotate missing KMS", envWith(rotEnv, map[string]string{"VAULT_KMS_KEY": omit}), true, "VAULT_KMS_KEY"},
@@ -5420,8 +5431,7 @@ func TestLoadConfig(t *testing.T) {
 		cfg.dbURL != testDevEnv()["VAULT_DB_URL"] || cfg.kmsKey != "" {
 		t.Error("dev config fields or defaults wrong")
 	}
-	if !bytes.Equal(cfg.devDEK, bytes.Repeat([]byte{0xab}, 32)) || !bytes.Equal(cfg.devHMAC, bytes.Repeat([]byte{0xcd}, 32)) ||
-		cfg.devStripeSecret != testSecret {
+	if !bytes.Equal(cfg.devDEK, bytes.Repeat([]byte{0xab}, 32)) || !bytes.Equal(cfg.devHMAC, bytes.Repeat([]byte{0xcd}, 32)) {
 		t.Error("dev secrets not decoded")
 	}
 	cfg, err = loadConfig(func(k string) string { return testProdEnv()[k] }, false)
@@ -5429,7 +5439,7 @@ func TestLoadConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.env != "prod" || cfg.kmsKey != testKMSKey || cfg.hmacSecretName != testHMACName ||
-		cfg.stripeSecretName != testStripeName || cfg.devDEK != nil || cfg.devHMAC != nil || cfg.devStripeSecret != "" {
+		cfg.devDEK != nil || cfg.devHMAC != nil {
 		t.Error("prod config fields wrong")
 	}
 	cfg, err = loadConfig(func(k string) string { return rotEnv[k] }, true)
@@ -5611,48 +5621,252 @@ func TestLoadSecrets(t *testing.T) {
 	ctx := context.Background()
 	hmacKey := bytes.Repeat([]byte{0x5a}, 32)
 
-	// Dev values: no network at all (nil client and token source).
-	cfg := config{env: "dev", devHMAC: hmacKey, devStripeSecret: testSecret}
-	k, s, err := loadSecrets(ctx, cfg, nil, nil)
-	if err != nil || !bytes.Equal(k, hmacKey) || s != testSecret {
-		t.Fatalf("dev secrets wrong: %v", err)
+	// Dev value: no network at all (nil client and token source).
+	k, err := loadSecrets(ctx, config{env: "dev", devHMAC: hmacKey}, nil, nil)
+	if err != nil || !bytes.Equal(k, hmacKey) {
+		t.Fatalf("dev secret wrong: %v", err)
 	}
 	for name, cfg := range map[string]config{
-		"stripe trailing newline": {env: "dev", devHMAC: hmacKey, devStripeSecret: "sk_test_x\n"},
-		"stripe inner space":      {env: "dev", devHMAC: hmacKey, devStripeSecret: "sk_test x"},
-		"stripe control char":     {env: "dev", devHMAC: hmacKey, devStripeSecret: "sk_test_\x01x"},
-		"HMAC 31 bytes":           {env: "dev", devHMAC: hmacKey[:31], devStripeSecret: testSecret},
-		"prod with dev HMAC":      {env: "prod", devHMAC: hmacKey, devStripeSecret: testSecret, hmacSecretName: testHMACName, stripeSecretName: testStripeName},
+		"HMAC 31 bytes":      {env: "dev", devHMAC: hmacKey[:31]},
+		"prod with dev HMAC": {env: "prod", devHMAC: hmacKey, hmacSecretName: testHMACName},
 	} {
-		if _, _, err := loadSecrets(ctx, cfg, nil, nil); err == nil {
+		if _, err := loadSecrets(ctx, cfg, nil, nil); err == nil {
 			t.Errorf("%s: accepted", name)
-		} else if strings.Contains(err.Error(), "sk_test") {
-			t.Errorf("%s: error contains the secret", name)
+		} else if strings.Contains(err.Error(), hex.EncodeToString(hmacKey)) {
+			t.Errorf("%s: error contains the key", name)
 		}
 	}
 
 	// Secret Manager path.
 	newFakeMetadata(t, nil)
 	c := newOutboundClient(nil)
-	prod := config{env: "prod", hmacSecretName: testHMACName, stripeSecretName: testStripeName}
-	newFakeSecretManager(t, map[string]string{testHMACName: hex.EncodeToString(hmacKey), testStripeName: testSecret}, false)
-	k, s, err = loadSecrets(ctx, prod, c, &tokenSource{client: c})
-	if err != nil || !bytes.Equal(k, hmacKey) || s != testSecret {
-		t.Fatalf("Secret Manager secrets wrong: %v", err)
+	prod := config{env: "prod", hmacSecretName: testHMACName}
+	newFakeSecretManager(t, map[string]string{testHMACName: hex.EncodeToString(hmacKey)}, false)
+	k, err = loadSecrets(ctx, prod, c, &tokenSource{client: c})
+	if err != nil || !bytes.Equal(k, hmacKey) {
+		t.Fatalf("Secret Manager secret wrong: %v", err)
 	}
 	for name, sm := range map[string]map[string]string{
-		"HMAC trailing newline": {testHMACName: hex.EncodeToString(hmacKey) + "\n", testStripeName: testSecret},
-		"HMAC 62 hex":           {testHMACName: hex.EncodeToString(hmacKey[:31]), testStripeName: testSecret},
-		"HMAC not hex":          {testHMACName: strings.Repeat("zz", 32), testStripeName: testSecret},
-		"stripe with space":     {testHMACName: hex.EncodeToString(hmacKey), testStripeName: testSecret + " "},
-		"stripe empty":          {testHMACName: hex.EncodeToString(hmacKey), testStripeName: ""},
-		"stripe missing":        {testHMACName: hex.EncodeToString(hmacKey)},
+		"HMAC trailing newline": {testHMACName: hex.EncodeToString(hmacKey) + "\n"},
+		"HMAC 62 hex":           {testHMACName: hex.EncodeToString(hmacKey[:31])},
+		"HMAC not hex":          {testHMACName: strings.Repeat("zz", 32)},
+		"HMAC missing":          {},
 	} {
 		newFakeSecretManager(t, sm, false)
-		if _, _, err := loadSecrets(ctx, prod, c, &tokenSource{client: c}); err == nil {
+		if _, err := loadSecrets(ctx, prod, c, &tokenSource{client: c}); err == nil {
 			t.Errorf("%s: accepted", name)
-		} else if strings.Contains(err.Error(), testSecret) || strings.Contains(err.Error(), hex.EncodeToString(hmacKey)) {
+		} else if strings.Contains(err.Error(), hex.EncodeToString(hmacKey)) {
 			t.Errorf("%s: error contains secret material", name)
+		}
+	}
+}
+
+func TestDevSecretVar(t *testing.T) {
+	for _, c := range []struct{ account, name, want string }{
+		{"stripe_test", "secretKey", "VAULT_DEV_SECRET_STRIPE_TEST_SECRETKEY"},
+		{"adyen_br", "apiKey", "VAULT_DEV_SECRET_ADYEN_BR_APIKEY"},
+		{"a1", "x_Y9", "VAULT_DEV_SECRET_A1_X_Y9"},
+		{"a", "b-c.d", "VAULT_DEV_SECRET_A_B_C_D"}, // every non-[A-Z0-9] character becomes "_"
+	} {
+		if got := devSecretVar(c.account, c.name); got != c.want {
+			t.Errorf("devSecretVar(%q, %q) = %q, want %q", c.account, c.name, got, c.want)
+		}
+	}
+}
+
+// safeErr is err's text for a failure message, unless it contains one of secrets.
+func safeErr(err error, secrets ...string) string {
+	if err == nil {
+		return "<nil>"
+	}
+	for _, s := range secrets {
+		if s != "" && strings.Contains(err.Error(), s) {
+			return "<withheld: the error contains a secret>"
+		}
+	}
+	return err.Error()
+}
+
+// TestLoadAccountSecrets: every secret of every loaded account is loaded (dev variable first in
+// dev, else Secret Manager) or the whole call fails, leaving no account with secrets; errors name
+// the account and secret name, never a value or a resource.
+func TestLoadAccountSecrets(t *testing.T) {
+	ctx := context.Background()
+	newFakeMetadata(t, nil)
+	c := newOutboundClient(nil)
+	ts := &tokenSource{client: c}
+	dev := config{env: "dev"}
+	// One distinct Secret Manager value per dev account resource of testCatalogJSON.
+	smValues := map[string]string{
+		"projects/pci-cde-dev/secrets/stripe-t-key":   "sm_stripe_t_v1",
+		"projects/pci-cde-dev/secrets/adyen-br-key":   "sm_adyen_br_v1",
+		"projects/pci-cde-dev/secrets/mp-ar-token":    "sm_mp_ar_v1",
+		"projects/pci-cde-dev/secrets/payu-co-key":    "sm_payu_co_v1",
+		"projects/pci-cde-dev/secrets/pagarme-br-key": "sm_pagarme_br_v1",
+		"projects/pci-cde-prod/secrets/adyen-br-key":  "sm_adyen_br_live_v1",
+	}
+	allValues := append(slices.Collect(maps.Values(smValues)), "sk_env_x9", "sk_env x9", "sk_env_x9\n")
+	noEnv := func(string) string { return "" }
+	noSecrets := func(cat *catalog) bool {
+		for _, a := range cat.accounts {
+			if len(a.secrets) != 0 {
+				return false
+			}
+		}
+		return true
+	}
+
+	// All from Secret Manager: every loaded account ends up with every one of its secrets.
+	hits := newFakeSecretManager(t, smValues, false)
+	cat := testCatalog(t, testCatalogHost)
+	if err := loadAccountSecrets(ctx, cat, dev, noEnv, c, ts); err != nil {
+		t.Fatalf("Secret Manager load: %s", safeErr(err, allValues...))
+	}
+	for _, a := range cat.accounts {
+		if len(a.secrets) != len(a.secretNames) {
+			t.Errorf("account %s: %d of %d secrets loaded", a.name, len(a.secrets), len(a.secretNames))
+		}
+		for n, res := range a.secretNames {
+			if a.secrets[n] != smValues[res] {
+				t.Errorf("account %s secret %s: not the Secret Manager value", a.name, n)
+			}
+		}
+	}
+	if hits.Load() != 5 {
+		t.Errorf("Secret Manager hits %d, want 5 (one per dev account secret)", hits.Load())
+	}
+
+	// A dev variable wins over Secret Manager; the others still come from Secret Manager.
+	hits = newFakeSecretManager(t, smValues, false)
+	cat = testCatalog(t, testCatalogHost)
+	env := map[string]string{"VAULT_DEV_SECRET_STRIPE_T_SECRETKEY": "sk_env_x9"}
+	if err := loadAccountSecrets(ctx, cat, dev, func(k string) string { return env[k] }, c, ts); err != nil {
+		t.Fatalf("dev variable load: %s", safeErr(err, allValues...))
+	}
+	if cat.accounts["stripe_t"].secrets["secretKey"] != "sk_env_x9" {
+		t.Error("the dev variable did not win")
+	}
+	if cat.accounts["adyen_br"].secrets["apiKey"] != "sm_adyen_br_v1" {
+		t.Error("a secret without a dev variable did not come from Secret Manager")
+	}
+	if hits.Load() != 4 {
+		t.Errorf("Secret Manager hits %d, want 4 (the dev variable's secret is not fetched)", hits.Load())
+	}
+
+	// Failures: each names the account and secret name, never a value or resource, and no account
+	// is left with secrets (renderRequest's missing-secret path stays unreachable).
+	missing := maps.Clone(smValues)
+	delete(missing, "projects/pci-cde-dev/secrets/pagarme-br-key")
+	spaced := maps.Clone(smValues)
+	spaced["projects/pci-cde-dev/secrets/stripe-t-key"] = "sk_env x9"
+	for _, f := range []struct {
+		name    string
+		sm      map[string]string
+		env     map[string]string
+		mention []string
+	}{
+		{"missing in Secret Manager", missing, nil, []string{"pagarme_br", "secretKey"}},
+		{"Secret Manager value with whitespace", spaced, nil, []string{"stripe_t", "secretKey"}},
+		{"Secret Manager value empty", envWithSM(smValues, "projects/pci-cde-dev/secrets/mp-ar-token", ""), nil, []string{"mp_ar", "accessToken"}},
+		{"dev variable with whitespace", smValues, map[string]string{"VAULT_DEV_SECRET_ADYEN_BR_APIKEY": "sk_env x9"}, []string{"adyen_br", "apiKey", "VAULT_DEV_SECRET_ADYEN_BR_APIKEY"}},
+		{"dev variable trailing newline", smValues, map[string]string{"VAULT_DEV_SECRET_PAYU_CO_APIKEY": "sk_env_x9\n"}, []string{"payu_co", "apiKey", "VAULT_DEV_SECRET_PAYU_CO_APIKEY"}},
+	} {
+		newFakeSecretManager(t, f.sm, false)
+		cat := testCatalog(t, testCatalogHost)
+		err := loadAccountSecrets(ctx, cat, dev, func(k string) string { return f.env[k] }, c, ts)
+		if err == nil {
+			t.Errorf("%s: accepted", f.name)
+			continue
+		}
+		for _, m := range f.mention {
+			if !strings.Contains(err.Error(), m) {
+				t.Errorf("%s: error %q does not name %s", f.name, safeErr(err, allValues...), m)
+			}
+		}
+		if safeErr(err, allValues...) != err.Error() || strings.Contains(err.Error(), "projects/") {
+			t.Errorf("%s: error contains a secret value or resource", f.name)
+		}
+		if !noSecrets(cat) {
+			t.Errorf("%s: an account was left with secrets after the failure", f.name)
+		}
+	}
+
+	// Prod never reads VAULT_DEV_SECRET_* (main's devVarSet refuses such a boot anyway).
+	newFakeSecretManager(t, smValues, false)
+	prodCat, err := parseCatalog([]byte(testCatalogJSON), "prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var devReads []string
+	prodEnv := func(k string) string {
+		if strings.HasPrefix(k, "VAULT_DEV_") {
+			devReads = append(devReads, k)
+		}
+		return "sk_env_x9"
+	}
+	if err := loadAccountSecrets(ctx, prodCat, config{env: "prod"}, prodEnv, c, ts); err != nil {
+		t.Fatalf("prod load: %s", safeErr(err, allValues...))
+	}
+	if prodCat.accounts["adyen_br_live"].secrets["apiKey"] != "sm_adyen_br_live_v1" || len(devReads) != 0 {
+		t.Errorf("prod: secret not from Secret Manager, or %d VAULT_DEV_* reads", len(devReads))
+	}
+
+	// Refused inputs.
+	if err := loadAccountSecrets(ctx, nil, dev, noEnv, c, ts); err == nil {
+		t.Error("nil catalog accepted")
+	}
+	if err := loadAccountSecrets(ctx, testCatalog(t, testCatalogHost), config{env: "staging"}, noEnv, c, ts); err == nil {
+		t.Error("unknown environment accepted")
+	}
+}
+
+// envWithSM copies sm with name set to value.
+func envWithSM(sm map[string]string, name, value string) map[string]string {
+	m := maps.Clone(sm)
+	m[name] = value
+	return m
+}
+
+// TestCheckDevSecretVars: before the database is touched, a dev boot refuses any VAULT_DEV_*
+// variable that is neither a fixed dev variable nor the dev variable of a loaded account secret
+// (a misspelt account secret variable would otherwise silently fall back to Secret Manager), and
+// any account secret variable whose value is not a valid secret. Prod is left to devVarSet.
+func TestCheckDevSecretVars(t *testing.T) {
+	devCat := testCatalog(t, testCatalogHost)
+	prodCat, err := parseCatalog([]byte(testCatalogJSON), "prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name    string
+		cat     *catalog
+		env     string
+		environ []string
+		mention string // "" = accepted
+	}{
+		{"no dev variables", devCat, "dev", []string{"PATH=/bin"}, ""},
+		{"fixed dev variables", devCat, "dev", []string{"VAULT_DEV_DEK_HEX=x", "VAULT_DEV_SESSION_HMAC_HEX=y"}, ""},
+		{"account secret variables", devCat, "dev", []string{"VAULT_DEV_SECRET_STRIPE_T_SECRETKEY=sk_env_x9", "VAULT_DEV_SECRET_PAYU_CO_APIKEY=sk_env_x9"}, ""},
+		{"account secret variable empty", devCat, "dev", []string{"VAULT_DEV_SECRET_STRIPE_T_SECRETKEY="}, ""},
+		{"misspelt account secret variable", devCat, "dev", []string{"VAULT_DEV_SECRET_STRIPE_T_SECRET_KEY=sk_env_x9"}, "VAULT_DEV_SECRET_STRIPE_T_SECRET_KEY"},
+		{"other environment's account", devCat, "dev", []string{"VAULT_DEV_SECRET_ADYEN_BR_LIVE_APIKEY=sk_env_x9"}, "VAULT_DEV_SECRET_ADYEN_BR_LIVE_APIKEY"},
+		{"removed Stripe variable", devCat, "dev", []string{"VAULT_DEV_STRIPE_SECRET=sk_env_x9"}, "VAULT_DEV_STRIPE_SECRET"},
+		{"unknown empty dev variable", devCat, "dev", []string{"VAULT_DEV_X="}, "VAULT_DEV_X"},
+		{"account secret with whitespace", devCat, "dev", []string{"VAULT_DEV_SECRET_MP_AR_ACCESSTOKEN=sk_env x9"}, "VAULT_DEV_SECRET_MP_AR_ACCESSTOKEN"},
+		{"prod is left to devVarSet", prodCat, "prod", []string{"VAULT_DEV_SECRET_ADYEN_BR_LIVE_APIKEY=sk_env_x9"}, ""},
+	} {
+		err := checkDevSecretVars(c.cat, c.env, c.environ)
+		if c.mention == "" {
+			if err != nil {
+				t.Errorf("%s: %s", c.name, safeErr(err, "sk_env"))
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), c.mention) {
+			t.Errorf("%s: error %s does not name %s", c.name, safeErr(err, "sk_env"), c.mention)
+		}
+		if err != nil && strings.Contains(err.Error(), "sk_env") {
+			t.Errorf("%s: error contains the value", c.name)
 		}
 	}
 }
@@ -6029,12 +6243,13 @@ func runMain(t *testing.T, env map[string]string, args ...string) (int, string) 
 	return cmd.ProcessState.ExitCode(), stderr.String()
 }
 
-// TestBootFailsFastOnTLSFiles: in serve mode the certificate, key and client CA are loaded right
-// after the environment is parsed (§11 "fail fast"), before the database, KMS or Secret Manager
-// is touched. VAULT_DB_URL is unparseable in every case, so a boot that reached openDB would
-// fail with the database reason instead. -rotate-dek never reads the TLS files.
-func TestBootFailsFastOnTLSFiles(t *testing.T) {
-	dir := t.TempDir()
+// bootBadDB is a VAULT_DB_URL that openDB refuses: a subprocess boot that fails with any other
+// reason failed before it touched the database.
+const bootBadDB = "postgres://vault_app@127.0.0.1:notaport/vault"
+
+// writeBootTLSFiles writes a valid server certificate, its key and the client CA into dir.
+func writeBootTLSFiles(t *testing.T, dir string) (certFile, keyFile, caFile string) {
+	t.Helper()
 	write := func(name string, b []byte) string {
 		p := filepath.Join(dir, name)
 		if err := os.WriteFile(p, b, 0o600); err != nil {
@@ -6048,13 +6263,26 @@ func TestBootFailsFastOnTLSFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	certFile := write("cert.pem", leafPEM)
-	keyFile := write("key.pem", pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}))
-	caFile := write("ca.pem", caPEM)
+	return write("cert.pem", leafPEM), write("key.pem", pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})), write("ca.pem", caPEM)
+}
+
+// TestBootFailsFastOnTLSFiles: in serve mode the certificate, key and client CA are loaded right
+// after the environment is parsed (§11 "fail fast"), before the database, KMS or Secret Manager
+// is touched. VAULT_DB_URL is unparseable in every case, so a boot that reached openDB would
+// fail with the database reason instead. -rotate-dek never reads the TLS files.
+func TestBootFailsFastOnTLSFiles(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string, b []byte) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	certFile, keyFile, caFile := writeBootTLSFiles(t, dir)
 	missing := filepath.Join(dir, "missing.pem")
-	const badDB = "postgres://vault_app@127.0.0.1:notaport/vault"
-	dev := envWith(testDevEnv(), map[string]string{"VAULT_CERT": certFile, "VAULT_KEY": keyFile, "VAULT_CLIENT_CA": caFile, "VAULT_DB_URL": badDB})
-	prod := envWith(testProdEnv(), map[string]string{"VAULT_CERT": certFile, "VAULT_KEY": keyFile, "VAULT_CLIENT_CA": caFile, "VAULT_DB_URL": badDB})
+	dev := envWith(testDevEnv(), map[string]string{"VAULT_CERT": certFile, "VAULT_KEY": keyFile, "VAULT_CLIENT_CA": caFile, "VAULT_DB_URL": bootBadDB})
+	prod := envWith(testProdEnv(), map[string]string{"VAULT_CERT": certFile, "VAULT_KEY": keyFile, "VAULT_CLIENT_CA": caFile, "VAULT_DB_URL": bootBadDB})
 	for _, c := range []struct {
 		name string
 		env  map[string]string
@@ -6088,6 +6316,54 @@ func TestBootFailsFastOnTLSFiles(t *testing.T) {
 			}
 			if !strings.Contains(stderr, " boot failed: "+c.want+"\n") {
 				t.Errorf("stderr (len %d) lacks boot failure reason %q", len(stderr), c.want)
+			}
+		})
+	}
+}
+
+// TestBootCatalogFailsFast: in serve mode the compiled-in catalog is parsed and the dev account
+// secret variables are checked right after the TLS files, before the database, KMS or Secret
+// Manager is touched (VAULT_DB_URL is unparseable in every case, so a boot that reached openDB
+// fails with the database reason instead). A dev account secret whose variable is misspelt (so the
+// secret is missing from the environment) or malformed exits 1 there, as does any VAULT_DEV_* in
+// prod. An account secret with no dev variable at all comes from Secret Manager, which §11 loads
+// after the DEKs; that path is TestLoadAccountSecrets'. No value ever reaches stderr.
+func TestBootCatalogFailsFast(t *testing.T) {
+	certFile, keyFile, caFile := writeBootTLSFiles(t, t.TempDir())
+	files := map[string]string{"VAULT_CERT": certFile, "VAULT_KEY": keyFile, "VAULT_CLIENT_CA": caFile, "VAULT_DB_URL": bootBadDB}
+	dev := envWith(testDevEnv(), files)
+	prod := envWith(testProdEnv(), files)
+	const acctVar = "VAULT_DEV_SECRET_STRIPE_TEST_SECRETKEY"
+	for _, c := range []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{"dev account secret variable misspelt", envWith(dev, map[string]string{acctVar: omit, "VAULT_DEV_SECRET_STRIPE_TEST_SECRET_KEY": testSecret}),
+			"VAULT_DEV_SECRET_STRIPE_TEST_SECRET_KEY is not a dev variable or the dev variable of a dev catalog account secret"},
+		{"dev removed VAULT_DEV_STRIPE_SECRET", envWith(dev, map[string]string{"VAULT_DEV_STRIPE_SECRET": testSecret}),
+			"VAULT_DEV_STRIPE_SECRET is not a dev variable or the dev variable of a dev catalog account secret"},
+		{"dev account secret with whitespace", envWith(dev, map[string]string{acctVar: testSecret + " x"}),
+			"account stripe_test secret secretKey: " + acctVar + " must be non-empty printable ASCII without whitespace"},
+		{"prod with an account secret variable", envWith(prod, map[string]string{acctVar: testSecret}), acctVar + " is refused when VAULT_ENV=prod"},
+		// Controls: the boot proceeds to the database and fails there.
+		{"dev with the account secret variable", dev, "VAULT_DB_URL cannot be parsed"},
+		{"dev without the account secret variable", envWith(dev, map[string]string{acctVar: omit}), "VAULT_DB_URL cannot be parsed"},
+		{"prod", prod, "VAULT_DB_URL cannot be parsed"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			code, stderr := runMain(t, c.env)
+			if code != 1 {
+				t.Errorf("exit code %d, want 1", code)
+			}
+			if strings.Contains(stderr, testSecret) {
+				t.Fatal("stderr contains the secret value") // never print it
+			}
+			if !strings.Contains(stderr, " boot failed: "+c.want+"\n") {
+				t.Errorf("stderr %q lacks boot failure reason %q", stderr, c.want)
+			}
+			if strings.Contains(stderr, "catalog loaded") {
+				t.Error("catalog loaded before the account secrets")
 			}
 		})
 	}
@@ -6289,8 +6565,18 @@ func TestIntegrationEndToEnd(t *testing.T) {
 	}
 
 	fp := newFakeProvider(t, nil)
-	v := newVault(cfg, db, deks, current, testHMACKey, testCatalog(t, testCatalogHost), newOutboundClient(nil), log.New(&testLog, "", 0))
-	v.catalog.accounts["stripe_t"].secrets["secretKey"] = testSecret // boot does not load account secrets yet
+	// Account secrets as a dev boot loads them: every dev account secret from its dev variable.
+	cat := testCatalog(t, testCatalogHost)
+	devSecrets := func(k string) string {
+		if strings.HasPrefix(k, "VAULT_DEV_SECRET_") {
+			return testSecret
+		}
+		return ""
+	}
+	if err := loadAccountSecrets(ctx, cat, cfg, devSecrets, nil, nil); err != nil {
+		t.Fatalf("loadAccountSecrets: %s", safeErr(err, testSecret))
+	}
+	v := newVault(cfg, db, deks, current, testHMACKey, cat, newOutboundClient(nil), log.New(&testLog, "", 0))
 	pointAccount(t, v, "stripe_t", fp.ts)
 
 	_, caPool, serverCert, clientCert := testPKI(t)

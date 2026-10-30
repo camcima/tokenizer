@@ -1397,7 +1397,7 @@ type catAccount struct {
 	name, provider, env, host, basePath string
 	secretNames                         map[string]string // name → Secret Manager resource
 	values                              map[string]string
-	secrets                             map[string]string // filled at boot (Task 7)
+	secrets                             map[string]string // filled at boot by loadAccountSecrets
 }
 
 // Raw decode targets. Their JSON names are the catalog.json schema:
@@ -1518,10 +1518,21 @@ func parseCatalog(data []byte, env string) (*catalog, error) {
 		}
 		c.providers[name] = p
 	}
+	// SPEC-DECISION: dev secret variables (devSecretVar) must be unique across every account of
+	// every environment, not only the loaded one: "a_b"/"c" and "a"/"b_c", or secrets "apiKey" and
+	// "APIKEY", would otherwise share one variable, and the same image boots in both environments.
+	devVar := map[string]string{} // dev variable → "account A secret S" that claimed it
 	for _, name := range slices.Sorted(maps.Keys(raw.Accounts)) {
 		a, err := parseCatAccount(name, raw.Accounts[name], c.providers)
 		if err != nil {
 			return nil, err
+		}
+		for _, s := range slices.Sorted(maps.Keys(a.secretNames)) {
+			v, this := devSecretVar(name, s), fmt.Sprintf("account %q secret %q", name, s)
+			if prev, ok := devVar[v]; ok {
+				return nil, fmt.Errorf("catalog: %s and %s share dev variable %s", prev, this, v)
+			}
+			devVar[v] = this
 		}
 		if a.env == env {
 			c.accounts[name] = a
@@ -2917,13 +2928,13 @@ func dbAddDEK(ctx context.Context, db *sql.DB, wrapped []byte) (int, error) {
 // config is the parsed environment (§11). Secret values held here (dev mode only) are never logged.
 type config struct {
 	env, publicAddr, internalAddr, certFile, keyFile, clientCAFile, allowOrigin, dbURL string
-	kmsKey, hmacSecretName, stripeSecretName                                           string
+	kmsKey, hmacSecretName                                                             string
 	devDEK, devHMAC                                                                    []byte
-	devStripeSecret                                                                    string
 }
 
-// devVars are the dev-mode secret variables; each is refused when VAULT_ENV=prod.
-var devVars = []string{"VAULT_DEV_DEK_HEX", "VAULT_DEV_SESSION_HMAC_HEX", "VAULT_DEV_STRIPE_SECRET"}
+// devVars are the fixed dev-mode secret variables; each is refused when VAULT_ENV=prod. Account
+// secrets have one dev variable each (devSecretVar), refused in prod by devVarSet's prefix check.
+var devVars = []string{"VAULT_DEV_DEK_HEX", "VAULT_DEV_SESSION_HMAC_HEX"}
 
 // SPEC-DECISION: KMS key and Secret Manager names must have exactly the documented shape, with
 // segments of [A-Za-z0-9_-] only. They are concatenated into request URLs, so "..", "?", "#",
@@ -2993,18 +3004,13 @@ func loadConfig(getenv func(string) string, rotate bool) (config, error) {
 	}
 
 	cfg.hmacSecretName = getenv("VAULT_SESSION_HMAC_SECRET")
-	cfg.stripeSecretName = getenv("VAULT_STRIPE_SECRET")
-	for _, f := range []struct{ name, val string }{
-		{"VAULT_SESSION_HMAC_SECRET", cfg.hmacSecretName},
-		{"VAULT_STRIPE_SECRET", cfg.stripeSecretName},
-	} {
-		if f.val != "" && !secretNameRe.MatchString(f.val) {
-			return config{}, errors.New(f.name + " must be projects/P/secrets/S")
-		}
+	if cfg.hmacSecretName != "" && !secretNameRe.MatchString(cfg.hmacSecretName) {
+		return config{}, errors.New("VAULT_SESSION_HMAC_SECRET must be projects/P/secrets/S")
 	}
 
 	// In prod every secret comes from KMS / Secret Manager (dev vars were refused above); in dev
 	// each comes from its VAULT_DEV_* variable when set, otherwise from KMS / Secret Manager.
+	// Provider account secrets are named by the catalog, not here (loadAccountSecrets).
 	if s := getenv("VAULT_DEV_DEK_HEX"); s != "" {
 		b, ok := decodeKey64(s)
 		if !ok {
@@ -3022,9 +3028,6 @@ func loadConfig(getenv func(string) string, rotate bool) (config, error) {
 		cfg.devHMAC = b
 	} else if cfg.hmacSecretName == "" {
 		return config{}, errors.New("VAULT_SESSION_HMAC_SECRET is required (or VAULT_DEV_SESSION_HMAC_HEX in dev)")
-	}
-	if cfg.devStripeSecret = getenv("VAULT_DEV_STRIPE_SECRET"); cfg.devStripeSecret == "" && cfg.stripeSecretName == "" {
-		return config{}, errors.New("VAULT_STRIPE_SECRET is required (or VAULT_DEV_STRIPE_SECRET in dev)")
 	}
 	return cfg, nil
 }
@@ -3414,49 +3417,131 @@ func validSecretValue(s string) bool {
 	return true
 }
 
-// loadSecrets returns the session HMAC key (32 bytes) and the Stripe secret (§8.6): from the
-// VAULT_DEV_* values in dev when set, otherwise from Secret Manager. The HMAC payload must be
-// exactly 64 hex chars. Errors name the variable, never the value.
-func loadSecrets(ctx context.Context, cfg config, c *http.Client, ts *tokenSource) (hmacKey []byte, stripeSecret string, err error) {
-	if cfg.env != "dev" && (cfg.devHMAC != nil || cfg.devStripeSecret != "") {
-		return nil, "", errors.New("dev secrets are refused when VAULT_ENV=prod")
+// loadSecrets returns the session HMAC key (32 bytes) (§8.6): from VAULT_DEV_SESSION_HMAC_HEX in
+// dev when set, otherwise from Secret Manager. The payload must be exactly 64 hex chars. Errors
+// name the variable, never the value. Provider account secrets are loadAccountSecrets'.
+func loadSecrets(ctx context.Context, cfg config, c *http.Client, ts *tokenSource) (hmacKey []byte, err error) {
+	if cfg.env != "dev" && cfg.devHMAC != nil {
+		return nil, errors.New("dev secrets are refused when VAULT_ENV=prod")
 	}
 	if cfg.devHMAC != nil {
 		hmacKey = bytes.Clone(cfg.devHMAC)
 	} else {
 		raw, err := accessSecret(ctx, c, ts, cfg.hmacSecretName)
 		if err != nil {
-			return nil, "", errors.New("VAULT_SESSION_HMAC_SECRET: " + err.Error())
+			return nil, errors.New("VAULT_SESSION_HMAC_SECRET: " + err.Error())
 		}
 		var ok bool
 		hmacKey, ok = decodeKey64(string(raw))
 		zero(raw)
 		if !ok {
-			return nil, "", errors.New("VAULT_SESSION_HMAC_SECRET: payload must be exactly 64 hex chars")
+			return nil, errors.New("VAULT_SESSION_HMAC_SECRET: payload must be exactly 64 hex chars")
 		}
 	}
 	if len(hmacKey) != 32 {
 		zero(hmacKey)
-		return nil, "", errors.New("session HMAC key must be 32 bytes")
+		return nil, errors.New("session HMAC key must be 32 bytes")
 	}
+	return hmacKey, nil
+}
 
-	name := "VAULT_DEV_STRIPE_SECRET"
-	stripeSecret = cfg.devStripeSecret
-	if stripeSecret == "" {
-		name = "VAULT_STRIPE_SECRET"
-		raw, err := accessSecret(ctx, c, ts, cfg.stripeSecretName)
-		if err != nil {
-			zero(hmacKey)
-			return nil, "", errors.New(name + ": " + err.Error())
+// devSecretVar is the dev variable of an account secret: VAULT_DEV_SECRET_<ACCOUNT>_<NAME>,
+// uppercased, with every character outside [A-Z0-9] replaced by "_" (globals decision 3).
+// parseCatalog refuses a catalog in which two account secrets share one.
+func devSecretVar(account, name string) string {
+	b := []byte(strings.ToUpper("VAULT_DEV_SECRET_" + account + "_" + name))
+	for i, c := range b {
+		if !(c >= 'A' && c <= 'Z' || c >= '0' && c <= '9') {
+			b[i] = '_'
 		}
-		stripeSecret = string(raw)
-		zero(raw)
 	}
-	if !validSecretValue(stripeSecret) {
-		zero(hmacKey)
-		return nil, "", errors.New(name + ": secret must be non-empty printable ASCII without whitespace")
+	return string(b)
+}
+
+// checkDevSecretVars runs before the database is touched (§11 "parse env, fail fast"). In dev,
+// every VAULT_DEV_* variable in environ (os.Environ form) must be one of devVars or the dev variable
+// of a secret of a loaded account, and an account secret variable that is set must be a valid
+// secret. In prod it does nothing: main refuses any VAULT_DEV_* there (devVarSet). Errors name the
+// variable, account and secret name, never the value.
+// SPEC-DECISION: an unknown VAULT_DEV_* name refuses a dev boot, even when empty. A misspelt
+// account secret variable (or the removed VAULT_DEV_STRIPE_SECRET) would otherwise be ignored and
+// the secret silently taken from Secret Manager, or reported missing only after the DEKs load.
+func checkDevSecretVars(cat *catalog, env string, environ []string) error {
+	if env != "dev" {
+		return nil
 	}
-	return hmacKey, stripeSecret, nil
+	if cat == nil {
+		return errors.New("catalog not loaded")
+	}
+	type acctSecret struct{ account, name string }
+	known := map[string]acctSecret{}
+	for _, a := range cat.accounts {
+		for n := range a.secretNames {
+			known[devSecretVar(a.name, n)] = acctSecret{a.name, n}
+		}
+	}
+	for _, kv := range environ {
+		name, val, _ := strings.Cut(kv, "=")
+		if !strings.HasPrefix(name, "VAULT_DEV_") || slices.Contains(devVars, name) {
+			continue
+		}
+		as, ok := known[name]
+		if !ok {
+			return errors.New(name + " is not a dev variable or the dev variable of a dev catalog account secret")
+		}
+		if val != "" && !validSecretValue(val) {
+			return errors.New("account " + as.account + " secret " + as.name + ": " + name + " must be non-empty printable ASCII without whitespace")
+		}
+	}
+	return nil
+}
+
+// loadAccountSecrets fills the secrets of every account of cat (the accounts of cfg.env): in dev
+// from the secret's dev variable (devSecretVar) when set, otherwise from Secret Manager by the
+// catalog's resource name; prod never reads a dev variable. Every value must pass
+// validSecretValue. Errors name the account and secret name, never the value or the resource.
+// SPEC-DECISION: all or nothing. Every secret of every loaded account must load or boot fails, and
+// on failure no account is given any secret. renderRequest's missing-secret path (which would
+// already have consumed the CVV) is therefore unreachable in a booted vault.
+func loadAccountSecrets(ctx context.Context, cat *catalog, cfg config, getenv func(string) string, c *http.Client, ts *tokenSource) error {
+	if cat == nil {
+		return errors.New("catalog not loaded")
+	}
+	if cfg.env != "dev" && cfg.env != "prod" {
+		return errors.New("account secrets: environment must be dev or prod")
+	}
+	loaded := map[string]map[string]string{}
+	for _, an := range slices.Sorted(maps.Keys(cat.accounts)) {
+		a := cat.accounts[an]
+		loaded[an] = map[string]string{}
+		for _, n := range slices.Sorted(maps.Keys(a.secretNames)) {
+			fail := func(reason string) error { return errors.New("account " + an + " secret " + n + ": " + reason) }
+			var v string
+			if dv := devSecretVar(an, n); cfg.env == "dev" && getenv(dv) != "" {
+				if v = getenv(dv); !validSecretValue(v) {
+					return fail(dv + " must be non-empty printable ASCII without whitespace")
+				}
+			} else {
+				raw, err := accessSecret(ctx, c, ts, a.secretNames[n])
+				if err != nil {
+					return fail(err.Error())
+				}
+				v = string(raw)
+				zero(raw)
+				if !validSecretValue(v) {
+					return fail("secret must be non-empty printable ASCII without whitespace")
+				}
+			}
+			loaded[an][n] = v
+		}
+		if len(loaded[an]) != len(a.secretNames) {
+			return errors.New("account " + an + ": not every secret loaded")
+		}
+	}
+	for an, secrets := range loaded {
+		cat.accounts[an].secrets = secrets
+	}
+	return nil
 }
 
 // rotateDEK generates a 32-byte DEK, wraps it via KMS encrypt, checks that KMS decrypt returns it,
@@ -3625,6 +3710,19 @@ func main() {
 		}
 	}
 
+	// 1c. Serve mode: parse the compiled-in catalog for this environment and check the dev account
+	// secret variables, still before any network call. -rotate-dek needs no catalog.
+	var cat *catalog
+	if !*rotate {
+		cat, err = parseCatalog(catalogJSON, cfg.env)
+		if err != nil {
+			fail(err.Error())
+		}
+		if err := checkDevSecretVars(cat, cfg.env, os.Environ()); err != nil {
+			fail(err.Error())
+		}
+	}
+
 	client := newOutboundClient(nil) // the single shared client: metadata, KMS, SM, providers
 	ts := &tokenSource{client: client}
 
@@ -3668,21 +3766,24 @@ func main() {
 	}
 	boot.logf("deks loaded versions=%s current=%d", dekVersions(deks), current)
 
-	// 4. Load secrets.
+	// 4. Load secrets: the session HMAC key, then every secret of every loaded catalog account
+	// (all or nothing: a missing or invalid one fails the boot).
 	ctx, cancel = context.WithTimeout(context.Background(), bootGCPTimeout)
-	hmacKey, _, err := loadSecrets(ctx, cfg, client, ts)
+	hmacKey, err := loadSecrets(ctx, cfg, client, ts)
 	cancel()
 	if err != nil {
 		fail(err.Error())
 	}
-
-	// 5. Parse the compiled-in catalog for this environment and build the vault.
-	// Interim (Task 6): account secrets are not loaded yet, so a request that needs one fails closed
-	// in renderRequest (500). Task 7 moves this parse right after loadConfig and loads the secrets.
-	cat, err := parseCatalog(catalogJSON, cfg.env)
+	ctx, cancel = context.WithTimeout(context.Background(), bootGCPTimeout)
+	err = loadAccountSecrets(ctx, cat, cfg, os.Getenv, client, ts)
+	cancel()
 	if err != nil {
+		zero(hmacKey)
 		fail(err.Error())
 	}
+	boot.logf("catalog loaded env=%s accounts=%d", cfg.env, len(cat.accounts))
+
+	// 5. Build the vault on the catalog parsed in step 1c.
 	v := newVault(cfg, db, deks, current, hmacKey, cat, client, logger)
 
 	// 6. Start both listeners (certificate and client CA were loaded in step 1b).
