@@ -2730,6 +2730,27 @@ func TestParseCatalogRejects(t *testing.T) {
 	}
 }
 
+// Example platform bodies for the embedded catalog's stripe endpoints (catalog.json), used by
+// TestEmbeddedCatalog, TestStripeMock and TestStripeLive.
+const (
+	embeddedPMBody = `type=card&card[number]={{pan}}&card[exp_month]={{exp_month}}&card[exp_year]={{exp_year}}` +
+		`&card[cvc]={{cvv}}&billing_details[name]={{name}}`
+	embeddedPMNoCVV = `type=card&card[number]={{pan}}&card[exp_month]={{exp_month}}&card[exp_year]={{exp_year}}` +
+		`&billing_details[name]={{name}}`
+	embeddedTokensBody = `card[number]={{pan}}&card[exp_month]={{exp_month}}&card[exp_year]={{exp_year}}` +
+		`&card[cvc]={{cvv}}&card[name]={{name}}`
+)
+
+// embeddedFixtures holds at least one example request per endpoint of the embedded catalog
+// (D§7), keyed "provider/endpoint": each must pass checkProxy for the named dev account and match
+// that endpoint. TestEmbeddedCatalog fails for an endpoint without one, so every catalog change
+// adds its fixture here.
+var embeddedFixtures = map[string]*proxyEnvelope{
+	"stripe/payment_methods": newEnvelope("stripe_test", "POST", "/v1/payment_methods",
+		map[string]string{"Idempotency-Key": "ord-1", "Authorization": "Bearer {{secret:secretKey}}"}, embeddedPMBody),
+	"stripe/tokens": newEnvelope("stripe_test", "POST", "/v1/tokens", nil, embeddedTokensBody),
+}
+
 func TestEmbeddedCatalog(t *testing.T) {
 	for _, env := range []string{"dev", "prod"} {
 		if _, err := parseCatalog(catalogJSON, env); err != nil {
@@ -2737,18 +2758,54 @@ func TestEmbeddedCatalog(t *testing.T) {
 		}
 	}
 	c, _ := parseCatalog(catalogJSON, "dev")
-	pi := catEndpointByID(t, c, "stripe", "payment_intents")
+	// SPEC-DECISION (plan Decision 5): stripe-mock rejects raw card fields on /v1/payment_intents
+	// (payment_method_data[type] has no "card" value), so the card endpoint is POST
+	// /v1/payment_methods: an unattached PaymentMethod is usable once, a single-use hand-off. Every
+	// field that attaches, clones or marks it for reuse is forbidden (see CLAUDE.md, catalog review notes).
+	pm := catEndpointByID(t, c, "stripe", "payment_methods")
 	tk := catEndpointByID(t, c, "stripe", "tokens")
-	if c.providers["stripe"].format != "form" || len(c.providers["stripe"].endpoints) != 2 || !pi.cardData || !tk.cardData {
+	if c.providers["stripe"].format != "form" || len(c.providers["stripe"].endpoints) != 2 || !pm.cardData || !tk.cardData {
 		t.Error("embedded stripe provider shape")
 	}
-	for _, addr := range []string{"setup_future_usage", "customer", "save_payment_method", "payment_method_options[card][setup_future_usage]"} {
-		if f, ok := pi.forbid[addr]; !ok || len(f) != 0 {
-			t.Errorf("embedded stripe payment_intents does not forbid %s", addr)
+	for _, addr := range []string{"customer", "payment_method", "allow_redisplay", "setup_future_usage"} {
+		if f, ok := pm.forbid[addr]; !ok || len(f) != 0 {
+			t.Errorf("embedded stripe payment_methods does not forbid %s", addr)
 		}
 	}
 	if a := c.accounts["stripe_test"]; a == nil || a.host != "api.stripe.com" || a.secretNames["secretKey"] != "projects/pci-cde-dev/secrets/stripe-test-secret-key" {
 		t.Error("embedded stripe_test account")
+	}
+
+	// Every endpoint has a fixture, every fixture passes and matches its endpoint, and (form) a
+	// fixture with a forbidden field added is refused.
+	for _, prov := range slices.Sorted(maps.Keys(c.providers)) {
+		for _, ep := range c.providers[prov].endpoints {
+			if embeddedFixtures[prov+"/"+ep.id] == nil {
+				t.Errorf("embedded endpoint %s/%s has no fixture in embeddedFixtures", prov, ep.id)
+			}
+		}
+	}
+	for _, key := range slices.Sorted(maps.Keys(embeddedFixtures)) {
+		e := embeddedFixtures[key]
+		prov, id, _ := strings.Cut(key, "/")
+		plan, perr := c.checkProxy(e)
+		if perr != nil {
+			t.Errorf("fixture %s rejected: %s (%s)", key, perr.msg, perr.reason)
+			continue
+		}
+		if plan.prov.name != prov || plan.ep.id != id {
+			t.Errorf("fixture %s matched %s/%s", key, plan.prov.name, plan.ep.id)
+		}
+		for _, addr := range slices.Sorted(maps.Keys(plan.ep.forbid)) {
+			if plan.prov.format != "form" {
+				break // appending a field is only this simple in a form body
+			}
+			bad := *e
+			bad.Request.Body = e.Request.Body + "&" + addr + "=x"
+			if _, perr := c.checkProxy(&bad); perr == nil || perr.msg != msgForbiddenField {
+				t.Errorf("fixture %s with %s set was not refused as a forbidden field", key, addr)
+			}
+		}
 	}
 }
 
@@ -6539,8 +6596,10 @@ func hasLogLine(logged string, parts ...string) bool {
 
 // TestIntegrationEndToEnd boots the vault the way main does (dev config, real database as
 // vault_app, DEK v1) behind both real TLS listeners, with the fake TLS provider standing in for
-// Stripe, and walks the §15 flow: browser preflight + tokenize, platform proxy with a forged
-// Authorization header, healthz, and the mTLS refusal of a client without a certificate.
+// the stripe_t account (testCatalogJSON, via pointAccount), and walks the §15 flow: browser
+// preflight + tokenize with a cardholder name, platform /proxy with the {account, token, request}
+// envelope (placeholders incl. {{name}}) and a forged Authorization header, healthz, and the mTLS
+// refusal of a client without a certificate.
 func TestIntegrationEndToEnd(t *testing.T) {
 	ctx := context.Background()
 	cfg := config{
@@ -6603,7 +6662,7 @@ func TestIntegrationEndToEnd(t *testing.T) {
 	if status != http.StatusNoContent || h.Get("Access-Control-Allow-Origin") != testOrigin {
 		t.Fatalf("preflight: status %d, want 204 with the allowed origin", status)
 	}
-	status, h, body := roundTrip(t, browser, http.MethodPost, pubURL+"/tokenize", tokBody(nil), map[string]string{
+	status, h, body := roundTrip(t, browser, http.MethodPost, pubURL+"/tokenize", tokBody(map[string]any{"name": testName}), map[string]string{
 		"Origin":        testOrigin,
 		"Authorization": "Bearer " + mintSession(testHMACKey, time.Now().Add(10*time.Minute)),
 		"Content-Type":  "application/json",
@@ -6634,7 +6693,8 @@ func TestIntegrationEndToEnd(t *testing.T) {
 	// Platform with its certificate: stripe_t POST /v1/tokens with a forged inbound Authorization
 	// header (the inbound headers are never used; the envelope carries the platform's headers).
 	platform := tlsClient(t, caPool, clientCert)
-	env := newEnvelope("stripe_t", "POST", "/v1/tokens", map[string]string{"Idempotency-Key": "e2e-1"}, stripeTokensBody)
+	e2eBody := stripeTokensBody + "&card[name]={{name}}"
+	env := newEnvelope("stripe_t", "POST", "/v1/tokens", map[string]string{"Idempotency-Key": "e2e-1"}, e2eBody)
 	env.Token = tr.Token
 	status, _, body = roundTrip(t, platform, http.MethodPost, intURL+"/proxy", envelopeJSON(env), map[string]string{
 		"Content-Type":  "application/json",
@@ -6653,9 +6713,9 @@ func TestIntegrationEndToEnd(t *testing.T) {
 	if sentHeader.Get("Authorization") != "Bearer "+testSecret || sentHeader.Get("Idempotency-Key") != "e2e-1" {
 		t.Error("provider did not receive the vault's own secret as the credential, or the platform's Idempotency-Key")
 	}
-	// The tokenized card (goodBody: 12/2030, CVV 9071) substituted into the platform's body.
-	if want := seededValues("form", stripeTokensBody); string(sent) != want {
-		t.Errorf("provider body is not the platform body plus the tokenized card and CVV (len %d, want %d)", len(sent), len(want))
+	// The tokenized card (goodBody: 12/2030, CVV 9071, name testName) substituted into the platform's body.
+	if want := seededValues("form", e2eBody); string(sent) != want {
+		t.Errorf("provider body is not the platform body plus the tokenized card, CVV and name (len %d, want %d)", len(sent), len(want))
 	}
 
 	status, _, body = roundTrip(t, platform, http.MethodGet, intURL+"/healthz", "", nil)
@@ -6778,49 +6838,91 @@ func TestIntegrationRotateDEK(t *testing.T) {
 	}
 }
 
-// TestStripeLive runs tokenize → create_payment_method against the real Stripe test-mode API
-// (§15) with a forged inbound Authorization header. It runs only when VAULT_TEST_STRIPE_SECRET
-// holds a test-mode key (sk_test_…), which is never printed. That the payment method shows up in
-// the vault's Stripe dashboard is still checked by hand.
+// embeddedStripeVault returns a test vault whose catalog is the embedded catalog.json (dev), with
+// the stripe_test account's secretKey set to secret. The account's host stays api.stripe.com until a
+// test points it elsewhere.
+func embeddedStripeVault(t *testing.T, secret string) (*vault, *fakeStore) {
+	t.Helper()
+	v, s := newTestVault(t)
+	c, err := parseCatalog(catalogJSON, "dev")
+	if err != nil {
+		t.Fatalf("embedded catalog: %v", err)
+	}
+	c.accounts["stripe_test"].secrets["secretKey"] = secret
+	v.catalog = c
+	return v, s
+}
+
+// stripeShow makes a Stripe response body printable in a failure message: PAN masked, the key,
+// the test cardholder name and its form encoding redacted, at most 2 KiB.
+func stripeShow(b []byte, secret string) string {
+	m, _ := maskPAN(b, testPAN)
+	out := strings.NewReplacer(secret, "<redacted>", testName, "<name>", url.QueryEscape(testName), "<name>").Replace(string(m))
+	if len(out) > 2048 {
+		out = out[:2048] + "…"
+	}
+	return out
+}
+
+// stripeProxyRequest returns POST /proxy for the stripe_test account on tok.
+func stripeProxyRequest(tok, path string, headers map[string]string, body string) *http.Request {
+	e := newEnvelope("stripe_test", "POST", path, headers, body)
+	e.Token = tok
+	return newProxyRequest(envelopeJSON(e))
+}
+
+// TestStripeLive runs tokenize (with a cardholder name) → /proxy against the real Stripe test-mode
+// API (§15) through the embedded catalog's stripe_test account, with a forged inbound Authorization
+// header: POST /v1/payment_methods with the CVV, then POST /v1/tokens without it (the CVV was used).
+// It runs only when VAULT_TEST_STRIPE_SECRET holds a test-mode key (sk_test_…), which is never
+// printed. That the objects show up in the vault's Stripe dashboard is still checked by hand.
 func TestStripeLive(t *testing.T) {
-	t.Skip("rewritten in Task 8: still asserts the old create_payment_method op")
 	secret := os.Getenv("VAULT_TEST_STRIPE_SECRET")
 	if !strings.HasPrefix(secret, "sk_test_") {
 		t.Skip("set VAULT_TEST_STRIPE_SECRET to a Stripe test-mode key (sk_test_…) to run")
 	}
-	v, _ := newTestVault(t) // in-memory store
-	v.catalog.accounts["stripe_t"].host = "api.stripe.com"
-	v.catalog.accounts["stripe_t"].secrets["secretKey"] = secret
+	v, _ := embeddedStripeVault(t, secret) // in-memory store, host api.stripe.com
 	v.client = newOutboundClient(nil)
 
-	rec := serveTokenize(v, tokRequest(tokCase{body: tokBody(map[string]any{"cvv": "314"})}))
+	rec := serveTokenize(v, tokRequest(tokCase{body: tokBody(map[string]any{"cvv": "314", "name": testName})}))
 	var tr tokenizeResponse
 	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &tr) != nil {
 		t.Fatalf("tokenize: status %d", rec.Code)
 	}
 
-	r := tokensRequest(tr.Token, stripeTokensBody)
-	r.Header.Set("Authorization", "Bearer sk_test_attacker")
-	rec = serveInternal(v, r)
-	if rec.Code != http.StatusOK || !regexp.MustCompile(`"id":\s*"pm_`).Match(rec.Body.Bytes()) {
-		masked, _ := maskPAN(rec.Body.Bytes(), testPAN)
-		t.Fatalf("create_payment_method: status %d, body (PAN masked, key redacted): %s",
-			rec.Code, strings.ReplaceAll(string(masked), secret, "<redacted>"))
+	for _, c := range []struct {
+		name, path, body string
+		wantID           *regexp.Regexp
+	}{
+		{"payment_methods", "/v1/payment_methods", embeddedPMBody, regexp.MustCompile(`"id":\s*"pm_`)},
+		{"tokens (CVV used)", "/v1/tokens", strings.Replace(embeddedTokensBody, "&card[cvc]={{cvv}}", "", 1), regexp.MustCompile(`"id":\s*"tok_`)},
+	} {
+		r := stripeProxyRequest(tr.Token, c.path, nil, c.body)
+		r.Header.Set("Authorization", "Bearer sk_test_attacker")
+		rec = serveInternal(v, r)
+		if rec.Code != http.StatusOK || !c.wantID.Match(rec.Body.Bytes()) {
+			t.Errorf("%s: status %d, body (PAN masked, key and name redacted): %s", c.name, rec.Code, stripeShow(rec.Body.Bytes(), secret))
+		}
 	}
 }
 
-// TestStripeMock checks the vault's real outbound Stripe requests against Stripe's published API
-// definition by sending them to stripe/stripe-mock (`make stripe-mock-test`). It runs only when
+// TestStripeMock checks the vault's real outbound Stripe requests, built from platform form bodies
+// through the embedded catalog's stripe provider, against Stripe's published API definition by
+// sending them to stripe/stripe-mock (`make stripe-mock-test`). It runs only when
 // VAULT_TEST_STRIPE_MOCK_URL names stripe-mock's plain-HTTP port on a loopback address.
 //
 // stripe-mock's built-in HTTPS certificate is an X.509 v1 cert with CN=localhost and no SANs, which
 // Go cannot hostname-verify for any ServerName, and stripe-mock takes no cert flags. So the vault
 // talks TLS to a test-only relay (an httptest TLS server whose certificate is the only root in the
-// vault client's pool, exactly as pointStripe does for the fake provider): the vault's client is
+// vault client's pool, exactly as pointAccount does for the fake provider): the vault's client is
 // the unmodified, fully verifying newOutboundClient. The relay forwards method, path, headers and
 // body unchanged to stripe-mock over loopback HTTP and returns its status, headers and body.
+//
+// SPEC-DECISION (plan Decision 5): stripe-mock rejects raw card fields on POST /v1/payment_intents
+// ("payment_method_data[type]": card is not in its enumeration), so catalog.json's card endpoint is
+// POST /v1/payment_methods (an unattached PaymentMethod is single use) with customer, payment_method,
+// allow_redisplay and setup_future_usage forbidden.
 func TestStripeMock(t *testing.T) {
-	t.Skip("rewritten in Task 8: its cases still describe the old create_payment_method/create_token ops")
 	raw := os.Getenv("VAULT_TEST_STRIPE_MOCK_URL")
 	if raw == "" {
 		t.Skip("set VAULT_TEST_STRIPE_MOCK_URL (e.g. via `make stripe-mock-test`) to run")
@@ -6836,10 +6938,10 @@ func TestStripeMock(t *testing.T) {
 
 	// What stripe-mock received for the latest request; recorded by the relay, never printed.
 	type seen struct {
-		hits                       int
-		method, path               string
-		authOK, formOK, userAgent  bool
-		hasCVC, hasCustomer, hasPM bool
+		hits                      int
+		method, path, idem        string
+		authOK, formOK, userAgent bool
+		body                      []byte
 	}
 	var mu sync.Mutex
 	var last seen
@@ -6858,54 +6960,46 @@ func TestStripeMock(t *testing.T) {
 			return
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
-		form, _ := url.ParseQuery(string(body))
 		mu.Lock()
 		last = seen{
-			hits:        last.hits + 1,
-			method:      r.Method,
-			path:        r.URL.Path,
-			authOK:      slices.Equal(r.Header.Values("Authorization"), []string{"Bearer " + secret}),
-			formOK:      r.Header.Get("Content-Type") == "application/x-www-form-urlencoded",
-			userAgent:   r.Header.Get("User-Agent") == "pan-vault/1",
-			hasCVC:      form.Has("card[cvc]"),
-			hasCustomer: form.Get("customer") == "cus_123",
-			hasPM:       form.Get("type") == "card",
+			hits:      last.hits + 1,
+			method:    r.Method,
+			path:      r.URL.Path,
+			idem:      r.Header.Get("Idempotency-Key"),
+			authOK:    slices.Equal(r.Header.Values("Authorization"), []string{"Bearer " + secret}),
+			formOK:    r.Header.Get("Content-Type") == "application/x-www-form-urlencoded",
+			userAgent: r.Header.Get("User-Agent") == "pan-vault/1",
+			body:      body,
 		}
 		mu.Unlock()
 		proxy.ServeHTTP(w, r)
 	}))
 	t.Cleanup(relay.Close)
 
-	v, s := newTestVault(t)
-	v.catalog.accounts["stripe_t"].secrets["secretKey"] = secret
-	pointAccount(t, v, "stripe_t", relay)
-
-	// show makes a response body printable: PAN masked, key redacted, at most 2 KiB.
-	show := func(b []byte) string {
-		m, _ := maskPAN(b, testPAN)
-		out := strings.ReplaceAll(string(m), secret, "<redacted>")
-		if len(out) > 2048 {
-			out = out[:2048] + "…"
-		}
-		return out
-	}
-	pmID := regexp.MustCompile(`"id":\s*"pm_`)
-	tokID := regexp.MustCompile(`"id":\s*"tok_`)
-
-	call := func(name, op, tok string, params map[string]string, wantPath string, wantCVC bool) (*httptest.ResponseRecorder, seen) {
-		t.Helper()
+	v, s := embeddedStripeVault(t, secret)
+	pointAccount(t, v, "stripe_test", relay)
+	hits := func() int {
 		mu.Lock()
-		before := last.hits
-		mu.Unlock()
-		rec := serveInternal(v, tokensRequest(tok, stripeTokensBody)) // op and params: the old API; Task 8 rewrites the cases
+		defer mu.Unlock()
+		return last.hits
+	}
+
+	// call sends one platform request and checks what reached stripe-mock: exactly one request,
+	// POST path, the vault's credential only, form Content-Type, the vault's User-Agent, the
+	// platform's Idempotency-Key if it sent one, and a body equal to the platform's body with the
+	// seeded card (12/2030, testCVV, testName) substituted. Bodies are compared, never printed.
+	call := func(name, tok, path, body string, headers map[string]string) *httptest.ResponseRecorder {
+		t.Helper()
+		before := hits()
+		rec := serveInternal(v, stripeProxyRequest(tok, path, headers, body))
 		mu.Lock()
 		got := last
 		mu.Unlock()
 		if got.hits != before+1 {
 			t.Fatalf("%s: stripe-mock got %d requests, want 1 (vault status %d)", name, got.hits-before, rec.Code)
 		}
-		if got.method != "POST" || got.path != wantPath {
-			t.Errorf("%s: outbound %s %s, want POST %s", name, got.method, got.path, wantPath)
+		if got.method != "POST" || got.path != path {
+			t.Errorf("%s: outbound %s %s, want POST %s", name, got.method, got.path, path)
 		}
 		if !got.authOK {
 			t.Errorf("%s: stripe-mock did not receive exactly the vault credential", name) // never print it
@@ -6913,58 +7007,58 @@ func TestStripeMock(t *testing.T) {
 		if !got.formOK || !got.userAgent {
 			t.Errorf("%s: outbound Content-Type or User-Agent wrong", name)
 		}
-		if got.hasCVC != wantCVC {
-			t.Errorf("%s: card[cvc] sent = %v, want %v", name, got.hasCVC, wantCVC)
+		if got.idem != headers["Idempotency-Key"] {
+			t.Errorf("%s: outbound Idempotency-Key is not the platform's", name)
 		}
-		return rec, got
-	}
-
-	// 1. create_payment_method, no params, CVV present.
-	tok1 := seedCard(t, v, s, testCVV)
-	rec, got := call("create_payment_method", "create_payment_method", tok1, nil, "/v1/payment_methods", true)
-	if !got.hasPM || got.hasCustomer {
-		t.Error("create_payment_method: outbound type=card missing or unexpected customer")
-	}
-	if rec.Code != http.StatusOK || !pmID.Match(rec.Body.Bytes()) {
-		t.Errorf("create_payment_method: status %d, body len %d (PAN masked): %s", rec.Code, rec.Body.Len(), show(rec.Body.Bytes()))
-	}
-
-	// 2. create_payment_method with customer: assert success if stripe-mock accepts it; a rejection
-	// is a FINDING for the catalog owner, logged without card data, not a test failure.
-	tok2 := seedCard(t, v, s, testCVV)
-	rec, got = call("create_payment_method+customer", "create_payment_method", tok2, map[string]string{"customer": "cus_123"}, "/v1/payment_methods", true)
-	if !got.hasPM || !got.hasCustomer {
-		t.Error("create_payment_method+customer: outbound type=card or customer missing")
-	}
-	switch {
-	case rec.Code == http.StatusOK:
-		if !pmID.Match(rec.Body.Bytes()) {
-			t.Errorf("create_payment_method+customer: 200 without a pm_ id, body len %d (PAN masked): %s", rec.Body.Len(), show(rec.Body.Bytes()))
-		} else {
-			t.Log("create_payment_method with customer: accepted by stripe-mock (200, pm_ id)")
+		if want := seededValues("form", body); string(got.body) != want {
+			t.Errorf("%s: outbound body is not the platform body plus the card values (len %d, want %d)", name, len(got.body), len(want))
 		}
-	default:
-		var e struct {
-			Error struct {
-				Message string `json:"message"`
-			} `json:"error"`
+		return rec
+	}
+	// refused sends one platform request that the vault must refuse with status/msg before any
+	// request reaches stripe-mock.
+	refused := func(name, tok, path, body string, status int, msg string) {
+		t.Helper()
+		before := hits()
+		rec := serveInternal(v, stripeProxyRequest(tok, path, nil, body))
+		if rec.Code != status || rec.Body.String() != wantErrBody(msg) {
+			t.Errorf("%s: status %d, want %d %q", name, rec.Code, status, msg)
 		}
-		_ = json.Unmarshal(rec.Body.Bytes(), &e)
-		msg, _ := maskPAN([]byte(e.Error.Message), testPAN)
-		t.Logf("FINDING (create_payment_method with customer): stripe-mock rejected it: status %d, message %q",
-			rec.Code, strings.ReplaceAll(string(msg), secret, "<redacted>"))
+		if n := hits() - before; n != 0 {
+			t.Errorf("%s: %d requests reached stripe-mock, want 0", name, n)
+		}
 	}
+	ok := func(name string, rec *httptest.ResponseRecorder, id *regexp.Regexp) {
+		t.Helper()
+		if rec.Code != http.StatusOK || !id.Match(rec.Body.Bytes()) {
+			t.Errorf("%s: status %d, body len %d (PAN masked, name redacted): %s", name, rec.Code, rec.Body.Len(), stripeShow(rec.Body.Bytes(), secret))
+		}
+	}
+	pmID := regexp.MustCompile(`"id":\s*"pm_`)
+	tokID := regexp.MustCompile(`"id":\s*"tok_`)
 
-	// 3. create_token, CVV present.
-	tok3 := seedCard(t, v, s, testCVV)
-	rec, _ = call("create_token", "create_token", tok3, nil, "/v1/tokens", true)
-	if rec.Code != http.StatusOK || !tokID.Match(rec.Body.Bytes()) {
-		t.Errorf("create_token: status %d, body len %d (PAN masked): %s", rec.Code, rec.Body.Len(), show(rec.Body.Bytes()))
-	}
+	// 1. payment_methods with {{cvv}} and the platform's Idempotency-Key.
+	tokA := seedCardNamed(t, v, s, testCVV, testName)
+	ok("payment_methods", call("payment_methods", tokA, "/v1/payment_methods", embeddedPMBody,
+		map[string]string{"Idempotency-Key": "smock-pm-1"}), pmID)
 
-	// 4. create_payment_method on tok1 again: its CVV was consumed by case 1, so no card[cvc].
-	rec, _ = call("create_payment_method (CVV consumed)", "create_payment_method", tok1, nil, "/v1/payment_methods", false)
-	if rec.Code != http.StatusOK || !pmID.Match(rec.Body.Bytes()) {
-		t.Errorf("create_payment_method (CVV consumed): status %d, body len %d (PAN masked): %s", rec.Code, rec.Body.Len(), show(rec.Body.Bytes()))
-	}
+	// 2. The CVV of tokA was used: {{cvv}} again is 409 with nothing sent; the platform resends
+	// without card[cvc].
+	refused("payment_methods (CVV used)", tokA, "/v1/payment_methods", embeddedPMBody, http.StatusConflict, msgCVVUnavailable)
+	ok("payment_methods without cvv", call("payment_methods without cvv", tokA, "/v1/payment_methods", embeddedPMNoCVV, nil), pmID)
+
+	// 3. tokens with {{cvv}}.
+	tokB := seedCardNamed(t, v, s, testCVV, testName)
+	ok("tokens", call("tokens", tokB, "/v1/tokens", embeddedTokensBody, nil), tokID)
+
+	// 4. Card-saving fields are refused before the relay, and the refusal leaves the CVV cached.
+	tokC := seedCardNamed(t, v, s, testCVV, testName)
+	refused("payment_methods + setup_future_usage", tokC, "/v1/payment_methods",
+		embeddedPMBody+"&setup_future_usage=off_session", http.StatusBadRequest, msgForbiddenField)
+	refused("payment_methods + customer", tokC, "/v1/payment_methods",
+		embeddedPMBody+"&customer=cus_123", http.StatusBadRequest, msgForbiddenField)
+	refused("payment_intents (not in the catalog)", tokC, "/v1/payment_intents",
+		"amount=1000&currency=usd&confirm=true&payment_method_data[type]=card&payment_method_data[card][number]={{pan}}",
+		http.StatusBadRequest, msgEndpointNotAllowed)
+	ok("payment_methods after refusals", call("payment_methods after refusals", tokC, "/v1/payment_methods", embeddedPMBody, nil), pmID)
 }

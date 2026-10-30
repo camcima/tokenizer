@@ -4,25 +4,25 @@
       "format": "form",
       "endpoints": [
         {
-          "id": "payment_intents",
+          "id": "payment_methods",
           "method": "POST",
-          "path": "/v1/payment_intents",
+          "path": "/v1/payment_methods",
           "card_data": true,
           "headers": {
             "Authorization": "Bearer {{secret:secretKey}}"
           },
           "positions": {
-            "payment_method_data[card][number]": "{{pan}}",
-            "payment_method_data[card][exp_month]": "{{exp_month}}",
-            "payment_method_data[card][exp_year]": "{{exp_year}}",
-            "payment_method_data[card][cvc]": "{{cvv}}",
-            "payment_method_data[billing_details][name]": "{{name}}"
+            "card[number]": "{{pan}}",
+            "card[exp_month]": "{{exp_month}}",
+            "card[exp_year]": "{{exp_year}}",
+            "card[cvc]": "{{cvv}}",
+            "billing_details[name]": "{{name}}"
           },
           "forbid": {
-            "setup_future_usage": [],
             "customer": [],
-            "save_payment_method": [],
-            "payment_method_options[card][setup_future_usage]": []
+            "payment_method": [],
+            "allow_redisplay": [],
+            "setup_future_usage": []
           }
         },
         {
