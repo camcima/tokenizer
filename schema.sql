@@ -46,6 +46,9 @@ DECLARE
   global_recent int;
   token_recent  int;
 BEGIN
+  -- Serialize lookups so concurrent calls cannot all pass the count before any inserts (TOCTOU).
+  PERFORM pg_advisory_xact_lock(hashtext('vault.get_card'));
+
   SELECT count(*) INTO global_recent FROM access_log
    WHERE op = 'get' AND at > now() - interval '1 minute';
   IF global_recent >= 300 THEN

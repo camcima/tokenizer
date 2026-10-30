@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -2564,5 +2565,251 @@ func TestHealthz(t *testing.T) {
 	}
 	if out := testLog.since(start); strings.Contains(out, marker) || !strings.Contains(out, " path=/healthz status=503 ") {
 		t.Fatalf("unhealthy log unexpected (len %d)", len(out))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Integration tests (SPEC §13.2). Gated on VAULT_TEST_DB_URL; run with `make itest`.
+// Tests may name tables (they check privileges and count audit rows as the owner); main.go never does.
+// ---------------------------------------------------------------------------
+
+// integrationDB connects to the test database. role "" connects as the URL's user (vault_owner);
+// otherwise the URL's user is replaced with role (the test server uses trust auth).
+func integrationDB(t *testing.T, role string) *sql.DB {
+	t.Helper()
+	raw := os.Getenv("VAULT_TEST_DB_URL")
+	if raw == "" {
+		t.Skip("VAULT_TEST_DB_URL not set")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal("VAULT_TEST_DB_URL does not parse")
+	}
+	if role != "" {
+		u.User = url.User(role)
+	}
+	db, err := sql.Open("pgx", u.String())
+	if err != nil {
+		t.Fatalf("open as %q: %v", role, err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+func wantPermissionDenied(t *testing.T, what string, err error) {
+	t.Helper()
+	if err == nil || !strings.Contains(err.Error(), "permission denied") {
+		t.Errorf("%s: err = %v, want permission denied", what, err)
+	}
+}
+
+func TestIntegrationPrivileges(t *testing.T) {
+	ctx := context.Background()
+	app := integrationDB(t, "vault_app")
+
+	_, err := app.ExecContext(ctx, "SELECT * FROM vault.cards")
+	wantPermissionDenied(t, "app SELECT cards", err)
+	_, err = app.ExecContext(ctx, `INSERT INTO vault.cards VALUES ($1, '\x01', '4242', 1)`, newToken())
+	wantPermissionDenied(t, "app INSERT cards", err)
+	_, err = app.ExecContext(ctx, `SELECT vault.add_dek('\x00')`)
+	wantPermissionDenied(t, "app add_dek", err)
+	_, err = app.ExecContext(ctx, "SELECT * FROM vault.access_log")
+	wantPermissionDenied(t, "app SELECT access_log", err)
+	_, err = app.ExecContext(ctx, "SELECT * FROM vault.deks")
+	wantPermissionDenied(t, "app SELECT deks", err)
+
+	tok := newToken()
+	if err := dbPutCard(ctx, app, tok, []byte{1, 2, 3}, "4242", 1); err != nil {
+		t.Fatalf("app put_card: %v", err)
+	}
+	ct, kv, err := dbGetCard(ctx, app, tok, "0A1B2C")
+	if err != nil || !bytes.Equal(ct, []byte{1, 2, 3}) || kv != 1 {
+		t.Fatalf("app get_card: ct=%x kv=%d err=%v", ct, kv, err)
+	}
+	if _, _, err := dbGetCard(ctx, app, newToken(), "0A1B2C"); !errors.Is(err, errUnknownToken) {
+		t.Errorf("app get_card unseeded: err = %v, want errUnknownToken", err)
+	}
+	if _, err := dbListDEKs(ctx, app); err != nil {
+		t.Errorf("app list_deks: %v", err)
+	}
+
+	rot := integrationDB(t, "vault_rotator")
+	// 32 bytes: Task 9's fake KMS reverses bytes and loadDEKs requires a 32-byte DEK for every row.
+	wrapped := bytes.Repeat([]byte{0x07}, 32)
+	v, err := dbAddDEK(ctx, rot, wrapped)
+	if err != nil || v <= 0 {
+		t.Fatalf("rotator add_dek: v=%d err=%v", v, err)
+	}
+	// 42501 = insufficient_privilege.
+	if err := dbPutCard(ctx, rot, newToken(), []byte{1}, "4242", 1); err == nil || !strings.Contains(err.Error(), "42501") {
+		t.Errorf("rotator put_card: err = %v, want sqlstate 42501", err)
+	}
+	if _, _, err := dbGetCard(ctx, rot, tok, "0A1B2C"); err == nil || !strings.Contains(err.Error(), "42501") {
+		t.Errorf("rotator get_card: err = %v, want sqlstate 42501", err)
+	}
+	_, err = rot.ExecContext(ctx, "SELECT * FROM vault.deks")
+	wantPermissionDenied(t, "rotator SELECT deks", err)
+	deks, err := dbListDEKs(ctx, rot)
+	if err != nil {
+		t.Fatalf("rotator list_deks: %v", err)
+	}
+	if !bytes.Equal(deks[v], wrapped) {
+		t.Errorf("list_deks[%d] = %x, want the wrapped value just added", v, deks[v])
+	}
+}
+
+func countRows(t *testing.T, db *sql.DB, query string, args ...any) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRowContext(context.Background(), query, args...).Scan(&n); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	return n
+}
+
+func TestIntegrationAccessLogCount(t *testing.T) {
+	ctx := context.Background()
+	owner := integrationDB(t, "")
+	app := integrationDB(t, "vault_app")
+
+	n0 := countRows(t, owner, "SELECT count(*) FROM vault.access_log")
+	var toks []string
+	for range 3 {
+		tok := newToken()
+		toks = append(toks, tok)
+		if err := dbPutCard(ctx, app, tok, []byte{9}, "1111", 1); err != nil {
+			t.Fatalf("put_card: %v", err)
+		}
+	}
+	for _, tok := range toks[:2] {
+		if _, _, err := dbGetCard(ctx, app, tok, "0A"); err != nil {
+			t.Fatalf("get_card: %v", err)
+		}
+	}
+	if n := countRows(t, owner, "SELECT count(*) FROM vault.access_log"); n != n0+5 {
+		t.Errorf("access_log rows = %d, want %d", n, n0+5)
+	}
+	if n := countRows(t, owner, "SELECT count(*) FROM vault.access_log WHERE token = ANY($1) AND op = 'put' AND caller IS NULL", toks); n != 3 {
+		t.Errorf("put rows = %d, want 3", n)
+	}
+	if n := countRows(t, owner, "SELECT count(*) FROM vault.access_log WHERE token = ANY($1) AND op = 'get' AND caller = '0A'", toks); n != 2 {
+		t.Errorf("get rows = %d, want 2", n)
+	}
+}
+
+func TestIntegrationSearchPathPinned(t *testing.T) {
+	owner := integrationDB(t, "")
+	rows, err := owner.QueryContext(context.Background(), `
+		SELECT p.proname, coalesce(array_to_string(p.proconfig, E'\n'), '')
+		  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+		 WHERE n.nspname = 'vault'`)
+	if err != nil {
+		t.Fatalf("query pg_proc: %v", err)
+	}
+	defer rows.Close()
+	got := map[string]bool{}
+	for rows.Next() {
+		var name, config string
+		if err := rows.Scan(&name, &config); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got[name] = true
+		if !slices.Contains(strings.Split(config, "\n"), "search_path=vault, pg_temp") {
+			t.Errorf("%s proconfig = %q, want search_path=vault, pg_temp", name, config)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	want := map[string]bool{"put_card": true, "get_card": true, "list_deks": true, "add_dek": true}
+	if !maps.Equal(got, want) {
+		t.Errorf("vault functions = %v, want %v", slices.Sorted(maps.Keys(got)), slices.Sorted(maps.Keys(want)))
+	}
+}
+
+func TestIntegrationVelocityPerToken(t *testing.T) {
+	ctx := context.Background()
+	app := integrationDB(t, "vault_app")
+	tok := newToken()
+	if err := dbPutCard(ctx, app, tok, []byte{5}, "4242", 1); err != nil {
+		t.Fatalf("put_card: %v", err)
+	}
+	for i := range 20 {
+		if _, _, err := dbGetCard(ctx, app, tok, "0A"); err != nil {
+			t.Fatalf("get %d: %v", i+1, err)
+		}
+	}
+	if _, _, err := dbGetCard(ctx, app, tok, "0A"); !errors.Is(err, errVelocity) {
+		t.Errorf("get 21: err = %v, want errVelocity", err)
+	}
+}
+
+func TestIntegrationVelocityConcurrent(t *testing.T) {
+	ctx := context.Background()
+	owner := integrationDB(t, "")
+	app := integrationDB(t, "vault_app")
+	app.SetMaxOpenConns(64)
+	tok := newToken()
+	if err := dbPutCard(ctx, app, tok, []byte{6}, "4242", 1); err != nil {
+		t.Fatalf("put_card: %v", err)
+	}
+
+	const calls = 50
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var ok, velocity, other atomic.Int32
+	for range calls {
+		wg.Go(func() {
+			<-start
+			_, _, err := dbGetCard(ctx, app, tok, "0A")
+			switch {
+			case err == nil:
+				ok.Add(1)
+			case errors.Is(err, errVelocity):
+				velocity.Add(1)
+			default:
+				other.Add(1)
+				t.Errorf("concurrent get: %v", err)
+			}
+		})
+	}
+	close(start)
+	wg.Wait()
+	if ok.Load() != 20 || velocity.Load() != calls-20 || other.Load() != 0 {
+		t.Errorf("concurrent gets: %d ok, %d velocity, %d other; want 20, %d, 0", ok.Load(), velocity.Load(), other.Load(), calls-20)
+	}
+	if n := countRows(t, owner, "SELECT count(*) FROM vault.access_log WHERE token = $1 AND op = 'get'", tok); n != 20 {
+		t.Errorf("get rows for token = %d, want 20", n)
+	}
+}
+
+func TestIntegrationVelocityGlobal(t *testing.T) {
+	ctx := context.Background()
+	owner := integrationDB(t, "")
+	app := integrationDB(t, "vault_app")
+
+	var used []string
+	t.Cleanup(func() {
+		// Test DB only: remove this test's lookups so later tests in the same minute aren't throttled.
+		if _, err := owner.ExecContext(context.Background(), "DELETE FROM vault.access_log WHERE token = ANY($1)", used); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
+
+	n := countRows(t, owner, "SELECT count(*) FROM vault.access_log WHERE op = 'get' AND at > now() - interval '1 minute'")
+	if n >= 300 {
+		t.Fatalf("%d recent gets already; cannot run", n)
+	}
+	for i := range 300 - n {
+		tok := newToken()
+		used = append(used, tok)
+		if _, _, err := dbGetCard(ctx, app, tok, "0A"); err != nil && !errors.Is(err, errUnknownToken) {
+			t.Fatalf("get %d of %d: %v", i+1, 300-n, err)
+		}
+	}
+	tok := newToken()
+	used = append(used, tok)
+	if _, _, err := dbGetCard(ctx, app, tok, "0A"); !errors.Is(err, errVelocity) {
+		t.Errorf("get past the global limit: err = %v, want errVelocity", err)
 	}
 }
