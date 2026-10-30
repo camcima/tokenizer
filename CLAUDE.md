@@ -5,6 +5,10 @@ You are implementing spec/original.md. Read it fully before writing code. These 
 ## Version overrides
 - Go 1.27.3 (not 1.23) and PostgreSQL 18 (not 16). These supersede the spec.
 
+## Known limitations (v1)
+- **Serialized lookups.** `vault.get_card` takes `pg_advisory_xact_lock` before it counts, so the velocity check and the `access_log` insert cannot race (no velocity TOCTOU). As a result, lookups run one at a time across all sessions. The vault also caps its pool at 16 open connections per instance (`db.SetMaxOpenConns(16)`), and each request's database call has a 5s deadline.
+- **Rollback bypass of the audit row (accepted 2026-10-30).** `access_log` rows are written inside the caller's transaction. A holder of the `vault_app` DB role can call `get_card` in an explicit transaction and roll it back. The ciphertext is still returned, but the audit row and its velocity count disappear, so that role holder bypasses the velocity limits. pgaudit (`pgaudit.log='function'`) still logs every call, whether or not it is rolled back. The vault itself only makes single-statement autocommit calls, so it cannot trigger this. The fix, an autonomous write (`dblink`), is planned for v1.1. Do not edit `schema.sql` for this: it must stay byte-identical to spec §7.
+
 ## Structure
 - ALL application code goes in `main.go`. Do not create packages, subdirectories, or additional .go files other than `main_test.go`.
 - Do not introduce interfaces, generics, or abstractions to "clean up" the file. Repetition is acceptable; indirection is not.
