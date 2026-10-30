@@ -1,5 +1,7 @@
 # PAN Vault
 
+*[Leer en español](README.es.md) · [Ler em português](README.pt-BR.md)*
+
 A small, single-purpose service that keeps credit card numbers out of the rest of our payment platform.
 
 The browser hands the card to the vault. The vault locks it away and gives back a meaningless **token**. From then on the platform only ever handles tokens. When a payment provider such as Stripe needs the real card, the platform writes the provider request with blanks where the card goes, and asks the vault to fill them in and make the call. The vault checks every request against a reviewed list of what is allowed, and the card number never passes through the platform at all.
