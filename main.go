@@ -266,12 +266,8 @@ const (
 	msgInvalidName        = "invalid name"
 	msgUnauthorized       = "unauthorized"
 	msgOrigin             = "origin not allowed"
-	msgUnknownProvider    = "unknown provider"
-	msgUnknownOp          = "unknown op"
 	msgInvalidToken       = "invalid token"
 	msgUnknownToken       = "unknown token"
-	msgInvalidParams      = "invalid params"
-	msgInvalidIdempotency = "invalid idempotency key"
 	msgVelocity           = "rate limit exceeded"
 	msgInternal           = "internal error"
 	msgProvider           = "provider unreachable"
@@ -301,14 +297,15 @@ type vault struct {
 	cvv         *cvvCache
 	now         func() time.Time
 	log         *log.Logger
-	providers   map[string]provider // the catalog (§6.3); see newProviders
-	client      *http.Client        // the single shared outbound client (§9.2)
+	catalog     *catalog     // the compiled-in catalog.json, this environment's accounts (D§5.1)
+	client      *http.Client // the single shared outbound client (§9.2)
 
 	lastSessionAlert atomic.Int64 // unix second of last session_token_invalid alert
+	lastPolicyAlert  atomic.Int64 // unix second of last proxy_policy alert
 }
 
 // logf writes one line: "<RFC3339 UTC timestamp> " + message. Callers pass only fixed format
-// strings and non-sensitive values (tokens, serials, provider/op names, statuses).
+// strings and non-sensitive values (tokens, serials, catalog account and endpoint names, statuses).
 func (v *vault) logf(format string, args ...any) {
 	v.log.Print(v.now().UTC().Format(time.RFC3339) + " " + fmt.Sprintf(format, args...))
 }
@@ -491,6 +488,22 @@ func (v *vault) alertSession(reason string) {
 		return
 	}
 	v.logf("ALERT session_token_invalid reason=%s", reason)
+}
+
+// alertPolicy logs "ALERT proxy_policy account=<a> endpoint=<id|-> reason=<r>" at most once per
+// second (D§5.11), on its own limiter so that a flood of policy violations cannot hide a session
+// alert or the other way round. account and endpoint are catalog names ("" endpoint → "-") and
+// reason a fixed checkProxy reason; the offending request value is never logged.
+func (v *vault) alertPolicy(account, endpoint, reason string) {
+	sec := v.now().Unix()
+	old := v.lastPolicyAlert.Load()
+	if old == sec || !v.lastPolicyAlert.CompareAndSwap(old, sec) {
+		return
+	}
+	if endpoint == "" {
+		endpoint = "-"
+	}
+	v.logf("ALERT proxy_policy account=%s endpoint=%s reason=%s", account, endpoint, reason)
 }
 
 // ---------------------------------------------------------------------------
@@ -781,121 +794,15 @@ func (v *vault) handleTokenize(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
-// Provider catalog, egress invariant, PAN masking, outbound client (SPEC §6.3, §6.4, §9)
+// Provider responses: PAN masking, outbound client (SPEC §6.4, §9)
 // ---------------------------------------------------------------------------
-
-// opBuilder constructs the ENTIRE provider request for one op: path, content type and body.
-// The PAN, expiry and CVV appear only where the builder puts them; nothing from the caller but
-// declared param values ever reaches the body (§6.3).
-type opBuilder func(params map[string]string, c card, cvv string) (path string, contentType string, body []byte, err error)
-
-type provider struct {
-	base   *url.URL                             // e.g. https://api.stripe.com
-	secret string                               // loaded at boot; never from a request
-	auth   func(r *http.Request, secret string) // how to attach the credential
-	ops    map[string]op
-}
-
-type op struct {
-	params map[string]bool // allowed param keys
-	build  opBuilder
-}
 
 const (
 	maxProviderResponse = 4 << 20 // §6.4 step 9: provider response body limit
 	formContentType     = "application/x-www-form-urlencoded"
 )
 
-var (
-	errBuild  = errors.New("invalid params")
-	errEgress = errors.New("egress invariant")
-)
-
-// newProviders returns the provider catalog (§6.3 v1). It is being replaced by catalog.json (see
-// parseCatalog), whose account hosts egress-hosts.<env>.txt must list (TestEgressHostsMatchCatalog).
-func newProviders(stripeSecret string) map[string]provider {
-	return map[string]provider{
-		"stripe": {
-			base:   &url.URL{Scheme: "https", Host: "api.stripe.com"},
-			secret: stripeSecret,
-			auth:   stripeAuth,
-			ops: map[string]op{
-				"create_payment_method": {params: map[string]bool{"customer": true}, build: stripeCreatePaymentMethod},
-				"create_token":          {params: map[string]bool{}, build: stripeCreateToken},
-			},
-		},
-	}
-}
-
-// stripeAuth attaches "Authorization: Bearer <secret>", replacing any value already present.
-func stripeAuth(r *http.Request, secret string) {
-	r.Header.Set("Authorization", "Bearer "+secret)
-}
-
-// stripeCard returns the card fields shared by both Stripe ops: card[number], card[exp_month],
-// card[exp_year], and card[cvc] only if a CVV is available.
-func stripeCard(c card, cvv string) url.Values {
-	v := url.Values{
-		"card[number]":    {c.PAN},
-		"card[exp_month]": {c.ExpMonth},
-		"card[exp_year]":  {c.ExpYear},
-	}
-	if cvv != "" {
-		v.Set("card[cvc]", cvv)
-	}
-	return v
-}
-
-// stripeCreatePaymentMethod builds POST /v1/payment_methods (§6.3): type=card, the card fields,
-// and customer if given.
-// SPEC-DECISION: the builder re-checks its params even though the handler already enforced
-// op.params: any undeclared key, or a customer that is present but empty, is an error rather
-// than being dropped or sent.
-func stripeCreatePaymentMethod(params map[string]string, c card, cvv string) (string, string, []byte, error) {
-	for k := range params {
-		if k != "customer" {
-			return "", "", nil, errBuild
-		}
-	}
-	v := stripeCard(c, cvv)
-	v.Set("type", "card")
-	if cus, ok := params["customer"]; ok {
-		if cus == "" {
-			return "", "", nil, errBuild
-		}
-		v.Set("customer", cus)
-	}
-	return "/v1/payment_methods", formContentType, []byte(v.Encode()), nil
-}
-
-// stripeCreateToken builds POST /v1/tokens (§6.3): the card fields only. It takes no params.
-func stripeCreateToken(params map[string]string, c card, cvv string) (string, string, []byte, error) {
-	if len(params) != 0 {
-		return "", "", nil, errBuild
-	}
-	return "/v1/tokens", formContentType, []byte(stripeCard(c, cvv).Encode()), nil
-}
-
-// providerURL is the egress invariant (§6.4 step 6): it builds https://<base.Host><path> and
-// returns errEgress unless the scheme is https and the host is exactly base.Host, both on the
-// constructed URL and on a reparse of its string form (what the transport actually dials).
-// SPEC-DECISION: also refused: a path not starting with "/", a base that is not https with a
-// host, and a reparse that gains userinfo, a query or a fragment or changes the path.
-func providerURL(base *url.URL, path string) (*url.URL, error) {
-	if base == nil || base.Scheme != "https" || base.Host == "" || !strings.HasPrefix(path, "/") {
-		return nil, errEgress
-	}
-	u := &url.URL{Scheme: "https", Host: base.Host, Path: path}
-	if u.Scheme != "https" || u.Host != base.Host {
-		return nil, errEgress
-	}
-	re, err := url.Parse(u.String())
-	if err != nil || re.Scheme != "https" || re.Host != base.Host || re.User != nil ||
-		re.RawQuery != "" || re.ForceQuery || re.Fragment != "" || re.Path != path {
-		return nil, errEgress
-	}
-	return u, nil
-}
+var errEgress = errors.New("egress invariant")
 
 // maskPAN replaces every occurrence of pan, and of pan grouped in fours from the left with single
 // spaces ("4242 4242 4242 4242", "3782 8224 6310 005") or single hyphens ("4242-4242-4242-4242"),
@@ -2262,8 +2169,9 @@ func (c *catalog) checkProxy(e *proxyEnvelope) (*proxyPlan, *policyError) {
 	}
 
 	// SPEC-DECISION: in a form body, a forbidden field "addr" also forbids every key starting with
-	// addr+"[" under any case ("customer[]", "customer[x]", "Customer[x]"): many form parsers (Stripe,
-	// Rack, PHP) nest those under the same field, so they would set it while avoiding the exact key.
+	// addr+"[" under any case ("customer[", "customer[]", "customer[x]", "Customer[x]"): many form
+	// parsers (Stripe, Rack, PHP) nest those under the same field, so they would set it while avoiding
+	// the exact key. (validFormKey already refuses "customer[" as malformed; ">=" covers it here too.)
 	for _, addr := range slices.Sorted(maps.Keys(ep.forbid)) {
 		got, found, err := readField(prov.format, body, addr)
 		if err != nil || caseVariant(addr) || (found && !slices.Contains(ep.forbid[addr], got)) {
@@ -2272,7 +2180,7 @@ func (c *catalog) checkProxy(e *proxyEnvelope) (*proxyPlan, *policyError) {
 		if prov.format == "form" {
 			prefix := addr + "["
 			for _, a := range addrs {
-				if len(a) > len(prefix) && strings.EqualFold(a[:len(prefix)], prefix) {
+				if len(a) >= len(prefix) && strings.EqualFold(a[:len(prefix)], prefix) {
 					return fail(msgForbiddenField, "forbidden_field")
 				}
 			}
@@ -2478,11 +2386,13 @@ func signPayU(p *proxyPlan) (string, error) {
 // https://<a.host><a.basePath><path>, where path is the validated request path with its "?query",
 // if any. It returns errEgress unless the scheme is https and the host is exactly a.host, both on the
 // constructed URL and on a reparse of its string form (what the transport actually dials), and the
-// reparse keeps the path and query unchanged and gains no userinfo or fragment. It replaces
-// providerURL.
+// reparse keeps the path and query unchanged and gains no userinfo or fragment.
 // SPEC-DECISION: also refused: an account without a host, or whose base path is neither "" nor
 // "/..." without a trailing "/"; a path not starting with "/"; any byte of path outside printable
-// non-space ASCII, or a "#"; and a "?" with an empty query.
+// non-space ASCII, or a "#"; a "?" with an empty query; and, in the path part (base path included),
+// any "%" or a "." or ".." segment. checkProxy (matchEndpoint) already refuses those request paths;
+// this is defence in depth, so no dot-segment or percent-encoding can reach the transport and be
+// resolved to a different path than the one checked.
 func accountURL(a *catAccount, path string) (*url.URL, error) {
 	if a == nil || a.host == "" || !strings.HasPrefix(path, "/") {
 		return nil, errEgress
@@ -2499,7 +2409,16 @@ func accountURL(a *catAccount, path string) (*url.URL, error) {
 	if hasQuery && q == "" {
 		return nil, errEgress
 	}
-	u := &url.URL{Scheme: "https", Host: a.host, Path: a.basePath + p, RawQuery: q}
+	full := a.basePath + p
+	if strings.Contains(full, "%") {
+		return nil, errEgress
+	}
+	for _, seg := range strings.Split(full, "/") {
+		if seg == "." || seg == ".." {
+			return nil, errEgress
+		}
+	}
+	u := &url.URL{Scheme: "https", Host: a.host, Path: full, RawQuery: q}
 	if u.Scheme != "https" || u.Host != a.host {
 		return nil, errEgress
 	}
@@ -2515,7 +2434,8 @@ func accountURL(a *catAccount, path string) (*url.URL, error) {
 // the CVV ("" if none) (D§5.3-5.7):
 //   - every occurrence span is replaced by its value encoded for the provider's format
 //     (encodeValue), and no other body byte changes; the result is left in p.sent, which the caller
-//     zeroes after the response has been read (best effort, §8.5);
+//     zeroes after the response has been read (best effort, §8.5). A body left in p.sent by an
+//     earlier render of the same plan is zeroed first, so p.sent is nil after a failed render;
 //   - every header template of the endpoint is rendered ({{secret:N}}, {{basic:N}} =
 //     base64(secret + ":"), {{signature}}) and set, whether or not the platform sent it;
 //   - the platform's allowlisted headers (platformHeaders) are copied, and nothing else of its;
@@ -2531,6 +2451,8 @@ func accountURL(a *catAccount, path string) (*url.URL, error) {
 // printable non-space ASCII (validSecretValue, so no header injection); a {{basic:}} in a body; or a
 // signer it does not know.
 func renderRequest(ctx context.Context, p *proxyPlan, c card, cvv string) (*http.Request, error) {
+	zero(p.sent) // best effort: a body from an earlier render of this plan
+	p.sent = nil
 	u, err := accountURL(p.acct, p.path)
 	if err != nil {
 		return nil, err
@@ -2668,21 +2590,16 @@ func renderRequest(ctx context.Context, p *proxyPlan, c card, cvv string) (*http
 // ---------------------------------------------------------------------------
 
 const (
-	maxInternalBody = 64 << 10 // §6.2: 64 KiB request body limit
-	maxParamValue   = 1 << 10  // §6.2: 1 KiB per param value
-	maxIdempotency  = 255      // §6.2: Idempotency-Key length limit
+	maxInternalBody = 64 << 10 // §6.2, D§5.2: 64 KiB request body limit
 	healthzTimeout  = 2 * time.Second
 )
 
-type proxyRequest struct {
-	Provider string            `json:"provider"`
-	Op       string            `json:"op"`
-	Token    string            `json:"token"`
-	Params   map[string]string `json:"params"`
-}
-
-// proxyFields is the exact set of keys a /proxy body may contain.
-var proxyFields = map[string]bool{"provider": true, "op": true, "token": true, "params": true}
+// envelopeFields and envelopeRequestFields are the exact keys of a /proxy envelope and of its
+// "request" object (proxyEnvelope).
+var (
+	envelopeFields        = map[string]bool{"account": true, "token": true, "request": true}
+	envelopeRequestFields = map[string]bool{"method": true, "path": true, "headers": true, "body": true}
+)
 
 // internalHandler is the complete handler for the internal listener: /proxy (POST) and /healthz
 // (GET). Checks run client certificate (401) → path (404) → method (405) → query (400).
@@ -2721,38 +2638,24 @@ func (v *vault) internalHandler() http.Handler {
 	}))
 }
 
-// validParamValue reports whether s is at most 1 KiB of valid UTF-8 without control characters.
-// SPEC-DECISION: an empty value is invalid too. No op gives "" a meaning, and rejecting it here
-// (rather than in the builder, after the single-use CVV has been taken) keeps the CVV intact.
-func validParamValue(s string) bool {
-	if s == "" || len(s) > maxParamValue || !utf8.ValidString(s) {
-		return false
-	}
-	for _, c := range s {
-		if unicode.IsControl(c) {
-			return false
-		}
-	}
-	return true
-}
-
-// validIdempotencyKey reports whether k is 1–255 bytes of printable ASCII (0x20–0x7E).
-func validIdempotencyKey(k string) bool {
-	if k == "" || len(k) > maxIdempotency {
-		return false
-	}
-	for i := 0; i < len(k); i++ {
-		if k[i] < 0x20 || k[i] > 0x7e {
-			return false
-		}
-	}
-	return true
-}
-
-// handleProxy implements POST /proxy (§3.2, §6.4). Routing, method, query and client certificate
-// were checked by internalHandler. The checks run in a fixed order and each failing check returns
-// immediately; error bodies use only the msg* constants. Nothing from the request or the provider
-// response is logged; the only log lines are the ALERTs of §10.1.
+// handleProxy implements POST /proxy (§3.2, D§4, D§5). Routing, method, query and client
+// certificate were checked by internalHandler. The steps run in a fixed order and each failing step
+// returns immediately; error bodies use only the msg* constants:
+//
+//  1. Content-Type application/json, body at most 64 KiB.
+//  2. Strict decode into proxyEnvelope: jsonStrict, one object, no unknown, case-variant or duplicate
+//     keys at the top level or in "request".
+//  3. checkProxy (no network, no database). A policy rejection raises ALERT proxy_policy.
+//  4. get_card (velocity and audit, §6.4 step 3).
+//  5. Decrypt.
+//  6. {{name}} with a card stored without a name: 409.
+//  7. {{cvv}}: the CVV is taken here, after every other check, and none cached is 409.
+//  8. renderRequest (account URL with the egress invariant, substitutions, headers).
+//  9. Send; read at most 4 MiB; refuse a Content-Encoding; mask the PAN.
+//  10. Respond with the provider's status, Content-Type and masked body.
+//
+// Nothing from the request or the provider response is logged; the only log lines are ALERTs with
+// fixed reasons, tokens, serials and catalog names (§10.1, D§5.11).
 func (v *vault) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if !jsonContentType(r.Header) {
 		writeError(w, http.StatusBadRequest, msgContentType)
@@ -2768,72 +2671,58 @@ func (v *vault) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Strict decode: one object, no unknown/case-variant/duplicate top-level keys, no duplicate
-	// params keys, params a string→string map.
-	// SPEC-DECISION: as on /tokenize, encoding/json's case-insensitive key matching and
-	// last-duplicate-wins are closed off, at the top level and inside params: a body that
-	// different JSON parsers would read differently is never acted on.
-	var req proxyRequest
+	// Strict decode.
+	// SPEC-DECISION: as on /tokenize, encoding/json's case-insensitive key matching is closed off:
+	// the top-level keys and the keys of "request" must be spelled exactly ({"Account":…} and
+	// {"Method":…} are unknown fields), and "request" must be an object. jsonStrict already refuses
+	// duplicate keys at any depth (so a repeated header name), invalid UTF-8 and trailing data.
+	if jsonStrict(reqBody) != nil || !exactKeys(reqBody, envelopeFields) {
+		writeError(w, http.StatusBadRequest, msgBadBody)
+		return
+	}
+	var env proxyEnvelope
 	dec := json.NewDecoder(bytes.NewReader(reqBody))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
+	if err := dec.Decode(&env); err != nil {
 		writeError(w, http.StatusBadRequest, msgBadBody)
 		return
 	}
 	var extra json.RawMessage
-	if err := dec.Decode(&extra); err != io.EOF || !exactKeys(reqBody, proxyFields) {
+	if err := dec.Decode(&extra); err != io.EOF {
 		writeError(w, http.StatusBadRequest, msgBadBody)
 		return
 	}
-	var raw struct {
-		Params json.RawMessage `json:"params"`
+	var rawReq struct {
+		Request json.RawMessage `json:"request"`
 	}
-	if err := json.Unmarshal(reqBody, &raw); err != nil ||
-		(len(raw.Params) > 0 && string(raw.Params) != "null" && !exactKeys(raw.Params, nil)) {
+	if err := json.Unmarshal(reqBody, &rawReq); err != nil || !exactKeys(rawReq.Request, envelopeRequestFields) {
 		writeError(w, http.StatusBadRequest, msgBadBody)
 		return
 	}
 
-	p, ok := v.providers[req.Provider]
-	if !ok {
-		writeError(w, http.StatusBadRequest, msgUnknownProvider)
-		return
-	}
-	o, ok := p.ops[req.Op]
-	if !ok {
-		writeError(w, http.StatusBadRequest, msgUnknownOp)
-		return
-	}
-	if !tokenRe.MatchString(req.Token) {
-		writeError(w, http.StatusBadRequest, msgInvalidToken)
-		return
-	}
-	for k, val := range req.Params {
-		if !o.params[k] || !validParamValue(val) {
-			writeError(w, http.StatusBadRequest, msgInvalidParams)
-			return
+	// SPEC-DECISION: the alert names the account as the catalog spells it, never as the request
+	// does. checkProxy only sets a reason once the account is known, so the "-" fallback is defence
+	// in depth.
+	plan, perr := v.catalog.checkProxy(&env)
+	if perr != nil {
+		writeError(w, perr.status, perr.msg)
+		if perr.reason != "" {
+			account := "-"
+			if a := v.catalog.accounts[env.Account]; a != nil {
+				account = a.name
+			}
+			v.alertPolicy(account, perr.endpoint, perr.reason)
 		}
-	}
-	// SPEC-DECISION: more than one Idempotency-Key header is ambiguous and rejected; a single
-	// empty one is treated as absent.
-	idem := ""
-	if vals := r.Header.Values("Idempotency-Key"); len(vals) > 1 {
-		writeError(w, http.StatusBadRequest, msgInvalidIdempotency)
 		return
-	} else if len(vals) == 1 && vals[0] != "" {
-		if !validIdempotencyKey(vals[0]) {
-			writeError(w, http.StatusBadRequest, msgInvalidIdempotency)
-			return
-		}
-		idem = vals[0]
 	}
+	account, endpoint := plan.acct.name, plan.ep.id
 
 	// §6.4 step 3. The caller serial is passed for the database audit trail (§10.2).
 	ctx := r.Context()
-	ciphertext, keyVersion, err := v.getCard(ctx, req.Token, callerSerial(r))
+	ciphertext, keyVersion, err := v.getCard(ctx, env.Token, callerSerial(r))
 	switch {
 	case errors.Is(err, errVelocity):
-		v.logf("ALERT velocity token=%s caller=%s", req.Token, callerSerial(r))
+		v.logf("ALERT velocity token=%s caller=%s account=%s", env.Token, callerSerial(r), account)
 		writeError(w, http.StatusTooManyRequests, msgVelocity)
 		return
 	case errors.Is(err, errUnknownToken):
@@ -2855,41 +2744,40 @@ func (v *vault) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	zero(plaintext) // best effort (§8.5)
 	if err != nil {
-		v.logf("ALERT decrypt_failed token=%s key_version=%d", req.Token, keyVersion)
+		v.logf("ALERT decrypt_failed token=%s key_version=%d account=%s", env.Token, keyVersion, account)
 		writeError(w, http.StatusInternalServerError, msgInternal)
 		return
 	}
 
-	// §6.4 steps 5–6. Absence of a CVV is not an error; the op decides.
-	cvv := v.cvv.take(req.Token)
-	path, contentType, outBody, err := o.build(req.Params, c, cvv)
-	defer zero(outBody) // best effort (§8.5); after the response has been read
-	if err != nil {
-		writeError(w, http.StatusBadRequest, msgInvalidParams)
+	// D§5.8, D§5.9. The name is checked first so that a name-unavailable request leaves the
+	// single-use CVV cached; the CVV is taken last, once nothing but rendering and sending is left.
+	// The vault never edits the body to drop a field: the platform resends without it.
+	if plan.usesName && c.Name == "" {
+		writeError(w, http.StatusConflict, msgNameUnavailable)
 		return
 	}
-	u, err := providerURL(p.base, path)
-	if err != nil {
-		v.logf("ALERT egress_invariant provider=%s", req.Provider)
-		writeError(w, http.StatusInternalServerError, msgInternal)
-		return
+	cvv := ""
+	if plan.usesCVV {
+		if cvv = v.cvv.take(env.Token); cvv == "" {
+			writeError(w, http.StatusConflict, msgCVVUnavailable)
+			return
+		}
 	}
 
-	// §6.4 step 7. A fresh header set: no inbound header but Idempotency-Key reaches the
-	// provider, and the credential comes only from the catalog (§9.3).
-	// Accept-Encoding is deliberately not set: the transport then requests gzip itself and
-	// decompresses transparently, so maskPAN always sees plain bytes.
-	out, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(outBody))
+	// §6.4 steps 5–7. renderRequest builds the whole outgoing request: account URL (egress
+	// invariant), substituted body, the endpoint's credential headers, the allowlisted platform
+	// headers, Content-Type and User-Agent. No inbound HTTP header of this request is used.
+	// SPEC-DECISION: a render failure after the CVV was taken loses the CVV (single use, never put
+	// back); it can only follow a catalog or boot defect, never platform input.
+	out, err := renderRequest(ctx, plan, c, cvv)
 	if err != nil {
+		if errors.Is(err, errEgress) {
+			v.logf("ALERT egress_invariant account=%s", account)
+		}
 		writeError(w, http.StatusInternalServerError, msgInternal)
 		return
 	}
-	out.Header.Set("Content-Type", contentType)
-	p.auth(out, p.secret)
-	if idem != "" {
-		out.Header.Set("Idempotency-Key", idem)
-	}
-	out.Header.Set("User-Agent", "pan-vault/1")
+	defer zero(plan.sent) // best effort (§8.5); after the response has been read
 
 	// §6.4 steps 8–9. Transport errors are never logged or returned (they name hosts and causes).
 	resp, err := v.client.Do(out)
@@ -2915,7 +2803,7 @@ func (v *vault) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	masked, found := maskPAN(respBody, c.PAN)
 	if found {
-		v.logf("ALERT pan_echo provider=%s op=%s token=%s", req.Provider, req.Op, req.Token)
+		v.logf("ALERT pan_echo account=%s endpoint=%s token=%s", account, endpoint, env.Token)
 	}
 
 	// §6.4 step 10: status, Content-Type and the scrubbed body; no other provider header.
@@ -3634,7 +3522,7 @@ const dbCallTimeout = 5 * time.Second
 // newVault wires the vault to the database and the loaded key material. Each putCard/getCard
 // call runs under dbCallTimeout, derived from the request context (an earlier request deadline
 // or a client disconnect still wins).
-func newVault(cfg config, db *sql.DB, deks map[int][]byte, current int, hmacKey []byte, stripeSecret string, client *http.Client, logger *log.Logger) *vault {
+func newVault(cfg config, db *sql.DB, deks map[int][]byte, current int, hmacKey []byte, cat *catalog, client *http.Client, logger *log.Logger) *vault {
 	return &vault{
 		putCard: func(ctx context.Context, token string, ciphertext []byte, last4 string, keyVersion int) error {
 			ctx, cancel := context.WithTimeout(ctx, dbCallTimeout)
@@ -3654,7 +3542,7 @@ func newVault(cfg config, db *sql.DB, deks map[int][]byte, current int, hmacKey 
 		cvv:         newCVVCache(15*time.Minute, time.Now),
 		now:         time.Now,
 		log:         logger,
-		providers:   newProviders(stripeSecret),
+		catalog:     cat,
 		client:      client,
 	}
 }
@@ -3782,14 +3670,20 @@ func main() {
 
 	// 4. Load secrets.
 	ctx, cancel = context.WithTimeout(context.Background(), bootGCPTimeout)
-	hmacKey, stripeSecret, err := loadSecrets(ctx, cfg, client, ts)
+	hmacKey, _, err := loadSecrets(ctx, cfg, client, ts)
 	cancel()
 	if err != nil {
 		fail(err.Error())
 	}
 
-	// 5. Build the vault (and with it the provider catalog).
-	v := newVault(cfg, db, deks, current, hmacKey, stripeSecret, client, logger)
+	// 5. Parse the compiled-in catalog for this environment and build the vault.
+	// Interim (Task 6): account secrets are not loaded yet, so a request that needs one fails closed
+	// in renderRequest (500). Task 7 moves this parse right after loadConfig and loads the secrets.
+	cat, err := parseCatalog(catalogJSON, cfg.env)
+	if err != nil {
+		fail(err.Error())
+	}
+	v := newVault(cfg, db, deks, current, hmacKey, cat, client, logger)
 
 	// 6. Start both listeners (certificate and client CA were loaded in step 1b).
 	// SPEC-DECISION: each socket is bound with net.Listen before serving (ServeTLS("", "") is what
