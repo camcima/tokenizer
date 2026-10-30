@@ -24,6 +24,7 @@ import (
 	"log"
 	"maps"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -2584,6 +2585,18 @@ func TestHealthz(t *testing.T) {
 // otherwise the URL's user is replaced with role (the test server uses trust auth).
 func integrationDB(t *testing.T, role string) *sql.DB {
 	t.Helper()
+	db, err := sql.Open("pgx", integrationURL(t, role))
+	if err != nil {
+		t.Fatalf("open as %q: %v", role, err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+// integrationURL returns VAULT_TEST_DB_URL, with the user replaced by role unless role is "", or
+// skips the test when it is not set.
+func integrationURL(t *testing.T, role string) string {
+	t.Helper()
 	raw := os.Getenv("VAULT_TEST_DB_URL")
 	if raw == "" {
 		t.Skip("VAULT_TEST_DB_URL not set")
@@ -2595,12 +2608,7 @@ func integrationDB(t *testing.T, role string) *sql.DB {
 	if role != "" {
 		u.User = url.User(role)
 	}
-	db, err := sql.Open("pgx", u.String())
-	if err != nil {
-		t.Fatalf("open as %q: %v", role, err)
-	}
-	t.Cleanup(func() { db.Close() })
-	return db
+	return u.String()
 }
 
 func wantPermissionDenied(t *testing.T, what string, err error) {
@@ -3555,5 +3563,384 @@ func TestNewServersConfig(t *testing.T) {
 	internal.Handler.ServeHTTP(rec, withClientCert(httptest.NewRequest(http.MethodGet, "/healthz", nil)))
 	if rec.Code != http.StatusOK {
 		t.Errorf("internal /healthz status %d, want 200", rec.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end acceptance (SPEC §15): real listeners and TLS, real database, DEK rotation, and the
+// opt-in live Stripe check. These tests replace package-level base URLs and must not call t.Parallel.
+// ---------------------------------------------------------------------------
+
+// testPKI returns a test CA (ECDSA P-256) with a pool holding it, a server certificate for
+// 127.0.0.1 and a client certificate with serial 0x0A1B2C, both issued by the CA.
+func testPKI(t *testing.T) (ca *x509.Certificate, caPool *x509.CertPool, server tls.Certificate, client tls.Certificate) {
+	t.Helper()
+	newKey := func() *ecdsa.PrivateKey {
+		k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	notBefore, notAfter := time.Now().Add(-time.Hour), time.Now().Add(time.Hour)
+	caKey := newKey()
+	caTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "pan-vault test CA"},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ca, err = x509.ParseCertificate(der); err != nil {
+		t.Fatal(err)
+	}
+	caPool = x509.NewCertPool()
+	caPool.AddCert(ca)
+
+	issue := func(tmpl *x509.Certificate) tls.Certificate {
+		key := newKey()
+		tmpl.NotBefore, tmpl.NotAfter = notBefore, notAfter
+		tmpl.KeyUsage = x509.KeyUsageDigitalSignature
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, &key.PublicKey, caKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leaf, err := x509.ParseCertificate(der)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}
+	}
+	server = issue(&x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "127.0.0.1"},
+		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1)},
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	})
+	client = issue(&x509.Certificate{
+		SerialNumber: big.NewInt(0x0A1B2C),
+		Subject:      pkix.Name{CommonName: "platform"},
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	})
+	return ca, caPool, server, client
+}
+
+// tlsClient returns an HTTPS client that trusts roots and presents certs (none = no client cert).
+func tlsClient(t *testing.T, roots *x509.CertPool, certs ...tls.Certificate) *http.Client {
+	t.Helper()
+	tr := &http.Transport{
+		Proxy:           nil,
+		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: roots, Certificates: certs},
+	}
+	t.Cleanup(tr.CloseIdleConnections)
+	return &http.Client{Transport: tr, Timeout: 15 * time.Second}
+}
+
+// roundTrip sends a request and returns status, headers and body; a transport error fails the test.
+// header holds the request headers to set.
+func roundTrip(t *testing.T, c *http.Client, method, target, body string, header map[string]string) (int, http.Header, []byte) {
+	t.Helper()
+	var rd io.Reader
+	if body != "" {
+		rd = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, target, rd)
+	if err != nil {
+		t.Fatal("building request failed")
+	}
+	for k, val := range header {
+		req.Header.Set(k, val)
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: transport error", method, req.URL.Path)
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("%s %s: reading response failed", method, req.URL.Path)
+	}
+	return resp.StatusCode, resp.Header, b
+}
+
+// hasLogLine reports whether one line of logged contains every part.
+func hasLogLine(logged string, parts ...string) bool {
+	for _, line := range strings.Split(logged, "\n") {
+		all := true
+		for _, p := range parts {
+			all = all && strings.Contains(line, p)
+		}
+		if all {
+			return true
+		}
+	}
+	return false
+}
+
+// TestIntegrationEndToEnd boots the vault the way main does (dev config, real database as
+// vault_app, DEK v1) behind both real TLS listeners, with the fake TLS provider standing in for
+// Stripe, and walks the §15 flow: browser preflight + tokenize, platform proxy with a forged
+// Authorization header, healthz, and the mTLS refusal of a client without a certificate.
+func TestIntegrationEndToEnd(t *testing.T) {
+	ctx := context.Background()
+	cfg := config{
+		env:          "dev",
+		publicAddr:   "127.0.0.1:0",
+		internalAddr: "127.0.0.1:0",
+		allowOrigin:  testOrigin,
+		dbURL:        integrationURL(t, "vault_app"),
+		devDEK:       bytes.Repeat([]byte{0x5e}, 32),
+	}
+	db, err := openDB(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("database ping: %v", err)
+	}
+	deks, current, err := loadDEKs(ctx, cfg, db, nil, nil)
+	if err != nil || current != 1 {
+		t.Fatalf("loadDEKs: current=%d err=%v", current, err)
+	}
+
+	fp := newFakeProvider(t, nil)
+	v := newVault(cfg, db, deks, current, testHMACKey, testSecret, newOutboundClient(nil), log.New(&testLog, "", 0))
+	pointStripe(t, v, fp.ts.URL, fp.ts.Certificate())
+
+	_, caPool, serverCert, clientCert := testPKI(t)
+	public, internal := newServers(v, cfg, serverCert, caPool)
+	serve := func(srv *http.Server) string {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		go srv.ServeTLS(ln, "", "")
+		t.Cleanup(func() { srv.Close() })
+		return "https://" + ln.Addr().String()
+	}
+	pubURL, intURL := serve(public), serve(internal)
+	n0 := testLog.Len()
+
+	// Browser at VAULT_ALLOW_ORIGIN: preflight, then tokenize with a valid session token.
+	browser := tlsClient(t, caPool)
+	status, h, _ := roundTrip(t, browser, http.MethodOptions, pubURL+"/tokenize", "", map[string]string{
+		"Origin":                         testOrigin,
+		"Access-Control-Request-Method":  "POST",
+		"Access-Control-Request-Headers": "authorization,content-type",
+	})
+	if status != http.StatusNoContent || h.Get("Access-Control-Allow-Origin") != testOrigin {
+		t.Fatalf("preflight: status %d, want 204 with the allowed origin", status)
+	}
+	status, h, body := roundTrip(t, browser, http.MethodPost, pubURL+"/tokenize", tokBody(nil), map[string]string{
+		"Origin":        testOrigin,
+		"Authorization": "Bearer " + mintSession(testHMACKey, time.Now().Add(10*time.Minute)),
+		"Content-Type":  "application/json",
+	})
+	var tr tokenizeResponse
+	if status != http.StatusOK || json.Unmarshal(body, &tr) != nil {
+		t.Fatalf("tokenize: status %d, want 200 with a JSON body", status)
+	}
+	if !tokenRe.MatchString(tr.Token) || tr.Last4 != "4242" || tr.ExpMonth != "12" || tr.ExpYear != "2030" ||
+		h.Get("Access-Control-Allow-Origin") != testOrigin {
+		t.Fatal("tokenize: response fields or CORS header wrong")
+	}
+
+	// Platform without a client certificate: the TLS handshake is refused, no handler runs.
+	nNoCert := testLog.Len()
+	req, err := http.NewRequest(http.MethodGet, intURL+"/healthz", nil)
+	if err != nil {
+		t.Fatal("building request failed")
+	}
+	if resp, err := tlsClient(t, caPool).Do(req); err == nil {
+		resp.Body.Close()
+		t.Fatalf("internal listener answered a client without a certificate: status %d", resp.StatusCode)
+	}
+	if strings.Contains(testLog.since(nNoCert), "listener=internal") {
+		t.Error("a request without a client certificate reached the internal handler")
+	}
+
+	// Platform with its certificate: create_payment_method with a forged Authorization header.
+	platform := tlsClient(t, caPool, clientCert)
+	status, _, body = roundTrip(t, platform, http.MethodPost, intURL+"/proxy",
+		proxyBody("stripe", "create_payment_method", tr.Token, nil), map[string]string{
+			"Content-Type":  "application/json",
+			"Authorization": "Bearer sk_test_attacker",
+		})
+	if status != http.StatusOK {
+		t.Fatalf("proxy: status %d, want 200", status)
+	}
+	if string(body) != `{"id":"pm_123"}` {
+		t.Errorf("proxy: body is not the provider's body (%d bytes)", len(body))
+	}
+	hits, method, path, sentHeader, sent := fp.last()
+	if hits != 1 || method != http.MethodPost || path != "/v1/payment_methods" {
+		t.Fatalf("provider saw %d requests, last %s %s; want 1 POST /v1/payment_methods", hits, method, path)
+	}
+	if sentHeader.Get("Authorization") != "Bearer "+testSecret {
+		t.Error("provider did not receive the vault's own secret as the credential")
+	}
+	if !bytes.Contains(sent, []byte("card%5Bnumber%5D="+testPAN)) {
+		t.Error("provider body lacks card[number] with the tokenized PAN")
+	}
+	if !bytes.Contains(sent, []byte("card%5Bcvc%5D="+testCVV)) {
+		t.Error("provider body lacks card[cvc] with the CVV given at tokenize")
+	}
+
+	status, _, body = roundTrip(t, platform, http.MethodGet, intURL+"/healthz", "", nil)
+	if status != http.StatusOK || string(body) != "{\"status\":\"ok\"}\n" {
+		t.Errorf("healthz: status %d (%d bytes), want 200 {\"status\":\"ok\"}", status, len(body))
+	}
+
+	logged := testLog.since(n0)
+	for _, parts := range [][]string{
+		{"req listener=public method=OPTIONS path=/tokenize status=204"},
+		{"req listener=public method=POST path=/tokenize status=200"},
+		{"req listener=internal method=POST path=/proxy status=200", "caller=0A1B2C"},
+		{"req listener=internal method=GET path=/healthz status=200", "caller=0A1B2C"},
+	} {
+		if !hasLogLine(logged, parts...) {
+			t.Errorf("no access-log line with %q", parts)
+		}
+	}
+}
+
+// TestIntegrationRotateDEK covers §8.3/§8.4 and the last §15 box: -rotate-dek (as vault_rotator,
+// KMS via the fake metadata server and fake KMS) creates a new version; after a "restart" (a
+// second loadDEKs as vault_app) every version loads and a token sealed under the old DEK resolves.
+// The KMS settings are what prod passes (no dev DEK). The pools are opened in dev mode because
+// the test database speaks trust auth without TLS; prod openDB (verified TLS + IAM token) is
+// covered by TestOpenDB.
+func TestIntegrationRotateDEK(t *testing.T) {
+	ctx := context.Background()
+	open := func(role string) *sql.DB {
+		db, err := openDB(config{env: "dev", dbURL: integrationURL(t, role)}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { db.Close() })
+		return db
+	}
+	rotDB, appDB := open("vault_rotator"), open("vault_app")
+	newFakeMetadata(t, nil)
+	k := newFakeKMS(t)
+	c := newOutboundClient(nil)
+	ts := &tokenSource{client: c}
+	kmsCfg := config{env: "prod", kmsKey: testKMSKey}
+
+	vOld, err := rotateDEK(ctx, kmsCfg, rotDB, c, ts)
+	if err != nil || vOld <= 0 {
+		t.Fatalf("first rotation: version=%d err=%v", vOld, err)
+	}
+	deks, cur, err := loadDEKs(ctx, kmsCfg, appDB, c, ts)
+	if err != nil || cur != vOld || len(deks[vOld]) != dekSize {
+		t.Fatalf("load after first rotation: current=%d (want %d) err=%v", cur, vOld, err)
+	}
+
+	// A card tokenized under the then-current DEK.
+	pt, err := json.Marshal(card{PAN: testPAN, ExpMonth: "12", ExpYear: "2030"})
+	if err != nil {
+		t.Fatal("marshal card failed")
+	}
+	tok := newToken()
+	if err := dbPutCard(ctx, appDB, tok, seal(deks[cur], pt), "4242", cur); err != nil {
+		t.Fatalf("put_card: %v", err)
+	}
+
+	vNew, err := rotateDEK(ctx, kmsCfg, rotDB, c, ts)
+	if err != nil || vNew != vOld+1 {
+		t.Fatalf("second rotation: version=%d err=%v, want %d", vNew, err, vOld+1)
+	}
+
+	// Restart: both versions load, current is the highest.
+	deks2, cur2, err := loadDEKs(ctx, kmsCfg, appDB, c, ts)
+	if err != nil {
+		t.Fatalf("load after second rotation: %v", err)
+	}
+	maxVer := 0
+	for ver := range deks2 {
+		maxVer = max(maxVer, ver)
+	}
+	if cur2 != vNew || cur2 != maxVer {
+		t.Errorf("current = %d, want %d (the highest version)", cur2, vNew)
+	}
+	for _, ver := range []int{vOld, vNew} {
+		if len(deks2[ver]) != dekSize {
+			t.Errorf("version %d not loaded as a 32-byte DEK", ver)
+		}
+	}
+	if !bytes.Equal(deks2[vOld], deks[vOld]) {
+		t.Error("the old DEK changed across restarts")
+	}
+	if bytes.Equal(deks2[vOld], deks2[vNew]) {
+		t.Error("two rotations produced the same DEK")
+	}
+	// Every DEK came through KMS decrypt: the fake KMS wraps by reversing the bytes.
+	wrapped, err := dbListDEKs(ctx, appDB)
+	if err != nil {
+		t.Fatalf("list_deks: %v", err)
+	}
+	if len(wrapped) != len(deks2) {
+		t.Errorf("loaded %d DEKs, list_deks has %d", len(deks2), len(wrapped))
+	}
+	for ver, d := range deks2 {
+		if !bytes.Equal(reversed(wrapped[ver]), d) {
+			t.Errorf("version %d was not unwrapped by KMS decrypt", ver)
+		}
+	}
+	if k.count() == 0 {
+		t.Error("fake KMS was never called")
+	}
+
+	// The old token still resolves under its own key version.
+	ct, kv, err := dbGetCard(ctx, appDB, tok, "0A1B2C")
+	if err != nil || kv != vOld {
+		t.Fatalf("get_card: key_version=%d (want %d) err=%v", kv, vOld, err)
+	}
+	got, err := unseal(deks2[kv], ct)
+	var cd card
+	if err != nil || json.Unmarshal(got, &cd) != nil || cd.PAN != testPAN || cd.ExpMonth != "12" || cd.ExpYear != "2030" {
+		t.Error("the old token does not resolve to its card after rotation")
+	}
+	if _, err := unseal(deks2[vNew], ct); err == nil {
+		t.Error("the old ciphertext opens under the new DEK")
+	}
+}
+
+// TestStripeLive runs tokenize → create_payment_method against the real Stripe test-mode API
+// (§15) with a forged inbound Authorization header. It runs only when VAULT_TEST_STRIPE_SECRET
+// holds a test-mode key (sk_test_…), which is never printed. That the payment method shows up in
+// the vault's Stripe dashboard is still checked by hand.
+func TestStripeLive(t *testing.T) {
+	secret := os.Getenv("VAULT_TEST_STRIPE_SECRET")
+	if !strings.HasPrefix(secret, "sk_test_") {
+		t.Skip("set VAULT_TEST_STRIPE_SECRET to a Stripe test-mode key (sk_test_…) to run")
+	}
+	v, _ := newTestVault(t) // in-memory store
+	v.providers = newProviders(secret)
+	v.client = newOutboundClient(nil)
+	if base := v.providers["stripe"].base.String(); base != "https://api.stripe.com" {
+		t.Fatalf("stripe base is %s, want the real API", base)
+	}
+
+	rec := serveTokenize(v, tokRequest(tokCase{body: tokBody(map[string]any{"cvv": "314"})}))
+	var tr tokenizeResponse
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &tr) != nil {
+		t.Fatalf("tokenize: status %d", rec.Code)
+	}
+
+	r := newProxyRequest(proxyBody("stripe", "create_payment_method", tr.Token, nil))
+	r.Header.Set("Authorization", "Bearer sk_test_attacker")
+	rec = serveInternal(v, r)
+	if rec.Code != http.StatusOK || !regexp.MustCompile(`"id":\s*"pm_`).Match(rec.Body.Bytes()) {
+		masked, _ := maskPAN(rec.Body.Bytes(), testPAN)
+		t.Fatalf("create_payment_method: status %d, body (PAN masked, key redacted): %s",
+			rec.Code, strings.ReplaceAll(string(masked), secret, "<redacted>"))
 	}
 }
