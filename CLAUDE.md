@@ -14,6 +14,7 @@ You are implementing spec/original.md. Read it fully before writing code. These 
 - ALL application code goes in `main.go`. Do not create packages, subdirectories, or additional .go files other than `main_test.go`.
 - Do not introduce interfaces, generics, or abstractions to "clean up" the file. Repetition is acceptable; indirection is not.
 - `schema.sql` is the only SQL. The Go code calls `vault.put_card`, `vault.get_card`, `vault.list_deks`, `vault.add_dek` and nothing else. No table names appear in Go.
+- Code comments explain behaviour and reasons; they never reference the spec, its section numbers, the design or plan documents.
 
 ## Dependencies
 - Standard library plus `github.com/jackc/pgx/v5/stdlib` only. If you believe something requires another module, STOP and explain; do not add it.
@@ -62,7 +63,7 @@ Every PR that adds or changes a provider, endpoint or account in `catalog.json` 
 - Adyen, Mercado Pago, PayU and Pagar.me are modelled only in the synthetic `testCatalogJSON`. Each lands in `catalog.json` as its own data-only PR after sandbox verification.
 
 ## When unsure
-- If the spec is ambiguous, choose the stricter interpretation (reject more, log less, expose less) and note the choice in a code comment prefixed `SPEC-DECISION:`.
+- If the spec is ambiguous, choose the stricter interpretation (reject more, log less, expose less) and explain the choice in a plain code comment (no spec or section references).
 - If a spec requirement seems wrong or impossible, stop and report before deviating.
 
 ## Deliverables, in order

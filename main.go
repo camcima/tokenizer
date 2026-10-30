@@ -49,12 +49,12 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Card primitives (SPEC §5.5, §5.6, §8.1, §8.5)
+// Card primitives
 // ---------------------------------------------------------------------------
 
-// card is the encrypted record: plaintext is json.Marshal(card{...}) (§8.1).
+// card is the encrypted record: plaintext is json.Marshal(card{...}).
 // CVV is never part of it. Keep values of this type scoped to a single request.
-// Name is the optional cardholder name (D§5.8). omitempty keeps the plaintext of a card stored
+// Name is the optional cardholder name. omitempty keeps the plaintext of a card stored
 // without a name byte-identical to before, and old rows decode with Name == "".
 type card struct {
 	PAN      string `json:"pan"`
@@ -95,8 +95,8 @@ func luhnValid(digits string) bool {
 }
 
 // normalizePAN strips spaces and hyphens, then requires ASCII digits only, length 13–19,
-// and a passing Luhn check (§5.5). On failure it returns ("", false).
-// SPEC-DECISION: only ' ' and '-' are stripped; any other separator (tab, dot, NBSP) or
+// and a passing Luhn check. On failure it returns ("", false).
+// Only ' ' and '-' are stripped; any other separator (tab, dot, NBSP) or
 // non-ASCII digit (e.g. full-width) rejects the PAN.
 func normalizePAN(s string) (string, bool) {
 	b := make([]byte, 0, len(s))
@@ -120,7 +120,7 @@ func normalizePAN(s string) (string, bool) {
 }
 
 // validExpiry checks exp_month (exactly "01"–"12") and exp_year (exactly four digits), and
-// requires (year, month) >= the current month in UTC (§5.5).
+// requires (year, month) >= the current month in UTC.
 func validExpiry(month, year string, now time.Time) bool {
 	if !expMonthRe.MatchString(month) || !expYearRe.MatchString(year) {
 		return false
@@ -136,7 +136,7 @@ func validExpiry(month, year string, now time.Time) bool {
 	return y > cy || (y == cy && m >= cm)
 }
 
-// validCVV reports whether s is 3–4 ASCII digits (§5.5). Presence is the caller's concern.
+// validCVV reports whether s is 3–4 ASCII digits. Presence is the caller's concern.
 func validCVV(s string) bool {
 	if len(s) < 3 || len(s) > 4 {
 		return false
@@ -149,9 +149,9 @@ func validCVV(s string) bool {
 	return true
 }
 
-// validName reports whether s is an acceptable cardholder name (D§5.8): 1–100 runes, valid
+// validName reports whether s is an acceptable cardholder name: 1–100 runes, valid
 // UTF-8, and no control rune (unicode.IsControl: C0, DEL, C1). Presence is the caller's concern.
-// SPEC-DECISION: U+FFFD is rejected too. encoding/json silently replaces invalid UTF-8 in a
+// U+FFFD is rejected too. encoding/json silently replaces invalid UTF-8 in a
 // string with U+FFFD, so without this a body carrying invalid UTF-8 would be stored, not
 // rejected. No real name contains the replacement character.
 func validName(s string) bool {
@@ -166,12 +166,12 @@ func validName(s string) bool {
 	return true
 }
 
-// newToken returns "tok_" + 32 lowercase hex chars from 16 bytes of crypto/rand (§5.6).
+// newToken returns "tok_" + 32 lowercase hex chars from 16 bytes of crypto/rand.
 func newToken() string {
 	var b [16]byte
 	// crypto/rand.Read is deliberately called without error handling: since Go 1.24 it never
 	// returns an error and irrecoverably crashes the process if the OS RNG fails, which is
-	// exactly §8.1's "a crypto/rand failure panics; it is not recoverable".
+	// exactly what is wanted: a crypto/rand failure panics and is not recoverable.
 	rand.Read(b[:])
 	return "tok_" + hex.EncodeToString(b[:])
 }
@@ -185,7 +185,7 @@ const (
 var errUnseal = errors.New("unseal failed")
 
 // newGCM builds AES-256-GCM for dek.
-// SPEC-DECISION: only 32-byte keys are accepted (AES-256 per §8.1); aes.NewCipher would
+// Only 32-byte keys are accepted (AES-256); aes.NewCipher would
 // otherwise silently accept 16/24-byte keys and downgrade to AES-128/192.
 func newGCM(dek []byte) (cipher.AEAD, error) {
 	if len(dek) != dekSize {
@@ -203,7 +203,7 @@ func newGCM(dek []byte) (cipher.AEAD, error) {
 }
 
 // seal encrypts plaintext under dek with AES-256-GCM and a fresh random 12-byte nonce, no
-// additional data, returning nonce || ciphertext || tag (§8.1).
+// additional data, returning nonce || ciphertext || tag.
 // A DEK that is not 32 bytes is a programming error (DEKs are length-checked at load) and panics.
 func seal(dek, plaintext []byte) []byte {
 	gcm, err := newGCM(dek)
@@ -232,7 +232,7 @@ func unseal(dek, blob []byte) ([]byte, error) {
 	return pt, nil
 }
 
-// zero overwrites b with zeros. Best effort only (§8.5): Go may have copied the data
+// zero overwrites b with zeros. Best effort only: Go may have copied the data
 // elsewhere (string conversions, GC moves, register spills), so this narrows exposure but
 // cannot guarantee the bytes are gone from memory.
 func zero(b []byte) {
@@ -242,7 +242,7 @@ func zero(b []byte) {
 }
 
 // ---------------------------------------------------------------------------
-// Vault core: state, logging, guard, errors (SPEC §5.7, §10.1)
+// Vault core: state, logging, guard, errors
 // ---------------------------------------------------------------------------
 
 // Errors returned by vault.getCard. Any other error is an internal failure.
@@ -251,7 +251,7 @@ var (
 	errUnknownToken = errors.New("unknown token")
 )
 
-// Error response strings: the complete fixed set (§5.7). Error bodies use only these; they never
+// Error response strings: the complete fixed set. Error bodies use only these; they never
 // carry user input, token values, provider error text, or Go error strings.
 const (
 	msgNotFound           = "not found"
@@ -297,8 +297,8 @@ type vault struct {
 	cvv         *cvvCache
 	now         func() time.Time
 	log         *log.Logger
-	catalog     *catalog     // the compiled-in catalog.json, this environment's accounts (D§5.1)
-	client      *http.Client // the single shared outbound client (§9.2)
+	catalog     *catalog     // the compiled-in catalog.json, this environment's accounts
+	client      *http.Client // the single shared outbound client
 
 	lastSessionAlert atomic.Int64 // unix second of last session_token_invalid alert
 	lastPolicyAlert  atomic.Int64 // unix second of last proxy_policy alert
@@ -334,7 +334,7 @@ func (w *statusWriter) Write(b []byte) (int, error) {
 }
 
 // logPath and logMethod keep request-controlled text out of the access log.
-// SPEC-DECISION: only known routes are logged literally, everything else as path=other, so a
+// Only known routes are logged literally, everything else as path=other, so a
 // PAN typed into a URL path (POST /4242…) can never reach the log; likewise method=other for
 // anything but GET/POST/OPTIONS.
 func logPath(p string) string {
@@ -353,7 +353,7 @@ func logMethod(m string) string {
 	return "other"
 }
 
-// guard wraps every handler on both listeners: exactly one access-log line per request (§10.1)
+// guard wraps every handler on both listeners: exactly one access-log line per request
 // and panic recovery. A panic becomes 500 {"error":"internal error"}; the panic value is never
 // logged (it could carry card data). If the response had already started, the connection is
 // aborted instead (http.ErrAbortHandler) so the client never receives a truncated success.
@@ -412,8 +412,8 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 
 // callerSerial returns the verified client certificate's serial number as byte-wise uppercase
 // hex, the way `openssl x509 -serial` prints it (serial 0x0A1B2C → "0A1B2C", zero → "00"), or ""
-// if there is none (§10.1).
-// SPEC-DECISION: a negative serial (invalid per RFC 5280; its magnitude would collide with a
+// if there is none.
+// A negative serial (invalid per RFC 5280; its magnitude would collide with a
 // positive serial) yields "", i.e. it is treated as no caller identity at all.
 func callerSerial(r *http.Request) string {
 	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
@@ -431,7 +431,7 @@ func callerSerial(r *http.Request) string {
 }
 
 // ---------------------------------------------------------------------------
-// Session tokens (SPEC §5.4)
+// Session tokens
 // ---------------------------------------------------------------------------
 
 const sessionMaxAhead = 15 * 60 // seconds
@@ -445,7 +445,7 @@ var (
 // "v1."+expires_unix)>" and returns "" if valid, else the alert reason "format", "hmac" or
 // "expired". Checks run format → HMAC → window, so "expired" is reported only for authentic
 // tokens. expires_unix <= now is expired; > now+15m is also rejected as "expired".
-// SPEC-DECISION: the scheme prefix is exactly "Bearer " (case-sensitive, one space), the MAC is
+// The scheme prefix is exactly "Bearer " (case-sensitive, one space), the MAC is
 // exactly 64 lowercase hex chars, and a key shorter than 32 bytes authenticates nothing.
 func checkSession(key []byte, authz string, now time.Time) string {
 	tok, ok := strings.CutPrefix(authz, "Bearer ")
@@ -479,8 +479,8 @@ func checkSession(key []byte, authz string, now time.Time) string {
 	return ""
 }
 
-// alertSession logs "ALERT session_token_invalid reason=<reason>" at most once per second
-// (§10.1). reason is checkSession's result.
+// alertSession logs "ALERT session_token_invalid reason=<reason>" at most once per second.
+// reason is checkSession's result.
 func (v *vault) alertSession(reason string) {
 	sec := v.now().Unix()
 	old := v.lastSessionAlert.Load()
@@ -491,7 +491,7 @@ func (v *vault) alertSession(reason string) {
 }
 
 // alertPolicy logs "ALERT proxy_policy account=<a> endpoint=<id|-> reason=<r>" at most once per
-// second (D§5.11), on its own limiter so that a flood of policy violations cannot hide a session
+// second, on its own limiter so that a flood of policy violations cannot hide a session
 // alert or the other way round. account and endpoint are catalog names ("" endpoint → "-") and
 // reason a fixed checkProxy reason; the offending request value is never logged.
 func (v *vault) alertPolicy(account, endpoint, reason string) {
@@ -507,7 +507,7 @@ func (v *vault) alertPolicy(account, endpoint, reason string) {
 }
 
 // ---------------------------------------------------------------------------
-// CVV cache (SPEC §3.2, §8.5): in memory only, single use, TTL, swept on every write
+// CVV cache: in memory only, single use, TTL, swept on every write
 // ---------------------------------------------------------------------------
 
 type cvvEntry struct {
@@ -527,7 +527,7 @@ func newCVVCache(ttl time.Duration, now func() time.Time) *cvvCache {
 }
 
 // put caches cvv for token until now+ttl, first deleting every expired entry.
-// SPEC-DECISION: an entry is expired from exactly put+ttl onward.
+// An entry is expired from exactly put+ttl onward.
 func (c *cvvCache) put(token, cvv string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -557,21 +557,21 @@ func (c *cvvCache) take(token string) string {
 }
 
 // ---------------------------------------------------------------------------
-// Public API: POST /tokenize and CORS (SPEC §3.2, §5)
+// Public API: POST /tokenize and CORS
 // ---------------------------------------------------------------------------
 
-const maxPublicBody = 4 << 10 // §5.2: 4 KiB request body limit
+const maxPublicBody = 4 << 10 // 4 KiB request body limit
 
 type tokenizeRequest struct {
 	PAN      string `json:"pan"`
 	ExpMonth string `json:"exp_month"`
 	ExpYear  string `json:"exp_year"`
-	// SPEC-DECISION: nil means the key is absent (no CVV). encoding/json also decodes JSON null
+	// nil means the key is absent (no CVV). encoding/json also decodes JSON null
 	// to nil, so handleTokenize detects "cvv": null separately and rejects it with
-	// msgInvalidCVV, like "" (controller ruling 2026-10-30: the stricter reading).
+	// msgInvalidCVV, like "": an explicit null is not treated as absent.
 	CVV *string `json:"cvv"`
 	// Name follows CVV exactly: nil means absent, and "name": null is detected separately and
-	// rejected with msgInvalidName (D§5.8; the same stricter reading as "cvv": null).
+	// rejected with msgInvalidName, just like "cvv": null.
 	Name *string `json:"name"`
 }
 
@@ -588,7 +588,7 @@ func (v *vault) publicHandler() http.Handler {
 }
 
 // singleHeader returns the value of header name if it is present exactly once.
-// SPEC-DECISION: a repeated Origin, Authorization or Content-Type header is ambiguous (proxies
+// A repeated Origin, Authorization or Content-Type header is ambiguous (proxies
 // and Go's Header.Get may disagree on which one counts) and is treated as invalid.
 func singleHeader(h http.Header, name string) (string, bool) {
 	vals := h.Values(name)
@@ -599,7 +599,7 @@ func singleHeader(h http.Header, name string) (string, bool) {
 }
 
 // jsonContentType reports whether h carries exactly one Content-Type and it is application/json.
-// SPEC-DECISION: the media type must be application/json (case-insensitive, per RFC 9110);
+// The media type must be application/json (case-insensitive, per RFC 9110);
 // the only parameter allowed is charset=utf-8, since JSON is UTF-8 (RFC 8259).
 func jsonContentType(h http.Header) bool {
 	ct, ok := singleHeader(h, "Content-Type")
@@ -616,7 +616,7 @@ var tokenizeFields = map[string]bool{"pan": true, "exp_month": true, "exp_year":
 
 // exactKeys reports whether body is a JSON object whose keys are all in fields (any key if fields
 // is nil), spelled exactly, each at most once.
-// SPEC-DECISION: encoding/json matches keys case-insensitively and keeps the last of duplicate
+// encoding/json matches keys case-insensitively and keeps the last of duplicate
 // keys, so DisallowUnknownFields alone accepts {"PAN":…} and {"pan":A,"pan":B}. Both are
 // rejected as unknown fields: a body that different JSON parsers would read differently is
 // never tokenized.
@@ -647,11 +647,11 @@ func exactKeys(body []byte, fields map[string]bool) bool {
 	return err == nil && t == json.Delim('}')
 }
 
-// handleTokenize implements POST /tokenize (§3.2, §5). The checks run in a fixed order and each
+// handleTokenize implements POST /tokenize. The checks run in a fixed order and each
 // failing check returns immediately; error bodies use only the msg* constants. Nothing from the
 // request is logged.
 func (v *vault) handleTokenize(w http.ResponseWriter, r *http.Request) {
-	// SPEC-DECISION: a percent-encoded spelling of the path (e.g. /%74okenize) decodes to
+	// A percent-encoded spelling of the path (e.g. /%74okenize) decodes to
 	// "/tokenize" but is not the exact path, so it is 404 (RawPath is set only for such forms).
 	if r.URL.Path != "/tokenize" || r.URL.RawPath != "" {
 		writeError(w, http.StatusNotFound, msgNotFound)
@@ -662,12 +662,12 @@ func (v *vault) handleTokenize(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, msgMethod)
 		return
 	}
-	// SPEC-DECISION: a bare trailing "?" (empty but present query) is rejected like any query.
+	// A bare trailing "?" (empty but present query) is rejected like any query.
 	if r.URL.RawQuery != "" || r.URL.ForceQuery {
 		writeError(w, http.StatusBadRequest, msgQuery)
 		return
 	}
-	// The Origin must match exactly on POST as well as on the preflight (globals ruling 3). An
+	// The Origin must match exactly on POST as well as on the preflight. An
 	// unset allow-origin matches nothing.
 	if origin, ok := singleHeader(r.Header, "Origin"); !ok || v.allowOrigin == "" || origin != v.allowOrigin {
 		writeError(w, http.StatusForbidden, msgOrigin)
@@ -704,7 +704,7 @@ func (v *vault) handleTokenize(w http.ResponseWriter, r *http.Request) {
 	}
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxPublicBody+1))
-	defer zero(body) // best effort (§8.5)
+	defer zero(body) // best effort
 	if len(body) > maxPublicBody {
 		writeError(w, http.StatusRequestEntityTooLarge, msgTooLarge)
 		return
@@ -778,7 +778,7 @@ func (v *vault) handleTokenize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ciphertext := seal(dek, plaintext)
-	zero(plaintext) // best effort (§8.5)
+	zero(plaintext) // best effort
 
 	token := newToken()
 	last4 := pan[len(pan)-4:]
@@ -794,11 +794,11 @@ func (v *vault) handleTokenize(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
-// Provider responses: PAN masking, outbound client (SPEC §6.4, §9)
+// Provider responses: PAN masking, outbound client
 // ---------------------------------------------------------------------------
 
 const (
-	maxProviderResponse = 4 << 20 // §6.4 step 9: provider response body limit
+	maxProviderResponse = 4 << 20 // provider response body limit
 	formContentType     = "application/x-www-form-urlencoded"
 )
 
@@ -806,15 +806,15 @@ var errEgress = errors.New("egress invariant")
 
 // maskPAN replaces every occurrence of pan, and of pan grouped in fours from the left with single
 // spaces ("4242 4242 4242 4242", "3782 8224 6310 005") or single hyphens ("4242-4242-4242-4242"),
-// with "****"+last4 (§6.4 step 9). found reports whether anything was replaced; if not, body is
+// with "****"+last4. found reports whether anything was replaced; if not, body is
 // returned unchanged.
-// SPEC-DECISION: the hyphen-grouped form is masked too (§6.4 names only the exact and spaced
-// forms; hyphens are the other separator normalizePAN accepts). The replacement repeats until no
+// The hyphen-grouped form is masked too, since hyphens are the other separator normalizePAN
+// accepts. The replacement repeats until no
 // form remains: one bytes.ReplaceAll pass over pan+pan[4:] leaves a full PAN when the last 4
 // digits equal the first 4 ("4242…4242" + "4242…" → "****4242" + "4242…"). Each pass replaces a
 // needle of >= 13 bytes with an 8-byte mask, so the body strictly shrinks and the loop ends.
 func maskPAN(body []byte, pan string) ([]byte, bool) {
-	if len(pan) < 13 { // never a real PAN (§5.5); keeps every needle longer than the mask
+	if len(pan) < 13 { // never a real PAN; keeps every needle longer than the mask
 		return body, false
 	}
 	var spaced, hyphen strings.Builder
@@ -841,7 +841,7 @@ func maskPAN(body []byte, pan string) ([]byte, bool) {
 	return body, found
 }
 
-// newOutboundClient returns the single shared provider client (§6.4 step 8, §9.2): 30s hard
+// newOutboundClient returns the single shared provider client: 30s hard
 // timeout, redirects never followed, no proxy from the environment, TLS >= 1.2 verified against
 // roots (nil = system roots; tests pass an httptest server's CA), 16 idle conns per host.
 func newOutboundClient(roots *x509.CertPool) *http.Client {
@@ -862,10 +862,10 @@ func newOutboundClient(roots *x509.CertPool) *http.Client {
 }
 
 // ---------------------------------------------------------------------------
-// Placeholders and strict body scanners (D§5.3, D§5.4)
+// Placeholders and strict body scanners
 // ---------------------------------------------------------------------------
 
-// placeholder is one entry of the fixed D§5.3 vocabulary: kind is pan, cvv, name, exp_month,
+// placeholder is one entry of the fixed vocabulary: kind is pan, cvv, name, exp_month,
 // exp_year, exp, secret, basic or signature; mod is the format modifier (int, yy, yyyy/mm,
 // mm/yy) and arg the secret NAME of secret/basic.
 type placeholder struct{ kind, mod, arg string }
@@ -962,7 +962,7 @@ var (
 	errPlaceholder = errors.New("invalid placeholder use") // placeholder-looking text where it is not allowed
 )
 
-// SPEC-DECISION: JSON nesting deeper than 64 objects/arrays is rejected. Provider bodies nest a
+// JSON nesting deeper than 64 objects/arrays is rejected. Provider bodies nest a
 // handful of levels; the cap bounds work on pathological input well below encoding/json's own.
 const maxJSONDepth = 64
 
@@ -984,11 +984,11 @@ var jsonPointerEscaper = strings.NewReplacer("~", "~0", "/", "~1")
 // be valid UTF-8 holding exactly one JSON value (whitespace around it only), with no duplicate keys
 // in any object (compared after decoding escapes) and at most maxJSONDepth levels of nesting.
 // Any failure is errBody.
-// SPEC-DECISION: a string or key whose decoded text contains U+FFFD is rejected. encoding/json
+// A string or key whose decoded text contains U+FFFD is rejected. encoding/json
 // silently decodes a lone surrogate escape ("\ud800") to U+FFFD, which other parsers reject or
 // keep, so such a body could be read differently by the provider; a literal or escaped U+FFFD is
 // indistinguishable after decoding and goes with it. A UTF-8 BOM is invalid JSON and rejected.
-// SPEC-DECISION: a key whose decoded text contains a control character (U+0000-U+001F) is
+// A key whose decoded text contains a control character (U+0000-U+001F) is
 // rejected, so a provider parser that truncates at NUL or strips control characters cannot alias
 // "merchantAccount\u0000" to "merchantAccount" and bypass a pin or forbid rule.
 //
@@ -1141,7 +1141,7 @@ type formField struct {
 // formFields parses a form body strictly into its fields, in order. Keys must be canonical (see
 // validFormKey) and unique unless they end in "[]". Any failure is errBody, except that a body
 // whose only failure is a key containing "{{" is errPlaceholder (strictness failures win).
-// SPEC-DECISION: stricter than url.ParseQuery, so no two parsers can split the body differently:
+// Stricter than url.ParseQuery, so no two parsers can split the body differently:
 // every raw byte must be visible ASCII (0x21-0x7E; spaces as "+", everything else percent-encoded),
 // ';' is rejected outright (some parsers treat it as a separator), every '&'-separated segment must
 // be key=value with a non-empty key (no empty segments, no bare keys), percent-escapes must be
@@ -1194,7 +1194,7 @@ func formFields(b []byte) ([]formField, error) {
 var formKeyRe = regexp.MustCompile(`^[A-Za-z0-9_-]+(\[[A-Za-z0-9_-]+\])*(\[\])?$`)
 
 // validFormKey reports whether a decoded form key is canonical.
-// SPEC-DECISION: bracket-parsing servers (Rack, PHP, qs) normalize malformed keys, mapping
+// Bracket-parsing servers (Rack, PHP, qs) normalize malformed keys, mapping
 // "customer]", "[customer" or "a[b]c" onto other names, and NUL or control bytes can truncate a
 // key. Such aliases would bypass duplicate detection and the pin/forbid rules, which match the
 // flat decoded name. So a key must be a name of [A-Za-z0-9_-] followed by zero or more non-empty
@@ -1266,7 +1266,7 @@ func scanBody(format string, body []byte) ([]occurrence, error) {
 // readField returns the value at addr (a JSON Pointer for json, a decoded field name for form).
 // found is false when the body is valid but has no such field. A body failing the strict parse is
 // errBody (errPlaceholder for a form key containing "{{"). Form values are always kind "string".
-// SPEC-DECISION: a form key that appears more than once (only possible for "[]" keys) has no single
+// A form key that appears more than once (only possible for "[]" keys) has no single
 // value, so reading it is errBody rather than picking one.
 func readField(format string, body []byte, addr string) (fieldValue, bool, error) {
 	switch format {
@@ -1303,7 +1303,7 @@ func readField(format string, body []byte, addr string) (fieldValue, bool, error
 
 // encodeValue encodes v for substitution in format: json as a quoted JSON string, or as a bare
 // number when number is set; form as url.QueryEscape(v).
-// SPEC-DECISION: a number is emitted bare only when v is 1-18 ASCII digits, and then in canonical
+// A number is emitted bare only when v is 1-18 ASCII digits, and then in canonical
 // form ("03" → 3; a leading zero is invalid JSON). Anything else is encoded as a string, so the
 // output is always a valid JSON value or form value; callers only pass digits. An unknown format is
 // a programming error and panics.
@@ -1351,10 +1351,10 @@ func substitute(body []byte, occs []occurrence, repl [][]byte) []byte {
 }
 
 // ---------------------------------------------------------------------------
-// Provider catalog: catalog.json (D§5.1, D§5.5-5.7, D§5.10)
+// Provider catalog: catalog.json
 // ---------------------------------------------------------------------------
 
-// catalogJSON is the reviewed provider catalog, compiled into the binary (D§5.1). It is never read
+// catalogJSON is the reviewed provider catalog, compiled into the binary. It is never read
 // from disk at runtime, so the image digest attests the exact catalog. Adding a provider, endpoint
 // or account is a PR that also updates egress-hosts.<env>.txt and the egress firewall rule;
 // TestEgressHostsMatchCatalog keeps the files and the catalog in step.
@@ -1455,7 +1455,7 @@ var (
 	catAccountKeys = map[string]bool{"provider": true, "env": true, "host": true, "base_path": true, "secrets": true, "values": true}
 )
 
-// SPEC-DECISION: provider names, endpoint ids and account names are [a-z0-9_]{1,64}. They appear in
+// Provider names, endpoint ids and account names are [a-z0-9_]{1,64}. They appear in
 // logs and alerts (account=<a> endpoint=<id>), so a restricted alphabet rules out log injection.
 var catNameRe = regexp.MustCompile(`^[a-z0-9_]{1,64}$`)
 
@@ -1463,11 +1463,11 @@ var catNameRe = regexp.MustCompile(`^[a-z0-9_]{1,64}$`)
 var catHostRe = regexp.MustCompile(`^[a-z0-9.-]+(:[0-9]{1,5})?$`)
 
 // catSegmentRe is a literal path segment: RFC 3986 unreserved characters only.
-// SPEC-DECISION: no percent-escapes, sub-delims or ':' in catalog paths, so a rule path has one
+// No percent-escapes, sub-delims or ':' in catalog paths, so a rule path has one
 // spelling and cannot be normalized into another by the provider.
 var catSegmentRe = regexp.MustCompile(`^[A-Za-z0-9._~-]+$`)
 
-// SPEC-DECISION: catalog header templates may not name the headers the vault sets (Host,
+// Catalog header templates may not name the headers the vault sets (Host,
 // Content-Type, Content-Length, User-Agent), transfer and hop-by-hop headers, or the platform
 // allowlist (Accept, Idempotency-Key, X-Idempotency-Key): a template there would compete with the
 // vault's own value or with the platform's.
@@ -1483,8 +1483,7 @@ var catHeaderNameRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9-]{0,63}$`)
 // parseCatalog parses and validates catalog.json. Every provider and every account in every
 // environment is validated; only the accounts of env ("dev" or "prod") are kept. Errors name the
 // provider, endpoint, account or address at fault, never a secret resource or account value.
-// The rules are those of D§5.1-5.7 and D§5.10; the SPEC-DECISION comments on the helpers below
-// record where they are stricter.
+// The comments on the helpers below explain where a rule is stricter than the bare format.
 func parseCatalog(data []byte, env string) (*catalog, error) {
 	if env != "dev" && env != "prod" {
 		return nil, errors.New("catalog: environment must be dev or prod")
@@ -1518,7 +1517,7 @@ func parseCatalog(data []byte, env string) (*catalog, error) {
 		}
 		c.providers[name] = p
 	}
-	// SPEC-DECISION: dev secret variables (devSecretVar) must be unique across every account of
+	// Dev secret variables (devSecretVar) must be unique across every account of
 	// every environment, not only the loaded one: "a_b"/"c" and "a"/"b_c", or secrets "apiKey" and
 	// "APIKEY", would otherwise share one variable, and the same image boots in both environments.
 	devVar := map[string]string{} // dev variable → "account A secret S" that claimed it
@@ -1544,7 +1543,7 @@ func parseCatalog(data []byte, env string) (*catalog, error) {
 // catExactKeys checks every key of an object that decodes into a struct against that struct's
 // exact key set. The struct objects sit at fixed depths: the root, /providers/P,
 // /providers/P/endpoints/I, /providers/P/endpoints/I/pins/A and /accounts/A.
-// SPEC-DECISION: encoding/json matches struct keys case-insensitively, so DisallowUnknownFields
+// encoding/json matches struct keys case-insensitively, so DisallowUnknownFields
 // alone accepts "Format" for "format", and {"format":"json","Format":"form"} passes the
 // duplicate-key check yet decodes as "form". Keys must be spelled exactly.
 func catExactKeys(nodes []jsonNode) error {
@@ -1578,7 +1577,7 @@ func catExactKeys(nodes []jsonNode) error {
 }
 
 // parseCatProvider validates one provider and its endpoints.
-// SPEC-DECISION: a provider must have at least one endpoint, and no two of its endpoints may share
+// A provider must have at least one endpoint, and no two of its endpoints may share
 // a method and overlapping paths (equal segment by segment, a wildcard matching anything), so a
 // request path matches at most one rule.
 func parseCatProvider(name string, rp rawProvider) (*catProvider, error) {
@@ -1611,13 +1610,13 @@ func parseCatProvider(name string, rp rawProvider) (*catProvider, error) {
 }
 
 // parseCatEndpoint validates one endpoint rule of a provider with body format format.
-// SPEC-DECISION: beyond D§5.3, (1) {{basic:}} is header-only, (2) the payu signer needs a json
+// Additional rules: (1) {{basic:}} is header-only, (2) the payu signer needs a json
 // provider (it reads body fields by JSON Pointer), (3) the whole-document address "" and empty JSON
 // Pointer tokens are rejected, and (4) form positions and pins may not use a repeatable "[]" key (it
 // names no single value).
-// SPEC-DECISION: every endpoint must have "card_data": true and list a {{pan}} position. D§5.6 scopes
-// the account credential to card-carrying calls, and D§2 leaves calls without card data (payments
-// with a provider token, refunds, queries) to the platform, with its own keys. A non-card endpoint
+// Every endpoint must have "card_data": true and list a {{pan}} position. The account credential
+// is only for card-carrying calls; calls without card data (payments
+// with a provider token, refunds, queries) are the platform's to make, with its own keys. A non-card endpoint
 // would let the platform borrow the vault's credential for a call the vault has no reason to make,
 // so it is refused here, and checkProxy refuses a request without a {{pan}} occurrence.
 func parseCatEndpoint(format string, i int, re rawEndpoint) (*catEndpoint, error) {
@@ -1869,7 +1868,7 @@ func validJSONPointer(p string) bool {
 // catLiteral decodes one pin or forbid literal, a JSON scalar, into the fieldValue readField
 // produces for that value: kind string with the decoded text, or kind number/bool/null with the raw
 // JSON text. null is accepted only if allowNull (forbid lists).
-// SPEC-DECISION: a string literal containing "{{" is rejected (a body field holding it would be a
+// A string literal containing "{{" is rejected (a body field holding it would be a
 // placeholder or rejected anyway), and form providers accept only string literals, since a form
 // field is always a string and any other literal could never match.
 func catLiteral(format string, raw json.RawMessage, allowNull bool) (fieldValue, bool) {
@@ -1899,7 +1898,7 @@ func catLiteral(format string, raw json.RawMessage, allowNull bool) (fieldValue,
 
 // validCatHost reports whether h is a valid account host: catHostRe, DNS labels of 1-63 characters
 // not starting or ending with '-', at most 253 characters, and a port (if any) in 1-65535.
-// SPEC-DECISION: stricter than the bare pattern, so the host has one spelling for url.URL, the TLS
+// Stricter than the bare pattern, so the host has one spelling for url.URL, the TLS
 // ServerName and the egress firewall list.
 func validCatHost(h string) bool {
 	if !catHostRe.MatchString(h) {
@@ -1924,7 +1923,7 @@ func validCatHost(h string) bool {
 }
 
 // validCatValue reports whether an account value is 1-256 bytes of printable ASCII with no "{{".
-// SPEC-DECISION: values are identifiers (merchant accounts, account IDs, hash names) compared with
+// Values are identifiers (merchant accounts, account IDs, hash names) compared with
 // body fields and fed to signers, so anything else is a catalog mistake.
 func validCatValue(s string) bool {
 	if len(s) < 1 || len(s) > 256 || strings.Contains(s, "{{") {
@@ -2010,10 +2009,10 @@ func parseCatAccount(name string, ra rawAccount, providers map[string]*catProvid
 }
 
 // ---------------------------------------------------------------------------
-// /proxy request policy (D§5.2-5.6, D§5.10, D§5.11)
+// /proxy request policy
 // ---------------------------------------------------------------------------
 
-// proxyEnvelope is the /proxy request body (D§5.2): the platform names one of our accounts, a card
+// proxyEnvelope is the /proxy request body: the platform names one of our accounts, a card
 // token, and the provider request it wants sent, with placeholders where the vault fills in card
 // data, secrets and signatures. It is built by a possibly-compromised platform; checkProxy decides
 // whether it may proceed.
@@ -2050,18 +2049,18 @@ type policyError struct {
 	endpoint    string // id of the matched endpoint (catalog text), "" if rejected before matching
 }
 
-// platformHeaders is the global allowlist of headers the platform may send (D§5.5), besides the
+// platformHeaders is the global allowlist of headers the platform may send, besides the
 // matched endpoint's header templates.
 var platformHeaders = map[string]bool{"Accept": true, "Idempotency-Key": true, "X-Idempotency-Key": true}
 
-// payuSignerInputs are the body fields the payu signer reads (D§5.7), as JSON Pointers.
+// payuSignerInputs are the body fields the payu signer reads, as JSON Pointers.
 var payuSignerInputs = []string{
 	"/transaction/order/referenceCode",
 	"/transaction/order/additionalValues/TX_VALUE/value",
 	"/transaction/order/additionalValues/TX_VALUE/currency",
 }
 
-// proxyWildcardRe is what a "{name}" rule segment matches in a request path (D§5.2).
+// proxyWildcardRe is what a "{name}" rule segment matches in a request path.
 var proxyWildcardRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 // checkProxy applies the catalog's rules to e. Checks run in a fixed order and the first failure
@@ -2070,25 +2069,25 @@ var proxyWildcardRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 // database, and handleProxy runs it before any database call. Every rejection is 400.
 // A GET or HEAD endpoint must have an empty body (checked right after the headers).
 //
-// SPEC-DECISION: every request must contain a {{pan}} occurrence, or it is msgPlaceholder (reason
-// "placeholder", so ALERT proxy_policy fires). The vault's credential is only for card-carrying calls
-// (D§5.6); a request without the card, such as POST /v1/tokens with pii[id_number], would borrow it
-// for a call the platform makes with its own keys (D§2). parseCatEndpoint requires a {{pan}} position
+// Every request must contain a {{pan}} occurrence, or it is msgPlaceholder (reason
+// "placeholder", so ALERT proxy_policy fires). The vault's credential is only for card-carrying calls;
+// a request without the card, such as POST /v1/tokens with pii[id_number], would borrow it
+// for a call the platform makes with its own keys. parseCatEndpoint requires a {{pan}} position
 // on every endpoint, so a request that carries the card always can. There is no empty-body
 // shortcut: an empty json body is msgBadBody, and an empty form body (zero fields) lacks {{pan}}.
-// SPEC-DECISION: a GET or HEAD endpoint still parses, and its request must have no body; with the
+// A GET or HEAD endpoint still parses, and its request must have no body; with the
 // {{pan}} rule above, no request to one can pass. The body rule is kept so that the two stay
 // independent if either changes.
-// SPEC-DECISION: a position address present in the body must hold exactly its placeholder; any
+// A position address present in the body must hold exactly its placeholder; any
 // literal there (an object, a number, the platform's own API key at /merchant/apiKey, a raw PAN) is
-// msgPlaceholder. D§5.6: credential fields only accept vault placeholders. Positions other than the
+// msgPlaceholder: credential fields only accept vault placeholders. Positions other than the
 // {{pan}} one stay optional: a body may omit such a field entirely.
-// SPEC-DECISION: a body field whose address differs from a position, pin or forbid address only in
+// A body field whose address differs from a position, pin or forbid address only in
 // case ("/MerchantAccount" next to or instead of "/merchantAccount") fails that check (placeholder,
 // pin or forbidden_field). Some provider parsers bind keys case-insensitively (Go's encoding/json,
 // Jackson with ACCEPT_CASE_INSENSITIVE_PROPERTIES), and such an alias could supply a credential or
 // override or bypass the checked field.
-// SPEC-DECISION: card placeholders are counted by kind, so "{{exp_year}}" and "{{exp_year:yy}}"
+// Card placeholders are counted by kind, so "{{exp_year}}" and "{{exp_year:yy}}"
 // together count as one card placeholder twice and are rejected.
 func (c *catalog) checkProxy(e *proxyEnvelope) (*proxyPlan, *policyError) {
 	if !tokenRe.MatchString(e.Token) {
@@ -2114,7 +2113,7 @@ func (c *catalog) checkProxy(e *proxyEnvelope) (*proxyPlan, *policyError) {
 
 	plan := &proxyPlan{acct: acct, prov: prov, ep: ep, path: e.Request.Path, headers: headers, body: []byte(e.Request.Body)}
 	body := plan.body
-	// SPEC-DECISION: a GET or HEAD request carries no body. D§5 is silent; a body there has no
+	// A GET or HEAD request carries no body: a body there has no
 	// defined meaning to the provider, so it is refused rather than sent or dropped.
 	if (ep.method == http.MethodGet || ep.method == http.MethodHead) && len(body) != 0 {
 		return fail(msgBadBody, "body")
@@ -2165,7 +2164,7 @@ func (c *catalog) checkProxy(e *proxyEnvelope) (*proxyPlan, *policyError) {
 		}
 	}
 	if !cardKinds["pan"] {
-		return fail(msgPlaceholder, "placeholder") // no card in the request: see the {{pan}} SPEC-DECISION above
+		return fail(msgPlaceholder, "placeholder") // no card in the request: see the {{pan}} rule above
 	}
 	plan.occs = occs
 	plan.usesCVV, plan.usesName = cardKinds["cvv"], cardKinds["name"]
@@ -2189,7 +2188,7 @@ func (c *catalog) checkProxy(e *proxyEnvelope) (*proxyPlan, *policyError) {
 		}
 	}
 
-	// SPEC-DECISION: in a form body, a forbidden field "addr" also forbids every key starting with
+	// In a form body, a forbidden field "addr" also forbids every key starting with
 	// addr+"[" under any case ("customer[", "customer[]", "customer[x]", "Customer[x]"): many form
 	// parsers (Stripe, Rack, PHP) nest those under the same field, so they would set it while avoiding
 	// the exact key. (validFormKey already refuses "customer[" as malformed; ">=" covers it here too.)
@@ -2211,7 +2210,7 @@ func (c *catalog) checkProxy(e *proxyEnvelope) (*proxyPlan, *policyError) {
 	// A signer input holding "{{" is a placeholder occurrence (scanBody lets no other "{{" through),
 	// and signers never take placeholder values. A case-variant alias of an input could make the
 	// provider sign or read a different value than the vault signed, so it is refused too.
-	// SPEC-DECISION: a signer name this switch does not know fails closed (parseCatEndpoint already
+	// A signer name this switch does not know fails closed (parseCatEndpoint already
 	// refuses one; this keeps the two in step if a signer is ever added to one and not the other).
 	switch ep.signer {
 	case "":
@@ -2232,7 +2231,7 @@ func (c *catalog) checkProxy(e *proxyEnvelope) (*proxyPlan, *policyError) {
 // matchEndpoint returns the one endpoint of prov whose method and path match, with the query (if
 // any) allowed by that endpoint, or nil. The path must start with "/" and contain no "%", "//" or
 // "..". Literal segments compare exactly; a "{name}" segment matches proxyWildcardRe.
-// SPEC-DECISION: a "?" with an empty query is rejected, as on the vault's own listeners.
+// A "?" with an empty query is rejected, as on the vault's own listeners.
 func matchEndpoint(prov *catProvider, method, reqPath string) *catEndpoint {
 	p, query, hasQuery := strings.Cut(reqPath, "?")
 	if !strings.HasPrefix(p, "/") || strings.Contains(p, "%") || strings.Contains(p, "//") || strings.Contains(p, "..") {
@@ -2275,7 +2274,7 @@ func proxyPathMatch(rule, segs []string) bool {
 
 // validProxyQuery reports whether the raw query q is allowed by ep: parsed like a strict form body
 // (formFields), every key listed in ep.query, and no decoded value containing "{{".
-// SPEC-DECISION: stricter than D§5.2. The raw query may only hold [A-Za-z0-9._~%+=&[]-] (anything
+// Stricter still: the raw query may only hold [A-Za-z0-9._~%+=&[]-] (anything
 // else percent-encoded), so no '#', '?', ';' or space reaches the URL builder, and a decoded value
 // may not hold control characters (U+0000-U+001F, U+007F).
 func validProxyQuery(ep *catEndpoint, q string) bool {
@@ -2301,7 +2300,7 @@ func validProxyQuery(ep *catEndpoint, q string) bool {
 	return true
 }
 
-// checkProxyHeaders checks the platform's headers against ep and the global allowlist (D§5.5).
+// checkProxyHeaders checks the platform's headers against ep and the global allowlist.
 // Names are canonicalized and must be unique after that. A header named by one of ep's templates
 // must equal the template exactly (placeholders unrendered) and is dropped, since the vault always
 // renders and sets every template header itself. Any other header must be allowlisted with a value
@@ -2362,12 +2361,11 @@ func bodyAddrs(format string, body []byte) ([]string, error) {
 
 // ---------------------------------------------------------------------------
 // Rendering the provider request: placeholders, header templates, signers, account URL
-// (D§5.2, D§5.3, D§5.5-5.7)
 // ---------------------------------------------------------------------------
 
 var errRender = errors.New("render failed")
 
-// signPayU is the payu signer (D§5.7): hex(hash(apiKey~merchantId~referenceCode~TX_VALUE.value~
+// signPayU is the payu signer: hex(hash(apiKey~merchantId~referenceCode~TX_VALUE.value~
 // TX_VALUE.currency)), where hash is the account value "hash" (md5, sha1 or sha256), apiKey the
 // account secret and merchantId the account value. The three body fields (payuSignerInputs) are read
 // with readField and used exactly as written: a JSON string decoded, a JSON number as its raw text
@@ -2403,12 +2401,12 @@ func signPayU(p *proxyPlan) (string, error) {
 	return "", errRender
 }
 
-// accountURL is the egress invariant (§6.4 step 6, D§5.2) for an account: it builds
+// accountURL is the egress invariant for an account: it builds
 // https://<a.host><a.basePath><path>, where path is the validated request path with its "?query",
 // if any. It returns errEgress unless the scheme is https and the host is exactly a.host, both on the
 // constructed URL and on a reparse of its string form (what the transport actually dials), and the
 // reparse keeps the path and query unchanged and gains no userinfo or fragment.
-// SPEC-DECISION: also refused: an account without a host, or whose base path is neither "" nor
+// Also refused: an account without a host, or whose base path is neither "" nor
 // "/..." without a trailing "/"; a path not starting with "/"; any byte of path outside printable
 // non-space ASCII, or a "#"; a "?" with an empty query; and, in the path part (base path included),
 // any "%" or a "." or ".." segment. checkProxy (matchEndpoint) already refuses those request paths;
@@ -2452,10 +2450,10 @@ func accountURL(a *catAccount, path string) (*url.URL, error) {
 }
 
 // renderRequest builds the outgoing provider request from a checked plan, the decrypted card and
-// the CVV ("" if none) (D§5.3-5.7):
+// the CVV ("" if none):
 //   - every occurrence span is replaced by its value encoded for the provider's format
 //     (encodeValue), and no other body byte changes; the result is left in p.sent, which the caller
-//     zeroes after the response has been read (best effort, §8.5). A body left in p.sent by an
+//     zeroes after the response has been read (best effort). A body left in p.sent by an
 //     earlier render of the same plan is zeroed first, so p.sent is nil after a failed render;
 //   - every header template of the endpoint is rendered ({{secret:N}}, {{basic:N}} =
 //     base64(secret + ":"), {{signature}}) and set, whether or not the platform sent it;
@@ -2465,7 +2463,7 @@ func accountURL(a *catAccount, path string) (*url.URL, error) {
 //     requests gzip itself and decompresses transparently, so maskPAN always sees plain bytes.
 //
 // Card data and secrets go only into the occurrence spans and the header templates.
-// SPEC-DECISION: it re-checks what it relies on and fails closed (errRender, or errEgress from
+// It re-checks what it relies on and fails closed (errRender, or errEgress from
 // accountURL, with no request and p.sent unset) on: an occurrence that is not, at its recorded span,
 // exactly the placeholder of its rule position, or spans out of order; a cvv or name placeholder
 // with no value; a card expiry that is not MM and YYYY; a missing secret, or one that is not
@@ -2607,11 +2605,11 @@ func renderRequest(ctx context.Context, p *proxyPlan, c card, cvv string) (*http
 }
 
 // ---------------------------------------------------------------------------
-// Internal API: POST /proxy and GET /healthz (SPEC §3.2, §6, §9.3, §10.1)
+// Internal API: POST /proxy and GET /healthz
 // ---------------------------------------------------------------------------
 
 const (
-	maxInternalBody = 64 << 10 // §6.2, D§5.2: 64 KiB request body limit
+	maxInternalBody = 64 << 10 // 64 KiB request body limit
 	healthzTimeout  = 2 * time.Second
 )
 
@@ -2624,7 +2622,7 @@ var (
 
 // internalHandler is the complete handler for the internal listener: /proxy (POST) and /healthz
 // (GET). Checks run client certificate (401) → path (404) → method (405) → query (400).
-// SPEC-DECISION: the client certificate is checked first, so a caller without one (impossible
+// The client certificate is checked first, so a caller without one (impossible
 // behind RequireAndVerifyClientCert; this is defence in depth) learns nothing about routing. A
 // certificate with no usable serial (callerSerial == "") counts as no certificate.
 func (v *vault) internalHandler() http.Handler {
@@ -2641,7 +2639,7 @@ func (v *vault) internalHandler() http.Handler {
 		case "/healthz":
 			method, h = http.MethodGet, v.handleHealthz
 		}
-		// SPEC-DECISION: as on /tokenize, a percent-encoded spelling of a route is 404.
+		// As on /tokenize, a percent-encoded spelling of a route is 404.
 		if h == nil || r.URL.RawPath != "" {
 			writeError(w, http.StatusNotFound, msgNotFound)
 			return
@@ -2659,7 +2657,7 @@ func (v *vault) internalHandler() http.Handler {
 	}))
 }
 
-// handleProxy implements POST /proxy (§3.2, D§4, D§5). Routing, method, query and client
+// handleProxy implements POST /proxy. Routing, method, query and client
 // certificate were checked by internalHandler. The steps run in a fixed order and each failing step
 // returns immediately; error bodies use only the msg* constants:
 //
@@ -2667,7 +2665,7 @@ func (v *vault) internalHandler() http.Handler {
 //  2. Strict decode into proxyEnvelope: jsonStrict, one object, no unknown, case-variant or duplicate
 //     keys at the top level or in "request".
 //  3. checkProxy (no network, no database). A policy rejection raises ALERT proxy_policy.
-//  4. get_card (velocity and audit, §6.4 step 3).
+//  4. get_card (velocity and audit).
 //  5. Decrypt.
 //  6. {{name}} with a card stored without a name: 409.
 //  7. {{cvv}}: the CVV is taken here, after every other check, and none cached is 409.
@@ -2676,7 +2674,7 @@ func (v *vault) internalHandler() http.Handler {
 //  10. Respond with the provider's status, Content-Type and masked body.
 //
 // Nothing from the request or the provider response is logged; the only log lines are ALERTs with
-// fixed reasons, tokens, serials and catalog names (§10.1, D§5.11).
+// fixed reasons, tokens, serials and catalog names.
 func (v *vault) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if !jsonContentType(r.Header) {
 		writeError(w, http.StatusBadRequest, msgContentType)
@@ -2693,7 +2691,7 @@ func (v *vault) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Strict decode.
-	// SPEC-DECISION: as on /tokenize, encoding/json's case-insensitive key matching is closed off:
+	// As on /tokenize, encoding/json's case-insensitive key matching is closed off:
 	// the top-level keys and the keys of "request" must be spelled exactly ({"Account":…} and
 	// {"Method":…} are unknown fields), and "request" must be an object. jsonStrict already refuses
 	// duplicate keys at any depth (so a repeated header name), invalid UTF-8 and trailing data.
@@ -2721,7 +2719,7 @@ func (v *vault) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// SPEC-DECISION: the alert names the account as the catalog spells it, never as the request
+	// The alert names the account as the catalog spells it, never as the request
 	// does. checkProxy only sets a reason once the account is known, so the "-" fallback is defence
 	// in depth.
 	plan, perr := v.catalog.checkProxy(&env)
@@ -2738,7 +2736,7 @@ func (v *vault) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	account, endpoint := plan.acct.name, plan.ep.id
 
-	// §6.4 step 3. The caller serial is passed for the database audit trail (§10.2).
+	// 4. get_card. The caller serial is passed for the database audit trail.
 	ctx := r.Context()
 	ciphertext, keyVersion, err := v.getCard(ctx, env.Token, callerSerial(r))
 	switch {
@@ -2755,22 +2753,22 @@ func (v *vault) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// §6.4 step 4.
-	// SPEC-DECISION: authentic plaintext that is not a card record is reported as decrypt_failed
+	// 5. Decrypt.
+	// Authentic plaintext that is not a card record is reported as decrypt_failed
 	// as well: it can only mean key or data corruption.
 	var c card
 	plaintext, err := unseal(v.deks[keyVersion], ciphertext) // a missing DEK (nil) fails unseal
 	if err == nil {
 		err = json.Unmarshal(plaintext, &c)
 	}
-	zero(plaintext) // best effort (§8.5)
+	zero(plaintext) // best effort
 	if err != nil {
 		v.logf("ALERT decrypt_failed token=%s key_version=%d account=%s", env.Token, keyVersion, account)
 		writeError(w, http.StatusInternalServerError, msgInternal)
 		return
 	}
 
-	// D§5.8, D§5.9. The name is checked first so that a name-unavailable request leaves the
+	// 6–7. The name is checked first so that a name-unavailable request leaves the
 	// single-use CVV cached; the CVV is taken last, once nothing but rendering and sending is left.
 	// The vault never edits the body to drop a field: the platform resends without it.
 	if plan.usesName && c.Name == "" {
@@ -2785,10 +2783,10 @@ func (v *vault) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// §6.4 steps 5–7. renderRequest builds the whole outgoing request: account URL (egress
+	// 8. renderRequest builds the whole outgoing request: account URL (egress
 	// invariant), substituted body, the endpoint's credential headers, the allowlisted platform
 	// headers, Content-Type and User-Agent. No inbound HTTP header of this request is used.
-	// SPEC-DECISION: a render failure after the CVV was taken loses the CVV (single use, never put
+	// A render failure after the CVV was taken loses the CVV (single use, never put
 	// back); it can only follow a catalog or boot defect, never platform input.
 	out, err := renderRequest(ctx, plan, c, cvv)
 	if err != nil {
@@ -2798,16 +2796,16 @@ func (v *vault) handleProxy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, msgInternal)
 		return
 	}
-	defer zero(plan.sent) // best effort (§8.5); after the response has been read
+	defer zero(plan.sent) // best effort; after the response has been read
 
-	// §6.4 steps 8–9. Transport errors are never logged or returned (they name hosts and causes).
+	// 9. Send and read. Transport errors are never logged or returned (they name hosts and causes).
 	resp, err := v.client.Do(out)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, msgProvider)
 		return
 	}
 	defer resp.Body.Close()
-	// SPEC-DECISION: a Content-Encoding still present means the transport did not decode the
+	// A Content-Encoding still present means the transport did not decode the
 	// body; maskPAN cannot see a PAN inside compressed bytes, so the response is refused (502).
 	for _, ce := range resp.Header.Values("Content-Encoding") {
 		if ce != "" {
@@ -2818,7 +2816,7 @@ func (v *vault) handleProxy(w http.ResponseWriter, r *http.Request) {
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxProviderResponse+1))
 	defer zero(respBody) // best effort; runs after the masked copy has been written
 	if err != nil || len(respBody) > maxProviderResponse {
-		// Never a truncated (and so possibly partially masked) body (globals decision 6).
+		// Never a truncated (and so possibly partially masked) body.
 		writeError(w, http.StatusBadGateway, msgProvider)
 		return
 	}
@@ -2827,7 +2825,7 @@ func (v *vault) handleProxy(w http.ResponseWriter, r *http.Request) {
 		v.logf("ALERT pan_echo account=%s endpoint=%s token=%s", account, endpoint, env.Token)
 	}
 
-	// §6.4 step 10: status, Content-Type and the scrubbed body; no other provider header.
+	// 10. Status, Content-Type and the scrubbed body; no other provider header.
 	h := w.Header()
 	if ct := resp.Header.Get("Content-Type"); ct != "" {
 		h.Set("Content-Type", ct)
@@ -2840,7 +2838,7 @@ func (v *vault) handleProxy(w http.ResponseWriter, r *http.Request) {
 	w.Write(masked)
 }
 
-// handleHealthz implements GET /healthz (§6.5): 200 {"status":"ok"} if the database answers a
+// handleHealthz implements GET /healthz: 200 {"status":"ok"} if the database answers a
 // ping within 2 seconds, else 503 {"error":"unavailable"}. The ping error is never revealed.
 func (v *vault) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), healthzTimeout)
@@ -2855,7 +2853,7 @@ func (v *vault) handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
-// Database access (SPEC §7). Go calls only the four SECURITY DEFINER functions; it never names a
+// Database access. Go calls only the four SECURITY DEFINER functions; it never names a
 // table. Every call is a single autocommit statement, so get_card's audit row commits with it.
 // ---------------------------------------------------------------------------
 
@@ -2880,7 +2878,7 @@ func dbPutCard(ctx context.Context, db *sql.DB, token string, ciphertext []byte,
 }
 
 // dbGetCard fetches a card via vault.get_card, which enforces the velocity limits and writes the
-// 'get' audit row (§6.4 step 3): SQLSTATE P0001 → errVelocity; no row → errUnknownToken.
+// 'get' audit row: SQLSTATE P0001 → errVelocity; no row → errUnknownToken.
 func dbGetCard(ctx context.Context, db *sql.DB, token, caller string) ([]byte, int, error) {
 	var ciphertext []byte
 	var keyVersion int
@@ -2932,10 +2930,9 @@ func dbAddDEK(ctx context.Context, db *sql.DB, wrapped []byte) (int, error) {
 
 // ---------------------------------------------------------------------------
 // Boot: configuration, GCP REST access, DEKs, secrets, rotation, listeners, shutdown
-// (SPEC §5.1, §6.1, §8.2–§8.6, §10.1, §11)
 // ---------------------------------------------------------------------------
 
-// config is the parsed environment (§11). Secret values held here (dev mode only) are never logged.
+// config is the parsed environment. Secret values held here (dev mode only) are never logged.
 type config struct {
 	env, publicAddr, internalAddr, certFile, keyFile, clientCAFile, allowOrigin, dbURL string
 	kmsKey, hmacSecretName                                                             string
@@ -2946,7 +2943,7 @@ type config struct {
 // secrets have one dev variable each (devSecretVar), refused in prod by devVarSet's prefix check.
 var devVars = []string{"VAULT_DEV_DEK_HEX", "VAULT_DEV_SESSION_HMAC_HEX"}
 
-// SPEC-DECISION: KMS key and Secret Manager names must have exactly the documented shape, with
+// KMS key and Secret Manager names must have exactly the documented shape, with
 // segments of [A-Za-z0-9_-] only. They are concatenated into request URLs, so "..", "?", "#",
 // ":" or an extra "/versions/N" could otherwise redirect the call to another resource. (Domain-
 // scoped project IDs like "example.com:p" are therefore not supported.)
@@ -2955,9 +2952,9 @@ var (
 	secretNameRe = regexp.MustCompile(`^projects/[A-Za-z0-9_-]+/secrets/[A-Za-z0-9_-]+$`)
 )
 
-// loadConfig parses the environment (§11). Errors name the variable, never its value.
+// loadConfig parses the environment. Errors name the variable, never its value.
 // rotate selects -rotate-dek mode, which needs only VAULT_ENV, VAULT_DB_URL and VAULT_KMS_KEY.
-// SPEC-DECISION: an empty variable counts as unset. With VAULT_ENV=prod each VAULT_DEV_* variable
+// An empty variable counts as unset. With VAULT_ENV=prod each VAULT_DEV_* variable
 // refuses boot (main additionally refuses any other VAULT_DEV_* name, see devVarSet), in rotate
 // mode too.
 func loadConfig(getenv func(string) string, rotate bool) (config, error) {
@@ -3068,7 +3065,7 @@ func decodeKey64(s string) ([]byte, bool) {
 
 // validOrigin reports whether s is exactly a serialized origin: scheme://host[:port] with no
 // userinfo, path, query or fragment, in canonical form (lowercase scheme and host).
-// SPEC-DECISION: the browser's Origin header is compared byte-for-byte (§5.3), so a value that
+// The browser's Origin header is compared byte-for-byte, so a value that
 // could never match one (trailing slash, uppercase host, "*") refuses boot; prod requires https.
 // The same goes for a port a browser never serializes: the scheme's default (https :443, http
 // :80, which browsers omit), an empty port ("host:"), a leading zero, or one outside 1–65535.
@@ -3091,7 +3088,7 @@ func validOrigin(s string, requireHTTPS bool) bool {
 	return u.Scheme == "https" || (!requireHTTPS && u.Scheme == "http")
 }
 
-// Google endpoints (§8.3, §8.6). Variables only so tests can point them at fakes.
+// Google endpoints. Variables only so tests can point them at fakes.
 var (
 	metadataTokenURL     = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
 	kmsBaseURL           = "https://cloudkms.googleapis.com/v1/"
@@ -3122,7 +3119,7 @@ func gcpCall(c *http.Client, req *http.Request, requireFlavor bool, out any) err
 		return errors.New("response is not from the metadata server")
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxGCPResponse+1))
-	defer zero(body) // may hold secret material; best effort (§8.5)
+	defer zero(body) // may hold secret material; best effort
 	if err != nil {
 		return errors.New("reading response failed")
 	}
@@ -3135,7 +3132,7 @@ func gcpCall(c *http.Client, req *http.Request, requireFlavor bool, out any) err
 	return nil
 }
 
-// tokenSource fetches the service account's access token from the metadata server (§8.3 step 1)
+// tokenSource fetches the service account's access token from the metadata server
 // and caches it until 60s before it expires.
 type tokenSource struct {
 	client *http.Client
@@ -3145,7 +3142,7 @@ type tokenSource struct {
 }
 
 // token returns a cached or freshly fetched access token.
-// SPEC-DECISION: the token must be 1–4096 printable non-space ASCII chars (it goes into an
+// The token must be 1–4096 printable non-space ASCII chars (it goes into an
 // Authorization header and a DB password) and expires_in must be positive.
 func (ts *tokenSource) token(ctx context.Context) (string, error) {
 	if ts == nil {
@@ -3187,7 +3184,7 @@ type kmsResponse struct {
 	Ciphertext string `json:"ciphertext"`
 }
 
-// kmsPost calls POST {kmsBaseURL}{key}:{verb} with {field: base64(data)} (§8.3 step 2).
+// kmsPost calls POST {kmsBaseURL}{key}:{verb} with {field: base64(data)}.
 func kmsPost(ctx context.Context, c *http.Client, ts *tokenSource, key, verb, field string, data []byte) (kmsResponse, error) {
 	var out kmsResponse
 	if !kmsKeyRe.MatchString(key) {
@@ -3198,7 +3195,7 @@ func kmsPost(ctx context.Context, c *http.Client, ts *tokenSource, key, verb, fi
 		return out, err
 	}
 	// The encrypt body carries the plaintext DEK. The base64 string cannot be zeroed; the
-	// marshalled body is zeroed best effort (§8.5).
+	// marshalled body is zeroed best effort.
 	body, err := json.Marshal(map[string]string{field: base64.StdEncoding.EncodeToString(data)})
 	defer zero(body)
 	if err != nil {
@@ -3245,9 +3242,9 @@ func kmsEncrypt(ctx context.Context, c *http.Client, ts *tokenSource, key string
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
-// accessSecret reads the latest version of a Secret Manager secret (§8.6):
+// accessSecret reads the latest version of a Secret Manager secret:
 // GET {secretManagerBaseURL}{name}/versions/latest:access → payload.data (base64).
-// SPEC-DECISION: when the response carries payload.dataCrc32c it must match the data.
+// When the response carries payload.dataCrc32c it must match the data.
 func accessSecret(ctx context.Context, c *http.Client, ts *tokenSource, name string) ([]byte, error) {
 	if !secretNameRe.MatchString(name) {
 		return nil, errors.New("secret manager: invalid secret name")
@@ -3286,17 +3283,17 @@ func accessSecret(ctx context.Context, c *http.Client, ts *tokenSource, name str
 
 // openDB opens the pool (it connects lazily). dev uses VAULT_DB_URL as is; prod authenticates
 // with Cloud SQL IAM: before every new connection the password is set to a fresh metadata
-// access token (globals decision 8). The pool is capped at 16 open connections in both modes
-// (user decision 2026-10-30, §7 notes). Errors never contain the URL (it can hold credentials).
-// SPEC-DECISION: in prod every connection path must use TLS with server certificate
+// access token. The pool is capped at 16 open connections in both modes.
+// Errors never contain the URL (it can hold credentials).
+// In prod every connection path must use TLS with server certificate
 // verification (sslmode=verify-ca or verify-full, or require with sslrootcert): the password is
 // an OAuth token that also authorizes KMS decrypt, so it must not be sent in clear text or to an
 // unverified server. sslmode=prefer/allow/require-without-root-cert/disable refuse boot.
 //
-// SPEC-DECISION: §14 forbids configuration from files, and pgx reads pg_service.conf when the
+// Configuration never comes from files, and pgx reads pg_service.conf when the
 // URL sets service/servicefile and a password file when it sets passfile, during ParseConfig.
 // Those keys (any letter case, percent-encoded or not) refuse boot before pgx sees the URL. To
-// make that check complete, VAULT_DB_URL must be the URL form (§11 "Postgres URL"): the
+// make that check complete, VAULT_DB_URL must be the URL form: the
 // keyword/value form ("host=… dbname=…") is refused, as is a query string that does not parse
 // strictly (pgx would silently drop such pairs). Accepted residue: pgx's PG* environment
 // fallbacks (PGHOST, PGSERVICE, …; the deployment sets none), and its default ~/.pgpass lookup
@@ -3356,10 +3353,10 @@ func openDB(cfg config, ts *tokenSource) (*sql.DB, error) {
 	return db, nil
 }
 
-// errNoDEKs is the §8.3 step 4 boot failure.
+// errNoDEKs is the boot failure when the database holds no DEK.
 var errNoDEKs = errors.New("no DEKs found; run vault -rotate-dek first")
 
-// loadDEKs returns every DEK by version and the current (highest) version (§8.3). In dev with
+// loadDEKs returns every DEK by version and the current (highest) version. In dev with
 // VAULT_DEV_DEK_HEX the dev DEK is version 1 and neither the database nor KMS is used.
 // Otherwise every vault.list_deks() row is unwrapped via KMS; any failure fails the whole load.
 func loadDEKs(ctx context.Context, cfg config, db *sql.DB, c *http.Client, ts *tokenSource) (map[int][]byte, int, error) {
@@ -3413,7 +3410,7 @@ func dekVersions(deks map[int][]byte) string {
 }
 
 // validSecretValue reports whether s is a non-empty run of printable, non-space ASCII.
-// SPEC-DECISION: stricter than "no whitespace or control chars": provider keys are ASCII and go
+// Stricter than "no whitespace or control chars": provider keys are ASCII and go
 // into an HTTP header, so any non-ASCII byte refuses boot too.
 func validSecretValue(s string) bool {
 	if s == "" {
@@ -3427,7 +3424,7 @@ func validSecretValue(s string) bool {
 	return true
 }
 
-// loadSecrets returns the session HMAC key (32 bytes) (§8.6): from VAULT_DEV_SESSION_HMAC_HEX in
+// loadSecrets returns the session HMAC key (32 bytes): from VAULT_DEV_SESSION_HMAC_HEX in
 // dev when set, otherwise from Secret Manager. The payload must be exactly 64 hex chars. Errors
 // name the variable, never the value. Provider account secrets are loadAccountSecrets'.
 func loadSecrets(ctx context.Context, cfg config, c *http.Client, ts *tokenSource) (hmacKey []byte, err error) {
@@ -3456,7 +3453,7 @@ func loadSecrets(ctx context.Context, cfg config, c *http.Client, ts *tokenSourc
 }
 
 // devSecretVar is the dev variable of an account secret: VAULT_DEV_SECRET_<ACCOUNT>_<NAME>,
-// uppercased, with every character outside [A-Z0-9] replaced by "_" (globals decision 3).
+// uppercased, with every character outside [A-Z0-9] replaced by "_".
 // parseCatalog refuses a catalog in which two account secrets share one.
 func devSecretVar(account, name string) string {
 	b := []byte(strings.ToUpper("VAULT_DEV_SECRET_" + account + "_" + name))
@@ -3468,12 +3465,12 @@ func devSecretVar(account, name string) string {
 	return string(b)
 }
 
-// checkDevSecretVars runs before the database is touched (§11 "parse env, fail fast"). In dev,
+// checkDevSecretVars runs before the database is touched, so a bad environment fails fast. In dev,
 // every VAULT_DEV_* variable in environ (os.Environ form) must be one of devVars or the dev variable
 // of a secret of a loaded account, and an account secret variable that is set must be a valid
 // secret. In prod it does nothing: main refuses any VAULT_DEV_* there (devVarSet). Errors name the
 // variable, account and secret name, never the value.
-// SPEC-DECISION: an unknown VAULT_DEV_* name refuses a dev boot, even when empty. A misspelt
+// An unknown VAULT_DEV_* name refuses a dev boot, even when empty. A misspelt
 // account secret variable (or the removed VAULT_DEV_STRIPE_SECRET) would otherwise be ignored and
 // the secret silently taken from Secret Manager, or reported missing only after the DEKs load.
 func checkDevSecretVars(cat *catalog, env string, environ []string) error {
@@ -3510,7 +3507,7 @@ func checkDevSecretVars(cat *catalog, env string, environ []string) error {
 // from the secret's dev variable (devSecretVar) when set, otherwise from Secret Manager by the
 // catalog's resource name; prod never reads a dev variable. Every value must pass
 // validSecretValue. Errors name the account and secret name, never the value or the resource.
-// SPEC-DECISION: all or nothing. Every secret of every loaded account must load or boot fails, and
+// All or nothing. Every secret of every loaded account must load or boot fails, and
 // on failure no account is given any secret. renderRequest's missing-secret path (which would
 // already have consumed the CVV) is therefore unreachable in a booted vault.
 func loadAccountSecrets(ctx context.Context, cat *catalog, cfg config, getenv func(string) string, c *http.Client, ts *tokenSource) error {
@@ -3555,8 +3552,8 @@ func loadAccountSecrets(ctx context.Context, cat *catalog, cfg config, getenv fu
 }
 
 // rotateDEK generates a 32-byte DEK, wraps it via KMS encrypt, checks that KMS decrypt returns it,
-// stores it via vault.add_dek and returns the new version (§8.4).
-// SPEC-DECISION: the unwrap check runs before anything is stored, so a wrapped value that boot
+// stores it via vault.add_dek and returns the new version.
+// The unwrap check runs before anything is stored, so a wrapped value that boot
 // could not unwrap (which would make every later boot fail) never reaches the database.
 func rotateDEK(ctx context.Context, cfg config, db *sql.DB, c *http.Client, ts *tokenSource) (int, error) {
 	if cfg.kmsKey == "" {
@@ -3581,9 +3578,9 @@ func rotateDEK(ctx context.Context, cfg config, db *sql.DB, c *http.Client, ts *
 	return dbAddDEK(ctx, db, wrapped)
 }
 
-// loadClientCA reads the mTLS client CA (§6.1): the file must contain exactly one PEM block, of
+// loadClientCA reads the mTLS client CA: the file must contain exactly one PEM block, of
 // type CERTIFICATE, holding a CA certificate.
-// SPEC-DECISION: any second PEM block (another certificate, a private key) refuses boot, as does
+// Any second PEM block (another certificate, a private key) refuses boot, as does
 // a certificate without basicConstraints CA:TRUE.
 func loadClientCA(path string) (*x509.CertPool, error) {
 	b, err := os.ReadFile(path)
@@ -3642,8 +3639,8 @@ func newVault(cfg config, db *sql.DB, deks map[int][]byte, current int, hmacKey 
 	}
 }
 
-// newServers builds both listeners (§5.1, §6.1). net/http's own error lines are discarded
-// (globals decision 5): they are neither boot nor ALERT lines and can quote client input.
+// newServers builds both listeners. net/http's own error lines are discarded:
+// they are neither boot nor ALERT lines and can quote client input.
 func newServers(v *vault, cfg config, cert tls.Certificate, clientCAs *x509.CertPool) (public, internal *http.Server) {
 	public = &http.Server{
 		Addr:              cfg.publicAddr,
@@ -3681,7 +3678,7 @@ const (
 	shutdownTimeout = 20 * time.Second
 )
 
-// main runs the boot sequence of §11, or -rotate-dek (§8.4). Every log line goes through logf;
+// main runs the boot sequence, or -rotate-dek. Every log line goes through logf;
 // failures log "boot failed: <reason>" with reasons built only from variable names, fixed
 // phrases, status codes and SQLSTATEs, and exit 1.
 func main() {
@@ -3705,7 +3702,7 @@ func main() {
 	boot.logf("config loaded env=%s", cfg.env)
 
 	// 1b. Serve mode: load the certificate, key and client CA now, before the database, KMS or
-	// Secret Manager is touched (§11 "fail fast"), so a bad file costs no network round trip and
+	// Secret Manager is touched, so a bad file costs no network round trip and
 	// never boots half way. -rotate-dek has no listeners and never reads them.
 	var cert tls.Certificate
 	var clientCAs *x509.CertPool
@@ -3754,7 +3751,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	// SPEC-DECISION: the ping error is not logged: pgx connect errors name the host, user and
+	// The ping error is not logged: pgx connect errors name the host, user and
 	// database from VAULT_DB_URL.
 	ctx, cancel := context.WithTimeout(context.Background(), bootDBTimeout)
 	err = db.PingContext(ctx)
@@ -3797,7 +3794,7 @@ func main() {
 	v := newVault(cfg, db, deks, current, hmacKey, cat, client, logger)
 
 	// 6. Start both listeners (certificate and client CA were loaded in step 1b).
-	// SPEC-DECISION: each socket is bound with net.Listen before serving (ServeTLS("", "") is what
+	// Each socket is bound with net.Listen before serving (ServeTLS("", "") is what
 	// ListenAndServeTLS("", "") does after binding), so a bind failure exits 1 before "ready".
 	public, internal := newServers(v, cfg, cert, clientCAs)
 	pubLn, err := net.Listen("tcp", cfg.publicAddr)
@@ -3828,7 +3825,7 @@ func main() {
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
 	select {
 	case <-sig:
-		// Stop accepting and drain both listeners concurrently within one 20s budget (§11).
+		// Stop accepting and drain both listeners concurrently within one 20s budget.
 		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		var wg sync.WaitGroup
 		for _, srv := range []*http.Server{public, internal} {

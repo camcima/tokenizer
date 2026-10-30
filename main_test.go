@@ -326,7 +326,7 @@ func TestSealRejectsNonAES256Key(t *testing.T) {
 }
 
 // The sealed plaintext is exactly json.Marshal(card{PAN, ExpMonth, ExpYear}) with these keys
-// and no CVV (§8.1); it must round-trip through seal/unseal.
+// and no CVV; it must round-trip through seal/unseal.
 func TestCardJSONSealRoundTrip(t *testing.T) {
 	c := card{PAN: "4242424242424242", ExpMonth: "12", ExpYear: "2030"}
 	pt, err := json.Marshal(c)
@@ -424,7 +424,7 @@ type fakeStore struct {
 	velocity   bool
 	putErr     error  // when set, putCard returns it and stores nothing
 	getErr     error  // when set (and velocity is not), getCard returns it
-	lastCaller string // caller passed to the most recent getCard (the audit identity, §6.4 step 1)
+	lastCaller string // caller passed to the most recent getCard (the audit identity)
 	gets       int    // number of getCard calls (each one is an audit and velocity row in the real store)
 }
 
@@ -490,7 +490,7 @@ func newTestVault(t *testing.T) (*vault, *fakeStore) {
 	return v, s
 }
 
-// mintSession builds a session token exactly as the platform does (§5.4).
+// mintSession builds a session token exactly as the platform does.
 func mintSession(key []byte, exp time.Time) string {
 	msg := "v1." + strconv.FormatInt(exp.Unix(), 10)
 	m := hmac.New(sha256.New, key)
@@ -524,7 +524,7 @@ func (c *fakeClock) advance(d time.Duration) {
 	c.t = c.t.Add(d)
 }
 
-// TestMain runs every test, then scans everything the test vaults logged (§13.1 log leak test).
+// TestMain runs every test, then scans everything the test vaults logged (the log leak test).
 // The scan checks the log as written and a copy with space/hyphen runs between digits removed
 // (so "4242 4242 4242 4242" is caught), and within every maximal digit run it tests every window
 // of length 13–19 (so a PAN embedded in a longer digit run is caught). Only offsets are printed.
@@ -629,7 +629,7 @@ func TestLeakScanner(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Session tokens (§5.4) and the session_token_invalid alert (§10.1)
+// Session tokens and the session_token_invalid alert
 // ---------------------------------------------------------------------------
 
 // upperMAC uppercases the third (HMAC) part of a "Bearer v1.<exp>.<mac>" header.
@@ -751,7 +751,7 @@ func TestSessionAlertRateLimited(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// CVV cache (§8.5)
+// CVV cache
 // ---------------------------------------------------------------------------
 
 func TestCVVSingleUse(t *testing.T) {
@@ -785,7 +785,7 @@ func TestCVVExpiry(t *testing.T) {
 		t.Fatal("CVV returned after its TTL")
 	}
 
-	// SPEC-DECISION (tested): an entry is expired at exactly put+TTL.
+	// An entry is expired at exactly put+TTL.
 	c.put("tok_c", testCVV)
 	clk.advance(15 * time.Minute)
 	if c.take("tok_c") != "" {
@@ -837,7 +837,7 @@ func TestCVVConcurrentTake(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// guard, access log, error bodies (§5.7, §10.1)
+// guard, access log, error bodies
 // ---------------------------------------------------------------------------
 
 // serveGuard runs one request through v.guard and returns the recorder and the log delta.
@@ -999,7 +999,7 @@ func TestCallerSerial(t *testing.T) {
 	if got := callerSerial(withClientCert(httptest.NewRequest("POST", "/proxy", nil))); got != "0A1B2C" {
 		t.Errorf("got %q, want 0A1B2C", got)
 	}
-	// Byte-wise uppercase hex as `openssl x509 -serial` prints it (§10.1).
+	// Byte-wise uppercase hex as `openssl x509 -serial` prints it.
 	for _, c := range []struct {
 		serial *big.Int
 		want   string
@@ -1054,7 +1054,7 @@ func TestWriteError(t *testing.T) {
 	}
 }
 
-// Every error message is one of the fixed constants (§5.7) with its exact text.
+// Every error message is one of the fixed constants with its exact text.
 func TestErrorConstants(t *testing.T) {
 	want := map[string]string{
 		msgNotFound: "not found", msgMethod: "method not allowed", msgQuery: "query string not allowed",
@@ -1112,7 +1112,7 @@ func TestNewTestVaultStore(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// POST /tokenize and CORS (§5)
+// POST /tokenize and CORS
 // ---------------------------------------------------------------------------
 
 // omit, as a header value in tokCase, means "do not send this header at all".
@@ -1188,7 +1188,7 @@ func TestTokenize(t *testing.T) {
 	wrongKey := "Bearer " + mintSession(bytes.Repeat([]byte{0x43}, 32), testNow.Add(time.Minute))
 
 	cases := []tokCase{
-		// Success, including every passing variant of the §5.5 rules.
+		// Success, including every passing variant of the card validation rules.
 		{name: "good", wantStatus: 200},
 		{name: "no cvv", body: tokBody(map[string]any{"cvv": nil}), wantStatus: 200},
 		{name: "hyphen pan", body: tokBody(map[string]any{"pan": "4242-4242-4242-4242"}), wantStatus: 200},
@@ -1373,7 +1373,7 @@ func TestTokenize(t *testing.T) {
 	}
 }
 
-// A preflight never needs a session and gets exactly the §5.3 headers.
+// A preflight never needs a session and gets exactly the CORS preflight headers.
 func TestTokenizePreflight(t *testing.T) {
 	v, _ := newTestVault(t)
 	r := httptest.NewRequest("OPTIONS", "/tokenize", nil)
@@ -1559,7 +1559,7 @@ func TestTokenizeStoresDecryptableCard(t *testing.T) {
 	}
 }
 
-// An optional name is sealed with the card (D§5.8): the plaintext gains a "name" key only when
+// An optional name is sealed with the card: the plaintext gains a "name" key only when
 // one was sent, and the response never echoes it. Failure messages never print the name.
 func TestTokenizeStoresName(t *testing.T) {
 	const name = "JANE Q DOE"
@@ -1726,7 +1726,7 @@ func TestTokenizeDuplicateContentType(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Provider catalog, egress invariant, PAN masking, outbound client (§6.3, §6.4, §9)
+// Provider catalog, egress invariant, PAN masking, outbound client
 // ---------------------------------------------------------------------------
 
 func TestMaskPAN(t *testing.T) {
@@ -1816,7 +1816,7 @@ func TestOutboundClientConfig(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Placeholders and strict body scanners (D§5.3, D§5.4)
+// Placeholders and strict body scanners
 // ---------------------------------------------------------------------------
 
 func TestParsePlaceholder(t *testing.T) {
@@ -2283,7 +2283,7 @@ func TestSubstitute(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Provider catalog: catalog.json (D§5.1, D§5.5-5.7, D§5.10)
+// Provider catalog: catalog.json
 // ---------------------------------------------------------------------------
 
 // testCatalogHost is the host of every testCatalogJSON account. testCatalog replaces it (quoted, so
@@ -2292,12 +2292,12 @@ func TestSubstitute(t *testing.T) {
 const testCatalogHost = "upstream.test"
 
 // testCatalogJSON is the synthetic catalog the proxy tests run against. It models Stripe (form) and
-// the four first-wave json shapes of D§6: Adyen (account pin, forbid list, X-API-Key header),
+// the four first-wave json shapes: Adyen (account pin, forbid list, X-API-Key header),
 // Mercado Pago (single-use card token, :int expiry, Bearer), PayU (body credential, account and
 // literal pins, payu signer, yyyy/mm expiry) and Pagar.me (Basic auth, array positions). Every
 // provider has a dev account; adyen_br_live is the one prod account. Stripe's confirm_payment_intent
 // carries the wildcard path segment and the query key. Every endpoint is card_data with a {{pan}}
-// position: the catalog has no non-card endpoints (D§2, D§5.6). Endpoint and account entries
+// position: the catalog has no non-card endpoints. Endpoint and account entries
 // keep their identifying fields on one line so that tests can mutate them with a string replace.
 // Secret resources all start with "projects/", so a test can check that no error names one.
 const testCatalogJSON = `{
@@ -2755,8 +2755,8 @@ const (
 		`&card[name]={{name}}`
 )
 
-// embeddedFixtures holds at least one example request per endpoint of the embedded catalog
-// (D§7), keyed "provider/endpoint": each must pass checkProxy for the named dev account and match
+// embeddedFixtures holds at least one example request per endpoint of the embedded catalog,
+// keyed "provider/endpoint": each must pass checkProxy for the named dev account and match
 // that endpoint. TestEmbeddedCatalog fails for an endpoint without one, so every catalog change
 // adds its fixture here.
 var embeddedFixtures = map[string]*proxyEnvelope{
@@ -2771,7 +2771,7 @@ func TestEmbeddedCatalog(t *testing.T) {
 		}
 	}
 	c, _ := parseCatalog(catalogJSON, "dev")
-	// Stripe ships POST /v1/tokens only (D§6): a single-use tok_ hand-off. POST /v1/payment_methods
+	// Stripe ships POST /v1/tokens only: a single-use tok_ hand-off. POST /v1/payment_methods
 	// creates a reusable, attachable PaymentMethod, which is storage, so it is not in the catalog.
 	// customer (Connect: a token cloned from a customer's saved card) must be absent.
 	tk := catEndpointByID(t, c, "stripe", "tokens")
@@ -2831,7 +2831,7 @@ func TestEmbeddedCatalog(t *testing.T) {
 	}
 }
 
-// egress-hosts.<env>.txt are the files the infra repo's firewall check diffs against (§9.1, D§5.1):
+// egress-hosts.<env>.txt are the files the infra repo's firewall check diffs against:
 // each must list exactly its environment's catalog account hosts, without ports.
 func TestEgressHostsMatchCatalog(t *testing.T) {
 	for _, env := range []string{"dev", "prod"} {
@@ -2862,7 +2862,7 @@ func TestEgressHostsMatchCatalog(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// /proxy request policy: checkProxy (D§5.2-5.6, D§5.10, D§5.11)
+// /proxy request policy: checkProxy
 // ---------------------------------------------------------------------------
 
 const checkToken = "tok_0123456789abcdef0123456789abcdef"
@@ -3386,7 +3386,7 @@ func TestCheckProxyHardening(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Rendering, the PayU signer and account URLs (D§5.3, D§5.5-5.7)
+// Rendering, the PayU signer and account URLs
 // ---------------------------------------------------------------------------
 
 // renderCard is the decrypted card the render tests substitute.
@@ -3634,7 +3634,7 @@ func TestRenderHeaders(t *testing.T) {
 }
 
 // TestRenderZeroesPreviousSent: renderRequest zeroes the body left in p.sent by an earlier render of the same plan before it
-// renders again (best effort, §8.5), whether or not the new render succeeds.
+// renders again (best effort), whether or not the new render succeeds.
 func TestRenderZeroesPreviousSent(t *testing.T) {
 	c := renderCatalog(t)
 	p := renderPlan(t, c, validEnvelope("stripe"))
@@ -3835,7 +3835,7 @@ func TestAccountURLInvariant(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// POST /proxy and GET /healthz (§6, §9.3, §10.1, §13.1)
+// POST /proxy and GET /healthz
 // ---------------------------------------------------------------------------
 
 // fakeProvider is an httptest TLS server standing in for a provider. It records the last request
@@ -5066,7 +5066,7 @@ func TestHealthz(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Integration tests (SPEC §13.2). Gated on VAULT_TEST_DB_URL; run with `make itest`.
+// Integration tests. Gated on VAULT_TEST_DB_URL; run with `make itest`.
 // Tests may name tables (they check privileges and count audit rows as the owner); main.go never does.
 // ---------------------------------------------------------------------------
 
@@ -5319,7 +5319,7 @@ func TestIntegrationVelocityGlobal(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Boot: config, GCP REST access, secrets, DB pool, client CA, servers (SPEC §8.2–§8.6, §11)
+// Boot: config, GCP REST access, secrets, DB pool, client CA, servers
 // These tests replace package-level base URLs and must not call t.Parallel.
 // ---------------------------------------------------------------------------
 
@@ -5614,7 +5614,7 @@ func TestLoadConfig(t *testing.T) {
 	}
 }
 
-// TestValidOrigin covers the serialized-origin shape check (§5.3). An origin carrying its
+// TestValidOrigin covers the serialized-origin shape check. An origin carrying its
 // scheme's default port, or any other port spelling a browser never sends, refuses boot: it
 // could only produce a permanent 403.
 func TestValidOrigin(t *testing.T) {
@@ -6128,7 +6128,7 @@ func TestOpenDB(t *testing.T) {
 		t.Error("prod without a token source accepted")
 	}
 
-	// §14: no configuration from files. service/servicefile/passfile would make pgx read
+	// No configuration from files. service/servicefile/passfile would make pgx read
 	// pg_service.conf or a .pgpass file, so they refuse boot before pgx parses the URL (the
 	// service file named here exists and is valid, so pgx itself would accept it). The
 	// keyword/value form is refused because its parameters cannot be checked the same way.
@@ -6433,7 +6433,7 @@ func writeBootTLSFiles(t *testing.T, dir string) (certFile, keyFile, caFile stri
 }
 
 // TestBootFailsFastOnTLSFiles: in serve mode the certificate, key and client CA are loaded right
-// after the environment is parsed (§11 "fail fast"), before the database, KMS or Secret Manager
+// after the environment is parsed, before the database, KMS or Secret Manager
 // is touched. VAULT_DB_URL is unparseable in every case, so a boot that reached openDB would
 // fail with the database reason instead. -rotate-dek never reads the TLS files.
 func TestBootFailsFastOnTLSFiles(t *testing.T) {
@@ -6492,7 +6492,7 @@ func TestBootFailsFastOnTLSFiles(t *testing.T) {
 // Manager is touched (VAULT_DB_URL is unparseable in every case, so a boot that reached openDB
 // fails with the database reason instead). A dev account secret whose variable is misspelt (so the
 // secret is missing from the environment) or malformed exits 1 there, as does any VAULT_DEV_* in
-// prod. An account secret with no dev variable at all comes from Secret Manager, which §11 loads
+// prod. An account secret with no dev variable at all comes from Secret Manager, which boot loads
 // after the DEKs; that path is TestLoadAccountSecrets'. No value ever reaches stderr.
 func TestBootCatalogFailsFast(t *testing.T) {
 	certFile, keyFile, caFile := writeBootTLSFiles(t, t.TempDir())
@@ -6587,7 +6587,7 @@ func TestNewServersConfig(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// End-to-end acceptance (SPEC §15): real listeners and TLS, real database, DEK rotation, and the
+// End-to-end acceptance: real listeners and TLS, real database, DEK rotation, and the
 // opt-in live Stripe check. These tests replace package-level base URLs and must not call t.Parallel.
 // ---------------------------------------------------------------------------
 
@@ -6705,7 +6705,7 @@ func hasLogLine(logged string, parts ...string) bool {
 
 // TestIntegrationEndToEnd boots the vault the way main does (dev config, real database as
 // vault_app, DEK v1) behind both real TLS listeners, with the fake TLS provider standing in for
-// the stripe_t account (testCatalogJSON, via pointAccount), and walks the §15 flow: browser
+// the stripe_t account (testCatalogJSON, via pointAccount), and walks the full acceptance flow: browser
 // preflight + tokenize with a cardholder name, platform /proxy with the {account, token, request}
 // envelope (placeholders incl. {{name}}) and a forged Authorization header, healthz, and the mTLS
 // refusal of a client without a certificate.
@@ -6845,7 +6845,7 @@ func TestIntegrationEndToEnd(t *testing.T) {
 	}
 }
 
-// TestIntegrationRotateDEK covers §8.3/§8.4 and the last §15 box: -rotate-dek (as vault_rotator,
+// TestIntegrationRotateDEK covers DEK loading and rotation: -rotate-dek (as vault_rotator,
 // KMS via the fake metadata server and fake KMS) creates a new version; after a "restart" (a
 // second loadDEKs as vault_app) every version loads and a token sealed under the old DEK resolves.
 // The KMS settings are what prod passes (no dev DEK). The pools are opened in dev mode because
@@ -6981,7 +6981,7 @@ func stripeProxyRequest(tok, path string, headers map[string]string, body string
 }
 
 // TestStripeLive runs tokenize (with a cardholder name) → /proxy against the real Stripe test-mode
-// API (§15) through the embedded catalog's stripe_test account, with a forged inbound Authorization
+// API through the embedded catalog's stripe_test account, with a forged inbound Authorization
 // header: POST /v1/tokens with the CVV, then again without it (the CVV was used). Each returns a
 // single-use tok_; the platform charges or creates a PaymentMethod from it with its own keys.
 // It runs only when VAULT_TEST_STRIPE_SECRET holds a test-mode key (sk_test_…), which is never
@@ -7028,7 +7028,7 @@ func TestStripeLive(t *testing.T) {
 // the unmodified, fully verifying newOutboundClient. The relay forwards method, path, headers and
 // body unchanged to stripe-mock over loopback HTTP and returns its status, headers and body.
 //
-// catalog.json's only Stripe endpoint is POST /v1/tokens (a single-use tok_, D§6), with customer
+// catalog.json's only Stripe endpoint is POST /v1/tokens (a single-use tok_), with customer
 // forbidden. POST /v1/payment_methods (storage) and POST /v1/payment_intents are not in the catalog.
 func TestStripeMock(t *testing.T) {
 	raw := os.Getenv("VAULT_TEST_STRIPE_MOCK_URL")

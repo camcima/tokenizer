@@ -6,7 +6,7 @@ GOFMT   = $(shell go env GOROOT)/bin/gofmt
 # Pinned tool versions, built with the module's toolchain into the repo-local, gitignored .tools/bin
 # (never the user's GOBIN or ~/go/bin). `make tools` installs each one that is missing or was built
 # from another version or toolchain; lint and vuln depend on it so that `make ci` works on a clean
-# checkout with nothing pre-installed (§15).
+# checkout with nothing pre-installed.
 TOOLBIN             = $(CURDIR)/.tools/bin
 TOOLCHAIN           = go1.27.3
 STATICCHECK_VERSION = v0.8.2
