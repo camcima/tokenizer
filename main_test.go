@@ -157,6 +157,46 @@ func TestValidCVV(t *testing.T) {
 	}
 }
 
+// validName: 1–100 runes (not bytes), valid UTF-8, no control rune. Failure messages print
+// only case indexes.
+func TestValidName(t *testing.T) {
+	for i, s := range []string{
+		"J",
+		"JANE Q DOE",
+		"José Ñúñez",
+		"O'Brien-Smith",
+		strings.Repeat("a", 100),
+		strings.Repeat("é", 100), // 100 runes, 200 bytes
+		strings.Repeat("😀", 100), // 100 runes, 400 bytes
+	} {
+		if !validName(s) {
+			t.Errorf("ok case %d rejected", i)
+		}
+	}
+	for i, s := range []string{
+		"",
+		strings.Repeat("a", 101),
+		strings.Repeat("é", 101),
+		strings.Repeat("😀", 101),
+		"a\u0007b",
+		"a\x00b",
+		"a\tb",
+		"a\nb",
+		"a\rb",
+		"a\x7fb",       // DEL
+		"a\u0085b",     // C1 control (NEL)
+		"a\u009fb",     // C1 control
+		"Jos\xff",      // invalid UTF-8
+		"Jos\xc3",      // truncated multi-byte sequence
+		"Jos\uFFFD",    // what encoding/json makes of invalid UTF-8
+		"\xed\xa0\x80", // UTF-8-encoded surrogate
+	} {
+		if validName(s) {
+			t.Errorf("reject case %d accepted", i)
+		}
+	}
+}
+
 func TestTokenFormatAndUniqueness(t *testing.T) {
 	seen := make(map[string]bool, 100000)
 	for i := 0; i < 100000; i++ {
@@ -1142,6 +1182,13 @@ func TestTokenize(t *testing.T) {
 		{name: "ctype mixed case", ctype: "Application/JSON", wantStatus: 200},
 		{name: "trailing whitespace", body: goodBody + "\n  \t", wantStatus: 200},
 		{name: "body exactly 4096", body: padBody(goodBody, 4096), wantStatus: 200},
+		{name: "name", body: tokBody(map[string]any{"name": "JANE Q DOE"}), wantStatus: 200},
+		{name: "name accented", body: tokBody(map[string]any{"name": "José Ñúñez"}), wantStatus: 200},
+		{name: "name escaped accents", body: `{"pan":"4242424242424242","exp_month":"12","exp_year":"2030","name":"Jos\u00e9"}`, wantStatus: 200},
+		{name: "name 1 rune", body: tokBody(map[string]any{"name": "J"}), wantStatus: 200},
+		{name: "name 100 runes", body: tokBody(map[string]any{"name": strings.Repeat("a", 100)}), wantStatus: 200},
+		{name: "name 100 two-byte runes", body: tokBody(map[string]any{"name": strings.Repeat("é", 100)}), wantStatus: 200},
+		{name: "name no cvv", body: tokBody(map[string]any{"name": "JANE Q DOE", "cvv": nil}), wantStatus: 200},
 
 		// 404: path must be exactly /tokenize.
 		{name: "trailing slash path", target: "/tokenize/", wantStatus: 404, wantError: msgNotFound},
@@ -1190,7 +1237,7 @@ func TestTokenize(t *testing.T) {
 		{name: "body 1MiB", body: padBody(goodBody, 1<<20), wantStatus: 413, wantError: msgTooLarge},
 
 		// 400 body shape.
-		{name: "unknown field", body: tokBody(map[string]any{"name": "J SMITH"}), wantStatus: 400, wantError: msgBadBody},
+		{name: "unknown field", body: tokBody(map[string]any{"holder": "J SMITH"}), wantStatus: 400, wantError: msgBadBody},
 		{name: "trailing object", body: goodBody + `{}`, wantStatus: 400, wantError: msgBadBody},
 		{name: "trailing garbage", body: goodBody + `x`, wantStatus: 400, wantError: msgBadBody},
 		{name: "not json", body: "pan=" + testPAN, wantStatus: 400, wantError: msgBadBody},
@@ -1234,6 +1281,22 @@ func TestTokenize(t *testing.T) {
 		{name: "cvv null spaced", body: `{"pan":"4242424242424242","exp_month":"12","exp_year":"2030","cvv" : null }`, wantStatus: 400, wantError: msgInvalidCVV},
 		{name: "cvv number", body: `{"pan":"4242424242424242","exp_month":"12","exp_year":"2030","cvv":123}`, wantStatus: 400, wantError: msgBadBody},
 
+		// 400 name.
+		{name: "name empty", body: tokBody(map[string]any{"name": ""}), wantStatus: 400, wantError: msgInvalidName},
+		{name: "name null", body: `{"pan":"4242424242424242","exp_month":"12","exp_year":"2030","name":null}`, wantStatus: 400, wantError: msgInvalidName},
+		{name: "name null first", body: `{"name":null,"pan":"4242424242424242","exp_month":"12","exp_year":"2030"}`, wantStatus: 400, wantError: msgInvalidName},
+		{name: "name null spaced", body: `{"pan":"4242424242424242","exp_month":"12","exp_year":"2030","name" : null }`, wantStatus: 400, wantError: msgInvalidName},
+		{name: "name 101 runes", body: tokBody(map[string]any{"name": strings.Repeat("a", 101)}), wantStatus: 400, wantError: msgInvalidName},
+		{name: "name 101 two-byte runes", body: tokBody(map[string]any{"name": strings.Repeat("é", 101)}), wantStatus: 400, wantError: msgInvalidName},
+		{name: "name bell", body: `{"pan":"4242424242424242","exp_month":"12","exp_year":"2030","name":"a\u0007b"}`, wantStatus: 400, wantError: msgInvalidName},
+		{name: "name newline", body: tokBody(map[string]any{"name": "JANE\nDOE"}), wantStatus: 400, wantError: msgInvalidName},
+		{name: "name C1 control", body: tokBody(map[string]any{"name": "JANE\u0085DOE"}), wantStatus: 400, wantError: msgInvalidName},
+		{name: "name raw invalid utf-8", body: "{\"pan\":\"4242424242424242\",\"exp_month\":\"12\",\"exp_year\":\"2030\",\"name\":\"Jos\xff\"}", wantStatus: 400, wantError: msgInvalidName},
+		{name: "name number", body: `{"pan":"4242424242424242","exp_month":"12","exp_year":"2030","name":1}`, wantStatus: 400, wantError: msgBadBody},
+		{name: "name object", body: tokBody(map[string]any{"name": map[string]any{}}), wantStatus: 400, wantError: msgBadBody},
+		{name: "duplicate name", body: `{"pan":"4242424242424242","exp_month":"12","exp_year":"2030","name":"","name":"JANE"}`, wantStatus: 400, wantError: msgBadBody},
+		{name: "case-variant name", body: `{"pan":"4242424242424242","exp_month":"12","exp_year":"2030","Name":"JANE"}`, wantStatus: 400, wantError: msgBadBody},
+
 		// Check order: each pair fails two checks; the earlier one wins.
 		{name: "order 404>405", method: "PUT", target: "/x", wantStatus: 404, wantError: msgNotFound},
 		{name: "order 405>query", method: "GET", target: "/tokenize?x=1", wantStatus: 405, wantError: msgMethod},
@@ -1242,10 +1305,15 @@ func TestTokenize(t *testing.T) {
 		{name: "order session>ctype", authz: omit, ctype: "text/plain", wantStatus: 401, wantError: msgUnauthorized},
 		{name: "order ctype>size", ctype: "text/plain", body: padBody(goodBody, 4097), wantStatus: 400, wantError: msgContentType},
 		{name: "order size>shape", body: padBody(goodBody, 4097) + "x", wantStatus: 413, wantError: msgTooLarge},
-		{name: "order shape>pan", body: tokBody(map[string]any{"pan": "1", "name": "x"}), wantStatus: 400, wantError: msgBadBody},
+		{name: "order shape>pan", body: tokBody(map[string]any{"pan": "1", "holder": "x"}), wantStatus: 400, wantError: msgBadBody},
 		{name: "order pan>expiry", body: tokBody(map[string]any{"pan": "1", "exp_month": "13"}), wantStatus: 400, wantError: msgInvalidPAN},
 		{name: "order expiry>cvv", body: tokBody(map[string]any{"exp_month": "13", "cvv": "1"}), wantStatus: 400, wantError: msgInvalidExpiry},
 		{name: "order expiry>cvv null", body: `{"pan":"4242424242424242","exp_month":"13","exp_year":"2030","cvv":null}`, wantStatus: 400, wantError: msgInvalidExpiry},
+		{name: "order cvv>name", body: tokBody(map[string]any{"cvv": "1", "name": ""}), wantStatus: 400, wantError: msgInvalidCVV},
+		{name: "order cvv null>name null", body: `{"pan":"4242424242424242","exp_month":"12","exp_year":"2030","cvv":null,"name":null}`, wantStatus: 400, wantError: msgInvalidCVV},
+		{name: "order expiry>name", body: tokBody(map[string]any{"exp_month": "13", "name": ""}), wantStatus: 400, wantError: msgInvalidExpiry},
+		{name: "order pan>name", body: tokBody(map[string]any{"pan": "1", "name": ""}), wantStatus: 400, wantError: msgInvalidPAN},
+		{name: "order shape>name", body: tokBody(map[string]any{"name": "", "holder": "x"}), wantStatus: 400, wantError: msgBadBody},
 	}
 
 	for _, c := range cases {
@@ -1468,6 +1536,74 @@ func TestTokenizeStoresDecryptableCard(t *testing.T) {
 	clk.advance(15 * time.Minute)
 	if v.cvv.take(resp.Token) != "" {
 		t.Fatal("CVV still available 15 minutes after tokenize")
+	}
+}
+
+// An optional name is sealed with the card (D§5.8): the plaintext gains a "name" key only when
+// one was sent, and the response never echoes it. Failure messages never print the name.
+func TestTokenizeStoresName(t *testing.T) {
+	const name = "JANE Q DOE"
+	v, s := newTestVault(t)
+	rec := serveTokenize(v, tokRequest(tokCase{body: tokBody(map[string]any{"name": name})}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), name) {
+		t.Fatal("response body echoes the name")
+	}
+	var resp tokenizeResponse
+	dec := json.NewDecoder(bytes.NewReader(rec.Body.Bytes()))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&resp); err != nil {
+		t.Fatalf("response body (len %d) does not decode as tokenizeResponse", rec.Body.Len())
+	}
+	row, ok := s.rows[resp.Token]
+	if !ok {
+		t.Fatal("no row stored for the response token")
+	}
+	if bytes.Contains(row.ciphertext, []byte(name)) {
+		t.Fatal("ciphertext contains the plaintext name")
+	}
+	pt, err := unseal(v.deks[row.keyVersion], row.ciphertext)
+	if err != nil {
+		t.Fatal("stored ciphertext does not unseal")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(pt, &fields); err != nil || len(fields) != 4 {
+		t.Fatalf("plaintext is not a 4-field object (%d fields)", len(fields))
+	}
+	var c card
+	if err := json.Unmarshal(pt, &c); err != nil || c != (card{PAN: testPAN, ExpMonth: "12", ExpYear: "2030", Name: name}) {
+		t.Fatal("plaintext does not decode to the normalized card with the name")
+	}
+	zero(pt)
+
+	// Without a name the plaintext has no "name" key at all.
+	rec = serveTokenize(v, tokRequest(tokCase{}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("no-name status %d, want 200", rec.Code)
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal("no-name response does not decode")
+	}
+	pt, err = unseal(v.deks[s.rows[resp.Token].keyVersion], s.rows[resp.Token].ciphertext)
+	if err != nil {
+		t.Fatal("no-name ciphertext does not unseal")
+	}
+	fields = nil
+	if err := json.Unmarshal(pt, &fields); err != nil || len(fields) != 3 {
+		t.Fatalf("no-name plaintext is not a 3-field object (%d fields)", len(fields))
+	}
+	if _, has := fields["name"]; has {
+		t.Fatal("no-name plaintext contains a name key")
+	}
+	zero(pt)
+
+	// A row sealed before names existed decodes with an empty Name.
+	old := []byte(`{"pan":"4242424242424242","exp_month":"12","exp_year":"2030"}`)
+	var oc card
+	if err := json.Unmarshal(old, &oc); err != nil || oc != (card{PAN: testPAN, ExpMonth: "12", ExpYear: "2030"}) {
+		t.Fatal("pre-name plaintext does not decode to a card without a name")
 	}
 }
 

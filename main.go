@@ -49,10 +49,13 @@ import (
 
 // card is the encrypted record: plaintext is json.Marshal(card{...}) (§8.1).
 // CVV is never part of it. Keep values of this type scoped to a single request.
+// Name is the optional cardholder name (D§5.8). omitempty keeps the plaintext of a card stored
+// without a name byte-identical to before, and old rows decode with Name == "".
 type card struct {
 	PAN      string `json:"pan"`
 	ExpMonth string `json:"exp_month"`
 	ExpYear  string `json:"exp_year"`
+	Name     string `json:"name,omitempty"`
 }
 
 var (
@@ -135,6 +138,23 @@ func validCVV(s string) bool {
 	}
 	for i := 0; i < len(s); i++ {
 		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// validName reports whether s is an acceptable cardholder name (D§5.8): 1–100 runes, valid
+// UTF-8, and no control rune (unicode.IsControl: C0, DEL, C1). Presence is the caller's concern.
+// SPEC-DECISION: U+FFFD is rejected too. encoding/json silently replaces invalid UTF-8 in a
+// string with U+FFFD, so without this a body carrying invalid UTF-8 would be stored, not
+// rejected. No real name contains the replacement character.
+func validName(s string) bool {
+	if s == "" || !utf8.ValidString(s) || utf8.RuneCountInString(s) > 100 {
+		return false
+	}
+	for _, r := range s {
+		if r == utf8.RuneError || unicode.IsControl(r) {
 			return false
 		}
 	}
@@ -238,6 +258,7 @@ const (
 	msgInvalidPAN         = "invalid pan"
 	msgInvalidExpiry      = "invalid expiry"
 	msgInvalidCVV         = "invalid cvv"
+	msgInvalidName        = "invalid name"
 	msgUnauthorized       = "unauthorized"
 	msgOrigin             = "origin not allowed"
 	msgUnknownProvider    = "unknown provider"
@@ -523,6 +544,9 @@ type tokenizeRequest struct {
 	// to nil, so handleTokenize detects "cvv": null separately and rejects it with
 	// msgInvalidCVV, like "" (controller ruling 2026-10-30: the stricter reading).
 	CVV *string `json:"cvv"`
+	// Name follows CVV exactly: nil means absent, and "name": null is detected separately and
+	// rejected with msgInvalidName (D§5.8; the same stricter reading as "cvv": null).
+	Name *string `json:"name"`
 }
 
 type tokenizeResponse struct {
@@ -562,7 +586,7 @@ func jsonContentType(h http.Header) bool {
 }
 
 // tokenizeFields is the exact set of keys a /tokenize body may contain.
-var tokenizeFields = map[string]bool{"pan": true, "exp_month": true, "exp_year": true, "cvv": true}
+var tokenizeFields = map[string]bool{"pan": true, "exp_month": true, "exp_year": true, "cvv": true, "name": true}
 
 // exactKeys reports whether body is a JSON object whose keys are all in fields (any key if fields
 // is nil), spelled exactly, each at most once.
@@ -700,13 +724,29 @@ func (v *vault) handleTokenize(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, msgInvalidCVV)
 		return
 	}
+	name := ""
+	if req.Name == nil {
+		// As for cvv: present-but-null is a non-nil RawMessage ("null"); a missing key stays nil.
+		var raw struct {
+			Name json.RawMessage `json:"name"`
+		}
+		if json.Unmarshal(body, &raw) != nil || raw.Name != nil {
+			writeError(w, http.StatusBadRequest, msgInvalidName)
+			return
+		}
+	} else if !validName(*req.Name) {
+		writeError(w, http.StatusBadRequest, msgInvalidName)
+		return
+	} else {
+		name = *req.Name
+	}
 
 	dek, ok := v.deks[v.currentDEK]
 	if !ok {
 		writeError(w, http.StatusInternalServerError, msgInternal)
 		return
 	}
-	plaintext, err := json.Marshal(card{PAN: pan, ExpMonth: req.ExpMonth, ExpYear: req.ExpYear})
+	plaintext, err := json.Marshal(card{PAN: pan, ExpMonth: req.ExpMonth, ExpYear: req.ExpYear, Name: name})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, msgInternal)
 		return
