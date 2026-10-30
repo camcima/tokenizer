@@ -519,8 +519,9 @@ type tokenizeRequest struct {
 	PAN      string `json:"pan"`
 	ExpMonth string `json:"exp_month"`
 	ExpYear  string `json:"exp_year"`
-	// SPEC-DECISION: nil means absent; JSON null also decodes to nil and is treated as absent
-	// (the plan's *string + "validate if non-nil"). "" is present and fails validation.
+	// SPEC-DECISION: nil means the key is absent (no CVV). encoding/json also decodes JSON null
+	// to nil, so handleTokenize detects "cvv": null separately and rejects it with
+	// msgInvalidCVV, like "" (controller ruling 2026-10-30: the stricter reading).
 	CVV *string `json:"cvv"`
 }
 
@@ -685,7 +686,17 @@ func (v *vault) handleTokenize(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, msgInvalidExpiry)
 		return
 	}
-	if req.CVV != nil && !validCVV(*req.CVV) {
+	if req.CVV == nil {
+		// Present-but-null shows up as a non-nil RawMessage ("null"); a missing key stays nil.
+		// exactKeys has already guaranteed "cvv" appears at most once, spelled exactly.
+		var raw struct {
+			CVV json.RawMessage `json:"cvv"`
+		}
+		if json.Unmarshal(body, &raw) != nil || raw.CVV != nil {
+			writeError(w, http.StatusBadRequest, msgInvalidCVV)
+			return
+		}
+	} else if !validCVV(*req.CVV) {
 		writeError(w, http.StatusBadRequest, msgInvalidCVV)
 		return
 	}
@@ -1397,11 +1408,23 @@ func decodeKey64(s string) ([]byte, bool) {
 // userinfo, path, query or fragment, in canonical form (lowercase scheme and host).
 // SPEC-DECISION: the browser's Origin header is compared byte-for-byte (§5.3), so a value that
 // could never match one (trailing slash, uppercase host, "*") refuses boot; prod requires https.
+// The same goes for a port a browser never serializes: the scheme's default (https :443, http
+// :80, which browsers omit), an empty port ("host:"), a leading zero, or one outside 1–65535.
 func validOrigin(s string, requireHTTPS bool) bool {
 	u, err := url.Parse(s)
 	if err != nil || u.Opaque != "" || u.User != nil || u.Host == "" || u.Path != "" || u.RawQuery != "" ||
 		u.ForceQuery || u.Fragment != "" || u.Host != strings.ToLower(u.Host) || u.String() != s {
 		return false
+	}
+	if strings.HasSuffix(u.Host, ":") {
+		return false
+	}
+	if p := u.Port(); p != "" {
+		n, err := strconv.Atoi(p)
+		if err != nil || p[0] == '0' || n < 1 || n > 65535 ||
+			(u.Scheme == "https" && n == 443) || (u.Scheme == "http" && n == 80) {
+			return false
+		}
 	}
 	return u.Scheme == "https" || (!requireHTTPS && u.Scheme == "http")
 }
@@ -1607,7 +1630,33 @@ func accessSecret(ctx context.Context, c *http.Client, ts *tokenSource, name str
 // verification (sslmode=verify-ca or verify-full, or require with sslrootcert): the password is
 // an OAuth token that also authorizes KMS decrypt, so it must not be sent in clear text or to an
 // unverified server. sslmode=prefer/allow/require-without-root-cert/disable refuse boot.
+//
+// SPEC-DECISION: §14 forbids configuration from files, and pgx reads pg_service.conf when the
+// URL sets service/servicefile and a password file when it sets passfile, during ParseConfig.
+// Those keys (any letter case, percent-encoded or not) refuse boot before pgx sees the URL. To
+// make that check complete, VAULT_DB_URL must be the URL form (§11 "Postgres URL"): the
+// keyword/value form ("host=… dbname=…") is refused, as is a query string that does not parse
+// strictly (pgx would silently drop such pairs). Accepted residue: pgx's PG* environment
+// fallbacks (PGHOST, PGSERVICE, …; the deployment sets none), and its default ~/.pgpass lookup
+// when the URL has no password, which in the scratch image resolves to /.pgpass (HOME=/ from
+// /etc/passwd), a file that does not exist.
 func openDB(cfg config, ts *tokenSource) (*sql.DB, error) {
+	if !strings.HasPrefix(cfg.dbURL, "postgres://") && !strings.HasPrefix(cfg.dbURL, "postgresql://") {
+		return nil, errors.New("VAULT_DB_URL must be a postgres:// or postgresql:// URL")
+	}
+	u, err := url.Parse(cfg.dbURL)
+	if err != nil {
+		return nil, errors.New("VAULT_DB_URL cannot be parsed")
+	}
+	query, err := url.ParseQuery(u.RawQuery)
+	if err != nil {
+		return nil, errors.New("VAULT_DB_URL cannot be parsed")
+	}
+	for k := range query {
+		if strings.EqualFold(k, "service") || strings.EqualFold(k, "servicefile") || strings.EqualFold(k, "passfile") {
+			return nil, errors.New("VAULT_DB_URL must not set service, servicefile or passfile")
+		}
+	}
 	pc, err := pgx.ParseConfig(cfg.dbURL)
 	if err != nil {
 		return nil, errors.New("VAULT_DB_URL cannot be parsed")
@@ -1816,13 +1865,24 @@ func loadClientCA(path string) (*x509.CertPool, error) {
 	return pool, nil
 }
 
-// newVault wires the vault to the database and the loaded key material.
+// dbCallTimeout bounds each request's database call (waiting for a pool slot included), so a
+// saturated pool (16 connections, get_card serialized by its advisory lock) or a stalled server
+// fails the request with 500 instead of holding it until the listener's WriteTimeout.
+const dbCallTimeout = 5 * time.Second
+
+// newVault wires the vault to the database and the loaded key material. Each putCard/getCard
+// call runs under dbCallTimeout, derived from the request context (an earlier request deadline
+// or a client disconnect still wins).
 func newVault(cfg config, db *sql.DB, deks map[int][]byte, current int, hmacKey []byte, stripeSecret string, client *http.Client, logger *log.Logger) *vault {
 	return &vault{
 		putCard: func(ctx context.Context, token string, ciphertext []byte, last4 string, keyVersion int) error {
+			ctx, cancel := context.WithTimeout(ctx, dbCallTimeout)
+			defer cancel()
 			return dbPutCard(ctx, db, token, ciphertext, last4, keyVersion)
 		},
 		getCard: func(ctx context.Context, token, caller string) ([]byte, int, error) {
+			ctx, cancel := context.WithTimeout(ctx, dbCallTimeout)
+			defer cancel()
 			return dbGetCard(ctx, db, token, caller)
 		},
 		ping:        db.PingContext,
@@ -1900,6 +1960,22 @@ func main() {
 	}
 	boot.logf("config loaded env=%s", cfg.env)
 
+	// 1b. Serve mode: load the certificate, key and client CA now, before the database, KMS or
+	// Secret Manager is touched (§11 "fail fast"), so a bad file costs no network round trip and
+	// never boots half way. -rotate-dek has no listeners and never reads them.
+	var cert tls.Certificate
+	var clientCAs *x509.CertPool
+	if !*rotate {
+		cert, err = tls.LoadX509KeyPair(cfg.certFile, cfg.keyFile)
+		if err != nil {
+			fail("VAULT_CERT/VAULT_KEY: cannot load key pair")
+		}
+		clientCAs, err = loadClientCA(cfg.clientCAFile)
+		if err != nil {
+			fail("VAULT_CLIENT_CA: " + err.Error())
+		}
+	}
+
 	client := newOutboundClient(nil) // the single shared client: metadata, KMS, SM, providers
 	ts := &tokenSource{client: client}
 
@@ -1954,17 +2030,7 @@ func main() {
 	// 5. Build the vault (and with it the provider catalog).
 	v := newVault(cfg, db, deks, current, hmacKey, stripeSecret, client, logger)
 
-	// 6. Certificate and client CA.
-	cert, err := tls.LoadX509KeyPair(cfg.certFile, cfg.keyFile)
-	if err != nil {
-		fail("VAULT_CERT/VAULT_KEY: cannot load key pair")
-	}
-	clientCAs, err := loadClientCA(cfg.clientCAFile)
-	if err != nil {
-		fail("VAULT_CLIENT_CA: " + err.Error())
-	}
-
-	// 7. Start both listeners.
+	// 6. Start both listeners (certificate and client CA were loaded in step 1b).
 	// SPEC-DECISION: each socket is bound with net.Listen before serving (ServeTLS("", "") is what
 	// ListenAndServeTLS("", "") does after binding), so a bind failure exits 1 before "ready".
 	public, internal := newServers(v, cfg, cert, clientCAs)
@@ -1989,7 +2055,7 @@ func main() {
 	}()
 	v.logf("listening public=%s internal=%s", cfg.publicAddr, cfg.internalAddr)
 
-	// 8. Ready.
+	// 7. Ready.
 	v.logf("ready")
 
 	sig := make(chan os.Signal, 1)

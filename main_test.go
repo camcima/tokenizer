@@ -29,6 +29,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -38,6 +39,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
 // Test failure messages never print a PAN, expiry or CVV: they print a case index or a length.
@@ -471,6 +475,10 @@ func (c *fakeClock) advance(d time.Duration) {
 // (so "4242 4242 4242 4242" is caught), and within every maximal digit run it tests every window
 // of length 13–19 (so a PAN embedded in a longer digit run is caught). Only offsets are printed.
 func TestMain(m *testing.M) {
+	if os.Getenv("PAN_VAULT_TEST_RUN_MAIN") == "1" {
+		main() // a boot-sequence subprocess started by runMain; main always exits
+		return
+	}
 	code := m.Run()
 	out := regexp.MustCompile(`tok_[0-9a-f]{32}`).ReplaceAllString(testLog.String(), "tok_")
 	for _, v := range []struct {
@@ -1122,7 +1130,6 @@ func TestTokenize(t *testing.T) {
 		// Success, including every passing variant of the §5.5 rules.
 		{name: "good", wantStatus: 200},
 		{name: "no cvv", body: tokBody(map[string]any{"cvv": nil}), wantStatus: 200},
-		{name: "cvv null is absent", body: `{"pan":"4242424242424242","exp_month":"12","exp_year":"2030","cvv":null}`, wantStatus: 200},
 		{name: "hyphen pan", body: tokBody(map[string]any{"pan": "4242-4242-4242-4242"}), wantStatus: 200},
 		{name: "plain pan", body: tokBody(map[string]any{"pan": testPAN}), wantStatus: 200},
 		{name: "13-digit pan", body: tokBody(map[string]any{"pan": "4222222222222"}), wantStatus: 200},
@@ -1221,6 +1228,10 @@ func TestTokenize(t *testing.T) {
 		{name: "cvv 5 digits", body: tokBody(map[string]any{"cvv": "12345"}), wantStatus: 400, wantError: msgInvalidCVV},
 		{name: "cvv letter", body: tokBody(map[string]any{"cvv": "12a"}), wantStatus: 400, wantError: msgInvalidCVV},
 		{name: "cvv empty", body: tokBody(map[string]any{"cvv": ""}), wantStatus: 400, wantError: msgInvalidCVV},
+		{name: "cvv null", body: `{"pan":"4242424242424242","exp_month":"12","exp_year":"2030","cvv":null}`, wantStatus: 400, wantError: msgInvalidCVV},
+		{name: "cvv null first", body: `{"cvv":null,"pan":"4242424242424242","exp_month":"12","exp_year":"2030"}`, wantStatus: 400, wantError: msgInvalidCVV},
+		{name: "cvv null spaced", body: `{"pan":"4242424242424242","exp_month":"12","exp_year":"2030","cvv" : null }`, wantStatus: 400, wantError: msgInvalidCVV},
+		{name: "cvv number", body: `{"pan":"4242424242424242","exp_month":"12","exp_year":"2030","cvv":123}`, wantStatus: 400, wantError: msgBadBody},
 
 		// Check order: each pair fails two checks; the earlier one wins.
 		{name: "order 404>405", method: "PUT", target: "/x", wantStatus: 404, wantError: msgNotFound},
@@ -1233,6 +1244,7 @@ func TestTokenize(t *testing.T) {
 		{name: "order shape>pan", body: tokBody(map[string]any{"pan": "1", "name": "x"}), wantStatus: 400, wantError: msgBadBody},
 		{name: "order pan>expiry", body: tokBody(map[string]any{"pan": "1", "exp_month": "13"}), wantStatus: 400, wantError: msgInvalidPAN},
 		{name: "order expiry>cvv", body: tokBody(map[string]any{"exp_month": "13", "cvv": "1"}), wantStatus: 400, wantError: msgInvalidExpiry},
+		{name: "order expiry>cvv null", body: `{"pan":"4242424242424242","exp_month":"13","exp_year":"2030","cvv":null}`, wantStatus: 400, wantError: msgInvalidExpiry},
 	}
 
 	for _, c := range cases {
@@ -3048,6 +3060,9 @@ func TestLoadConfig(t *testing.T) {
 		{"origin with path", envWith(testDevEnv(), map[string]string{"VAULT_ALLOW_ORIGIN": testOrigin + "/pay"}), false, "VAULT_ALLOW_ORIGIN"},
 		{"origin with query", envWith(testDevEnv(), map[string]string{"VAULT_ALLOW_ORIGIN": testOrigin + "?a=1"}), false, "VAULT_ALLOW_ORIGIN"},
 		{"origin with userinfo", envWith(testDevEnv(), map[string]string{"VAULT_ALLOW_ORIGIN": "https://u@checkout.example.com"}), false, "VAULT_ALLOW_ORIGIN"},
+		{"origin default https port", envWith(testDevEnv(), map[string]string{"VAULT_ALLOW_ORIGIN": testOrigin + ":443"}), false, "VAULT_ALLOW_ORIGIN"},
+		{"prod origin default https port", envWith(testProdEnv(), map[string]string{"VAULT_ALLOW_ORIGIN": testOrigin + ":443"}), false, "VAULT_ALLOW_ORIGIN"},
+		{"origin default http port", envWith(testDevEnv(), map[string]string{"VAULT_ALLOW_ORIGIN": "http://localhost:80"}), false, "VAULT_ALLOW_ORIGIN"},
 		{"prod http origin", envWith(testProdEnv(), map[string]string{"VAULT_ALLOW_ORIGIN": "http://checkout.example.com"}), false, "VAULT_ALLOW_ORIGIN"},
 		{"prod missing VAULT_KMS_KEY", envWith(testProdEnv(), map[string]string{"VAULT_KMS_KEY": omit}), false, "VAULT_KMS_KEY"},
 		{"prod missing VAULT_SESSION_HMAC_SECRET", envWith(testProdEnv(), map[string]string{"VAULT_SESSION_HMAC_SECRET": omit}), false, "VAULT_SESSION_HMAC_SECRET"},
@@ -3124,6 +3139,41 @@ func TestLoadConfig(t *testing.T) {
 	cfg, err = loadConfig(func(k string) string { return rotEnv[k] }, true)
 	if err != nil || cfg.env != "prod" || cfg.kmsKey != testKMSKey || cfg.dbURL != rotEnv["VAULT_DB_URL"] {
 		t.Error("rotate config fields wrong")
+	}
+}
+
+// TestValidOrigin covers the serialized-origin shape check (§5.3). An origin carrying its
+// scheme's default port, or any other port spelling a browser never sends, refuses boot: it
+// could only produce a permanent 403.
+func TestValidOrigin(t *testing.T) {
+	for _, c := range []struct {
+		origin   string
+		prod, ok bool
+	}{
+		{"https://checkout.example.com", true, true},
+		{"https://checkout.example.com:8443", true, true},
+		{"https://checkout.example.com:65535", true, true},
+		{"https://checkout.example.com:1", true, true},
+		{"https://[2001:db8::1]:8443", true, true},
+		{"http://localhost:3000", false, true},
+		{"http://localhost", false, true},
+		{"https://checkout.example.com:443", true, false},
+		{"https://checkout.example.com:443", false, false},
+		{"https://[2001:db8::1]:443", true, false},
+		{"http://localhost:80", false, false},
+		{"https://checkout.example.com:", true, false},
+		{"https://checkout.example.com:0443", true, false},
+		{"https://checkout.example.com:08443", true, false},
+		{"https://checkout.example.com:0", true, false},
+		{"https://checkout.example.com:65536", true, false},
+		{"http://localhost:3000", true, false},
+		{"https://checkout.example.com/", true, false},
+		{"https://Checkout.example.com", true, false},
+		{"*", true, false},
+	} {
+		if got := validOrigin(c.origin, c.prod); got != c.ok {
+			t.Errorf("validOrigin(%q, prod=%v) = %v, want %v", c.origin, c.prod, got, c.ok)
+		}
 	}
 }
 
@@ -3401,6 +3451,49 @@ func TestOpenDB(t *testing.T) {
 		db.Close()
 		t.Error("prod without a token source accepted")
 	}
+
+	// §14: no configuration from files. service/servicefile/passfile would make pgx read
+	// pg_service.conf or a .pgpass file, so they refuse boot before pgx parses the URL (the
+	// service file named here exists and is valid, so pgx itself would accept it). The
+	// keyword/value form is refused because its parameters cannot be checked the same way.
+	dir := t.TempDir()
+	svc := filepath.Join(dir, "pg_service.conf")
+	if err := os.WriteFile(svc, []byte("[s1]\nhost=127.0.0.1\nport=1\ndbname=vault\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pass := filepath.Join(dir, "pgpass")
+	if err := os.WriteFile(pass, []byte("*:*:*:*:pw-x9q\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const base = "postgres://vault_app@127.0.0.1:1/vault?sslmode=verify-full&"
+	for name, tc := range map[string]struct {
+		cfg  config
+		want string
+	}{
+		"dev service":             {config{env: "dev", dbURL: "postgres:///?service=s1&servicefile=" + svc}, "VAULT_DB_URL must not set service, servicefile or passfile"},
+		"dev servicefile":         {config{env: "dev", dbURL: "postgres://vault_app@127.0.0.1:1/vault?servicefile=" + svc}, "VAULT_DB_URL must not set service, servicefile or passfile"},
+		"dev passfile":            {config{env: "dev", dbURL: "postgres://vault_app@127.0.0.1:1/vault?sslmode=disable&passfile=" + pass}, "VAULT_DB_URL must not set service, servicefile or passfile"},
+		"dev postgresql scheme":   {config{env: "dev", dbURL: "postgresql://vault_app@127.0.0.1:1/vault?passfile=" + pass}, "VAULT_DB_URL must not set service, servicefile or passfile"},
+		"dev mixed-case key":      {config{env: "dev", dbURL: "postgres://vault_app@127.0.0.1:1/vault?PassFile=" + pass}, "VAULT_DB_URL must not set service, servicefile or passfile"},
+		"dev percent-encoded key": {config{env: "dev", dbURL: "postgres://vault_app@127.0.0.1:1/vault?%73ervice=s1"}, "VAULT_DB_URL must not set service, servicefile or passfile"},
+		"dev repeated key":        {config{env: "dev", dbURL: "postgres://vault_app@127.0.0.1:1/vault?sslmode=disable&sslmode=disable&service=s1"}, "VAULT_DB_URL must not set service, servicefile or passfile"},
+		"prod service":            {config{env: "prod", dbURL: base + "service=s1"}, "VAULT_DB_URL must not set service, servicefile or passfile"},
+		"prod passfile":           {config{env: "prod", dbURL: base + "passfile=" + pass}, "VAULT_DB_URL must not set service, servicefile or passfile"},
+		"keyword/value form":      {config{env: "dev", dbURL: "host=127.0.0.1 port=1 dbname=vault sslmode=disable"}, "VAULT_DB_URL must be a postgres:// or postgresql:// URL"},
+		"keyword/value service":   {config{env: "dev", dbURL: "service=s1 servicefile=" + svc}, "VAULT_DB_URL must be a postgres:// or postgresql:// URL"},
+		"uppercase scheme":        {config{env: "dev", dbURL: "POSTGRES://vault_app@127.0.0.1:1/vault"}, "VAULT_DB_URL must be a postgres:// or postgresql:// URL"},
+		"malformed query":         {config{env: "dev", dbURL: "postgres://vault_app@127.0.0.1:1/vault?sslmode=disable;service=s1"}, "VAULT_DB_URL cannot be parsed"},
+	} {
+		db, err := openDB(tc.cfg, &tokenSource{client: c})
+		if err == nil {
+			db.Close()
+			t.Errorf("%s: accepted", name)
+			continue
+		}
+		if err.Error() != tc.want {
+			t.Errorf("%s: wrong error (len %d)", name, len(err.Error())) // never print it: it might quote the URL
+		}
+	}
 }
 
 // testCertPEM returns a PEM certificate: a self-signed CA when parent is nil and isCA, else a
@@ -3512,6 +3605,194 @@ func TestNewVault(t *testing.T) {
 	defer cancel()
 	if v.ping(ctx) == nil {
 		t.Error("ping is not wired to the database")
+	}
+}
+
+// TestNewVaultDBDeadline: each putCard/getCard call runs under a 5s deadline derived from the
+// request context, so a saturated pool or a stalled server fails the request instead of
+// hanging it.
+func TestNewVaultDBDeadline(t *testing.T) {
+	type ctxKey struct{}
+	type seen struct {
+		left time.Duration
+		ok   bool
+		req  bool
+	}
+	got := make(chan seen, 1)
+	pc, err := pgx.ParseConfig("postgres://vault_app@127.0.0.1:1/vault?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := stdlib.OpenDB(*pc, stdlib.OptionBeforeConnect(func(ctx context.Context, _ *pgx.ConnConfig) error {
+		dl, ok := ctx.Deadline()
+		got <- seen{left: time.Until(dl), ok: ok, req: ctx.Value(ctxKey{}) != nil}
+		return errors.New("fake connect refused")
+	}))
+	defer db.Close()
+	v := newVault(config{env: "dev", allowOrigin: testOrigin}, db, map[int][]byte{1: bytes.Repeat([]byte{1}, 32)}, 1,
+		testHMACKey, testSecret, newOutboundClient(nil), log.New(&testLog, "", 0))
+
+	reqCtx := context.WithValue(context.Background(), ctxKey{}, true)
+	short, cancel := context.WithTimeout(reqCtx, time.Second)
+	defer cancel()
+	calls := map[string]func(context.Context) error{
+		"putCard": func(ctx context.Context) error { return v.putCard(ctx, newToken(), []byte{1}, "4242", 1) },
+		"getCard": func(ctx context.Context) error { _, _, err := v.getCard(ctx, newToken(), "1"); return err },
+	}
+	for name, call := range calls {
+		if call(reqCtx) == nil {
+			t.Fatalf("%s: no error from a refused connection", name)
+		}
+		s := <-got
+		if !s.ok || s.left > 5*time.Second || s.left < 4*time.Second {
+			t.Errorf("%s: deadline ok=%v %v away, want ≤5s", name, s.ok, s.left)
+		}
+		if !s.req {
+			t.Errorf("%s: the DB context is not derived from the request context", name)
+		}
+		// An earlier request deadline is kept.
+		if call(short) == nil {
+			t.Fatalf("%s: no error from a refused connection", name)
+		}
+		if s := <-got; !s.ok || s.left > time.Second {
+			t.Errorf("%s: request deadline not kept (%v away)", name, s.left)
+		}
+	}
+
+	// A server that accepts and never answers: both calls fail after ~5s, not never.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var held sync.WaitGroup
+	defer held.Wait()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			held.Go(func() { io.Copy(io.Discard, conn); conn.Close() })
+		}
+	}()
+	stalled, err := openDB(config{env: "dev", dbURL: "postgres://vault_app@" + ln.Addr().String() + "/vault?sslmode=disable"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stalled.Close()
+	v = newVault(config{env: "dev", allowOrigin: testOrigin}, stalled, map[int][]byte{1: bytes.Repeat([]byte{1}, 32)}, 1,
+		testHMACKey, testSecret, newOutboundClient(nil), log.New(&testLog, "", 0))
+	var wg sync.WaitGroup
+	for name, call := range calls {
+		wg.Go(func() {
+			// The 30s outer bound only keeps a regression from hanging the suite.
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			start := time.Now()
+			err := call(ctx)
+			d := time.Since(start)
+			if err == nil {
+				t.Errorf("%s: stalled server: no error", name)
+			} else if want := "vault." + map[string]string{"putCard": "put_card", "getCard": "get_card"}[name] + ": failed"; err.Error() != want {
+				t.Errorf("%s: stalled server: error %q, want %q", name, err, want)
+			}
+			if d < 4500*time.Millisecond || d > 8*time.Second {
+				t.Errorf("%s: stalled server: returned after %v, want ~5s", name, d)
+			}
+		})
+	}
+	wg.Wait()
+	ln.Close()
+	stalled.Close()
+}
+
+// runMain runs main() in a subprocess of the test binary with exactly env (nothing inherited)
+// and args, and returns its exit code and stderr.
+func runMain(t *testing.T, env map[string]string, args ...string) (int, string) {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, exe, args...)
+	cmd.Env = []string{"PAN_VAULT_TEST_RUN_MAIN=1"}
+	for k, v := range env {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err = cmd.Run()
+	var exit *exec.ExitError
+	if err != nil && !errors.As(err, &exit) {
+		t.Fatalf("subprocess did not run: %v", err)
+	}
+	return cmd.ProcessState.ExitCode(), stderr.String()
+}
+
+// TestBootFailsFastOnTLSFiles: in serve mode the certificate, key and client CA are loaded right
+// after the environment is parsed (§11 "fail fast"), before the database, KMS or Secret Manager
+// is touched. VAULT_DB_URL is unparseable in every case, so a boot that reached openDB would
+// fail with the database reason instead. -rotate-dek never reads the TLS files.
+func TestBootFailsFastOnTLSFiles(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string, b []byte) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	caPEM, ca, caKey := testCertPEM(t, true, nil, nil)
+	leafPEM, _, leafKey := testCertPEM(t, false, ca, caKey)
+	keyDER, err := x509.MarshalECPrivateKey(leafKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certFile := write("cert.pem", leafPEM)
+	keyFile := write("key.pem", pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}))
+	caFile := write("ca.pem", caPEM)
+	missing := filepath.Join(dir, "missing.pem")
+	const badDB = "postgres://vault_app@127.0.0.1:notaport/vault"
+	dev := envWith(testDevEnv(), map[string]string{"VAULT_CERT": certFile, "VAULT_KEY": keyFile, "VAULT_CLIENT_CA": caFile, "VAULT_DB_URL": badDB})
+	prod := envWith(testProdEnv(), map[string]string{"VAULT_CERT": certFile, "VAULT_KEY": keyFile, "VAULT_CLIENT_CA": caFile, "VAULT_DB_URL": badDB})
+	for _, c := range []struct {
+		name string
+		env  map[string]string
+		args []string
+		want string
+	}{
+		{"dev missing cert", envWith(dev, map[string]string{"VAULT_CERT": missing}), nil, "VAULT_CERT/VAULT_KEY: cannot load key pair"},
+		{"dev missing key", envWith(dev, map[string]string{"VAULT_KEY": missing}), nil, "VAULT_CERT/VAULT_KEY: cannot load key pair"},
+		{"dev key does not match cert", envWith(dev, map[string]string{"VAULT_KEY": write("other-key.pem", func() []byte {
+			_, _, k := testCertPEM(t, false, nil, nil)
+			der, err := x509.MarshalECPrivateKey(k)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der})
+		}())}), nil, "VAULT_CERT/VAULT_KEY: cannot load key pair"},
+		{"dev missing client CA", envWith(dev, map[string]string{"VAULT_CLIENT_CA": missing}), nil, "VAULT_CLIENT_CA: client CA: cannot read file"},
+		{"dev client CA not a CA", envWith(dev, map[string]string{"VAULT_CLIENT_CA": certFile}), nil, "VAULT_CLIENT_CA: client CA: certificate is not a CA"},
+		{"prod missing cert", envWith(prod, map[string]string{"VAULT_CERT": missing}), nil, "VAULT_CERT/VAULT_KEY: cannot load key pair"},
+		{"prod missing client CA", envWith(prod, map[string]string{"VAULT_CLIENT_CA": missing}), nil, "VAULT_CLIENT_CA: client CA: cannot read file"},
+		// Controls: with good TLS files the boot proceeds to the database and fails there.
+		{"dev good TLS files", dev, nil, "VAULT_DB_URL cannot be parsed"},
+		{"prod good TLS files", prod, nil, "VAULT_DB_URL cannot be parsed"},
+		// -rotate-dek ignores the TLS variables entirely.
+		{"rotate ignores TLS files", envWith(prod, map[string]string{"VAULT_CERT": missing, "VAULT_KEY": missing, "VAULT_CLIENT_CA": missing}), []string{"-rotate-dek"}, "VAULT_DB_URL cannot be parsed"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			code, stderr := runMain(t, c.env, c.args...)
+			if code != 1 {
+				t.Errorf("exit code %d, want 1", code)
+			}
+			if !strings.Contains(stderr, " boot failed: "+c.want+"\n") {
+				t.Errorf("stderr (len %d) lacks boot failure reason %q", len(stderr), c.want)
+			}
+		})
 	}
 }
 
