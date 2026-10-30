@@ -2,11 +2,12 @@
 
 # Tools from the module's toolchain (go.mod `toolchain go1.27.3`), not whatever is first on PATH.
 GOFMT   = $(shell go env GOROOT)/bin/gofmt
-TOOLBIN = $(or $(shell go env GOBIN),$(shell go env GOPATH)/bin)
 
-# Pinned tool versions, built with the module's toolchain. `make tools` installs each one that is
-# missing or was built from another version or toolchain; lint and vuln depend on it so that
-# `make ci` works on a clean checkout with nothing pre-installed (§15).
+# Pinned tool versions, built with the module's toolchain into the repo-local, gitignored .tools/bin
+# (never the user's GOBIN or ~/go/bin). `make tools` installs each one that is missing or was built
+# from another version or toolchain; lint and vuln depend on it so that `make ci` works on a clean
+# checkout with nothing pre-installed (§15).
+TOOLBIN             = $(CURDIR)/.tools/bin
 TOOLCHAIN           = go1.27.3
 STATICCHECK_VERSION = v0.8.2
 GOVULNCHECK_VERSION = v1.9.0
@@ -32,10 +33,10 @@ lint: tools
 	@out=$$($(GOFMT) -l .) || { echo "lint: gofmt failed"; exit 1; }; \
 	test -z "$$out" || { echo "lint: gofmt would reformat:"; echo "$$out"; exit 1; }
 	go vet ./...
-	$(TOOLBIN)/staticcheck ./...
+	"$(TOOLBIN)/staticcheck" ./...
 
 vuln: tools
-	$(TOOLBIN)/govulncheck ./...
+	"$(TOOLBIN)/govulncheck" ./...
 
 deps-check:
 	go mod tidy -diff
@@ -75,22 +76,24 @@ image-repro:
 ci: lint vuln deps-check vendor-check test build
 
 # A tool is current when `go version -m` reports the pinned toolchain and module version; any
-# other file under its name (another version, a script) is removed and the pinned one installed.
+# other file under its name in .tools/bin (another version, a script) is removed and the pinned
+# one installed. GOBIN is set only for the install command, so nothing outside the repo changes.
 tools:
 	@set -e; \
 	current() { info=$$(go version -m "$(TOOLBIN)/$$1" 2>/dev/null) || return 1; \
 		printf '%s\n' "$$info" | head -n 1 | grep -q ": $(TOOLCHAIN)\$$" && \
 		printf '%s\n' "$$info" | grep -q "^[[:space:]]*mod[[:space:]]*$$2[[:space:]]*$$3[[:space:]]"; }; \
+	mkdir -p "$(TOOLBIN)"; \
 	if ! current staticcheck honnef.co/go/tools $(STATICCHECK_VERSION); then \
 		echo "tools: installing staticcheck $(STATICCHECK_VERSION)"; \
 		rm -f "$(TOOLBIN)/staticcheck"; \
-		GOTOOLCHAIN=$(TOOLCHAIN) go install honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION); \
+		GOBIN="$(TOOLBIN)" GOTOOLCHAIN=$(TOOLCHAIN) go install honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION); \
 		current staticcheck honnef.co/go/tools $(STATICCHECK_VERSION) || { echo "tools: staticcheck not at $(STATICCHECK_VERSION) in $(TOOLBIN)"; exit 1; }; \
 	fi; \
 	if ! current govulncheck golang.org/x/vuln $(GOVULNCHECK_VERSION); then \
 		echo "tools: installing govulncheck $(GOVULNCHECK_VERSION)"; \
 		rm -f "$(TOOLBIN)/govulncheck"; \
-		GOTOOLCHAIN=$(TOOLCHAIN) go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION); \
+		GOBIN="$(TOOLBIN)" GOTOOLCHAIN=$(TOOLCHAIN) go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION); \
 		current govulncheck golang.org/x/vuln $(GOVULNCHECK_VERSION) || { echo "tools: govulncheck not at $(GOVULNCHECK_VERSION) in $(TOOLBIN)"; exit 1; }; \
 	fi
 
