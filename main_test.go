@@ -4,16 +4,22 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log"
 	"maps"
@@ -22,6 +28,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -2811,5 +2818,742 @@ func TestIntegrationVelocityGlobal(t *testing.T) {
 	used = append(used, tok)
 	if _, _, err := dbGetCard(ctx, app, tok, "0A"); !errors.Is(err, errVelocity) {
 		t.Errorf("get past the global limit: err = %v, want errVelocity", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Boot: config, GCP REST access, secrets, DB pool, client CA, servers (SPEC §8.2–§8.6, §11)
+// These tests replace package-level base URLs and must not call t.Parallel.
+// ---------------------------------------------------------------------------
+
+const (
+	testKMSKey     = "projects/p1/locations/global/keyRings/r1/cryptoKeys/k1"
+	testHMACName   = "projects/p1/secrets/session-hmac"
+	testStripeName = "projects/p1/secrets/stripe-key"
+	testGCPToken   = "ya29.fake-access-token"
+)
+
+// pointURL sets *p to v for the duration of the test.
+func pointURL(t *testing.T, p *string, v string) {
+	t.Helper()
+	old := *p
+	*p = v
+	t.Cleanup(func() { *p = old })
+}
+
+// newFakeMetadata serves the metadata token endpoint (requires Metadata-Flavor: Google) and
+// points metadataTokenURL at it. respond, if set, writes the response instead.
+func newFakeMetadata(t *testing.T, respond func(w http.ResponseWriter)) *atomic.Int32 {
+	t.Helper()
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/token" || r.Header.Get("Metadata-Flavor") != "Google" {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		hits.Add(1)
+		if respond != nil {
+			respond(w)
+			return
+		}
+		w.Header().Set("Metadata-Flavor", "Google")
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"access_token":%q,"expires_in":3599,"token_type":"Bearer"}`, testGCPToken)
+	}))
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	t.Cleanup(srv.Close)
+	pointURL(t, &metadataTokenURL, srv.URL+"/token")
+	return &hits
+}
+
+func reversed(b []byte) []byte {
+	out := slices.Clone(b)
+	slices.Reverse(out)
+	return out
+}
+
+// fakeKMS stands in for Cloud KMS: encrypt reverses the bytes, decrypt reverses them back.
+// mode "short" makes decrypt return 31 bytes, "corrupt" flips a byte, "500" fails every call.
+type fakeKMS struct {
+	mu   sync.Mutex
+	mode string
+	hits int
+}
+
+func (k *fakeKMS) setMode(m string) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.mode = m
+}
+
+func (k *fakeKMS) count() int {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.hits
+}
+
+func newFakeKMS(t *testing.T) *fakeKMS {
+	t.Helper()
+	k := &fakeKMS{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		k.mu.Lock()
+		k.hits++
+		mode := k.mode
+		k.mu.Unlock()
+		if r.Method != http.MethodPost || r.Header.Get("Authorization") != "Bearer "+testGCPToken ||
+			r.Header.Get("Content-Type") != "application/json" || mode == "500" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		var in map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil || len(in) != 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var field, out string
+		switch r.URL.Path {
+		case "/v1/" + testKMSKey + ":encrypt":
+			field, out = "plaintext", "ciphertext"
+		case "/v1/" + testKMSKey + ":decrypt":
+			field, out = "ciphertext", "plaintext"
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		b, err := base64.StdEncoding.DecodeString(in[field])
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		b = reversed(b)
+		if out == "plaintext" && mode == "short" {
+			b = b[:len(b)-1]
+		}
+		if out == "plaintext" && mode == "corrupt" {
+			b[0] ^= 0xff
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{out: base64.StdEncoding.EncodeToString(b), "name": testKMSKey})
+	}))
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	t.Cleanup(srv.Close)
+	pointURL(t, &kmsBaseURL, srv.URL+"/v1/")
+	return k
+}
+
+// newFakeSecretManager serves secrets[name] at /v1/<name>/versions/latest:access with a correct
+// dataCrc32c (or a wrong one when badCRC). Unknown names are 404.
+func newFakeSecretManager(t *testing.T, secrets map[string]string, badCRC bool) *atomic.Int32 {
+	t.Helper()
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer "+testGCPToken {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		name, ok := strings.CutSuffix(strings.TrimPrefix(r.URL.Path, "/v1/"), "/versions/latest:access")
+		data, found := secrets[name]
+		if !ok || !found {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		crc := crc32.Checksum([]byte(data), crc32.MakeTable(crc32.Castagnoli))
+		if badCRC {
+			crc++
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"name":%q,"payload":{"data":%q,"dataCrc32c":"%d"}}`,
+			name+"/versions/1", base64.StdEncoding.EncodeToString([]byte(data)), crc)
+	}))
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	t.Cleanup(srv.Close)
+	pointURL(t, &secretManagerBaseURL, srv.URL+"/v1/")
+	return &hits
+}
+
+func testDevEnv() map[string]string {
+	return map[string]string{
+		"VAULT_ENV":                  "dev",
+		"VAULT_CERT":                 "/etc/vault/srv-cert.pem",
+		"VAULT_KEY":                  "/etc/vault/srv-key.pem",
+		"VAULT_CLIENT_CA":            "/etc/vault/client-ca.pem",
+		"VAULT_ALLOW_ORIGIN":         testOrigin,
+		"VAULT_DB_URL":               "postgres://vault_app:pw-x9q@db.internal/vault",
+		"VAULT_DEV_DEK_HEX":          strings.Repeat("ab", 32),
+		"VAULT_DEV_SESSION_HMAC_HEX": strings.Repeat("cd", 32),
+		"VAULT_DEV_STRIPE_SECRET":    testSecret,
+	}
+}
+
+func testProdEnv() map[string]string {
+	return map[string]string{
+		"VAULT_ENV":                 "prod",
+		"VAULT_CERT":                "/etc/vault/srv-cert.pem",
+		"VAULT_KEY":                 "/etc/vault/srv-key.pem",
+		"VAULT_CLIENT_CA":           "/etc/vault/client-ca.pem",
+		"VAULT_ALLOW_ORIGIN":        testOrigin,
+		"VAULT_DB_URL":              "postgres://vault_app@10.1.2.3/vault?sslmode=verify-full",
+		"VAULT_KMS_KEY":             testKMSKey,
+		"VAULT_SESSION_HMAC_SECRET": testHMACName,
+		"VAULT_STRIPE_SECRET":       testStripeName,
+	}
+}
+
+// envWith copies base and applies over; a value of omit deletes the key.
+func envWith(base, over map[string]string) map[string]string {
+	m := maps.Clone(base)
+	for k, v := range over {
+		if v == omit {
+			delete(m, k)
+		} else {
+			m[k] = v
+		}
+	}
+	return m
+}
+
+func TestLoadConfig(t *testing.T) {
+	rotEnv := map[string]string{"VAULT_ENV": "prod", "VAULT_DB_URL": "postgres://vault_rotator@10.1.2.3/vault?sslmode=verify-full", "VAULT_KMS_KEY": testKMSKey}
+	cases := []struct {
+		name    string
+		env     map[string]string
+		rotate  bool
+		mention string // non-empty: an error naming this variable is expected
+	}{
+		{"dev with all dev vars", testDevEnv(), false, ""},
+		{"dev custom addrs", envWith(testDevEnv(), map[string]string{"VAULT_PUBLIC_ADDR": "127.0.0.1:1", "VAULT_INTERNAL_ADDR": "127.0.0.1:2"}), false, ""},
+		{"dev http localhost origin", envWith(testDevEnv(), map[string]string{"VAULT_ALLOW_ORIGIN": "http://localhost:3000"}), false, ""},
+		{"dev KMS instead of dev DEK", envWith(testDevEnv(), map[string]string{"VAULT_DEV_DEK_HEX": omit, "VAULT_KMS_KEY": testKMSKey}), false, ""},
+		{"dev SM instead of dev secrets", envWith(testDevEnv(), map[string]string{"VAULT_DEV_SESSION_HMAC_HEX": omit, "VAULT_SESSION_HMAC_SECRET": testHMACName, "VAULT_DEV_STRIPE_SECRET": omit, "VAULT_STRIPE_SECRET": testStripeName}), false, ""},
+		{"prod", testProdEnv(), false, ""},
+		{"missing VAULT_ENV", envWith(testDevEnv(), map[string]string{"VAULT_ENV": omit}), false, "VAULT_ENV"},
+		{"VAULT_ENV staging", envWith(testDevEnv(), map[string]string{"VAULT_ENV": "staging"}), false, "VAULT_ENV"},
+		{"VAULT_ENV Prod", envWith(testProdEnv(), map[string]string{"VAULT_ENV": "Prod"}), false, "VAULT_ENV"},
+		{"dev missing VAULT_CERT", envWith(testDevEnv(), map[string]string{"VAULT_CERT": omit}), false, "VAULT_CERT"},
+		{"dev missing VAULT_KEY", envWith(testDevEnv(), map[string]string{"VAULT_KEY": omit}), false, "VAULT_KEY"},
+		{"dev missing VAULT_CLIENT_CA", envWith(testDevEnv(), map[string]string{"VAULT_CLIENT_CA": omit}), false, "VAULT_CLIENT_CA"},
+		{"dev missing VAULT_ALLOW_ORIGIN", envWith(testDevEnv(), map[string]string{"VAULT_ALLOW_ORIGIN": omit}), false, "VAULT_ALLOW_ORIGIN"},
+		{"dev missing VAULT_DB_URL", envWith(testDevEnv(), map[string]string{"VAULT_DB_URL": omit}), false, "VAULT_DB_URL"},
+		{"origin trailing slash", envWith(testDevEnv(), map[string]string{"VAULT_ALLOW_ORIGIN": testOrigin + "/"}), false, "VAULT_ALLOW_ORIGIN"},
+		{"origin wildcard", envWith(testDevEnv(), map[string]string{"VAULT_ALLOW_ORIGIN": "*"}), false, "VAULT_ALLOW_ORIGIN"},
+		{"origin with path", envWith(testDevEnv(), map[string]string{"VAULT_ALLOW_ORIGIN": testOrigin + "/pay"}), false, "VAULT_ALLOW_ORIGIN"},
+		{"origin with query", envWith(testDevEnv(), map[string]string{"VAULT_ALLOW_ORIGIN": testOrigin + "?a=1"}), false, "VAULT_ALLOW_ORIGIN"},
+		{"origin with userinfo", envWith(testDevEnv(), map[string]string{"VAULT_ALLOW_ORIGIN": "https://u@checkout.example.com"}), false, "VAULT_ALLOW_ORIGIN"},
+		{"prod http origin", envWith(testProdEnv(), map[string]string{"VAULT_ALLOW_ORIGIN": "http://checkout.example.com"}), false, "VAULT_ALLOW_ORIGIN"},
+		{"prod missing VAULT_KMS_KEY", envWith(testProdEnv(), map[string]string{"VAULT_KMS_KEY": omit}), false, "VAULT_KMS_KEY"},
+		{"prod missing VAULT_SESSION_HMAC_SECRET", envWith(testProdEnv(), map[string]string{"VAULT_SESSION_HMAC_SECRET": omit}), false, "VAULT_SESSION_HMAC_SECRET"},
+		{"prod missing VAULT_STRIPE_SECRET", envWith(testProdEnv(), map[string]string{"VAULT_STRIPE_SECRET": omit}), false, "VAULT_STRIPE_SECRET"},
+		{"prod + VAULT_DEV_DEK_HEX", envWith(testProdEnv(), map[string]string{"VAULT_DEV_DEK_HEX": strings.Repeat("ab", 32)}), false, "VAULT_DEV_DEK_HEX"},
+		{"prod + VAULT_DEV_SESSION_HMAC_HEX", envWith(testProdEnv(), map[string]string{"VAULT_DEV_SESSION_HMAC_HEX": strings.Repeat("cd", 32)}), false, "VAULT_DEV_SESSION_HMAC_HEX"},
+		{"prod + VAULT_DEV_STRIPE_SECRET", envWith(testProdEnv(), map[string]string{"VAULT_DEV_STRIPE_SECRET": testSecret}), false, "VAULT_DEV_STRIPE_SECRET"},
+		{"dev DEK 63 hex", envWith(testDevEnv(), map[string]string{"VAULT_DEV_DEK_HEX": strings.Repeat("ab", 31) + "a"}), false, "VAULT_DEV_DEK_HEX"},
+		{"dev DEK 66 hex", envWith(testDevEnv(), map[string]string{"VAULT_DEV_DEK_HEX": strings.Repeat("ab", 33)}), false, "VAULT_DEV_DEK_HEX"},
+		{"dev DEK not hex", envWith(testDevEnv(), map[string]string{"VAULT_DEV_DEK_HEX": strings.Repeat("zq", 32)}), false, "VAULT_DEV_DEK_HEX"},
+		{"dev HMAC 63 hex", envWith(testDevEnv(), map[string]string{"VAULT_DEV_SESSION_HMAC_HEX": strings.Repeat("cd", 31) + "c"}), false, "VAULT_DEV_SESSION_HMAC_HEX"},
+		{"dev no DEK source", envWith(testDevEnv(), map[string]string{"VAULT_DEV_DEK_HEX": omit}), false, "VAULT_KMS_KEY"},
+		{"dev no HMAC source", envWith(testDevEnv(), map[string]string{"VAULT_DEV_SESSION_HMAC_HEX": omit}), false, "VAULT_SESSION_HMAC_SECRET"},
+		{"dev no Stripe source", envWith(testDevEnv(), map[string]string{"VAULT_DEV_STRIPE_SECRET": omit}), false, "VAULT_STRIPE_SECRET"},
+		{"KMS key bad shape", envWith(testProdEnv(), map[string]string{"VAULT_KMS_KEY": "projects/p1/locations/global/keyRings/r1/cryptoKeys/../k1"}), false, "VAULT_KMS_KEY"},
+		{"KMS key with query", envWith(testProdEnv(), map[string]string{"VAULT_KMS_KEY": testKMSKey + "?x=1"}), false, "VAULT_KMS_KEY"},
+		{"HMAC secret bad shape", envWith(testProdEnv(), map[string]string{"VAULT_SESSION_HMAC_SECRET": "projects/p1/secrets/s/versions/3"}), false, "VAULT_SESSION_HMAC_SECRET"},
+		{"Stripe secret bad shape", envWith(testProdEnv(), map[string]string{"VAULT_STRIPE_SECRET": "https://evil.example/x"}), false, "VAULT_STRIPE_SECRET"},
+		{"rotate prod only ENV/DB/KMS", rotEnv, true, ""},
+		{"rotate dev only ENV/DB/KMS", envWith(rotEnv, map[string]string{"VAULT_ENV": "dev"}), true, ""},
+		{"rotate missing KMS", envWith(rotEnv, map[string]string{"VAULT_KMS_KEY": omit}), true, "VAULT_KMS_KEY"},
+		{"rotate missing DB", envWith(rotEnv, map[string]string{"VAULT_DB_URL": omit}), true, "VAULT_DB_URL"},
+		{"rotate missing ENV", envWith(rotEnv, map[string]string{"VAULT_ENV": omit}), true, "VAULT_ENV"},
+		{"rotate prod + VAULT_DEV_DEK_HEX", envWith(rotEnv, map[string]string{"VAULT_DEV_DEK_HEX": strings.Repeat("ab", 32)}), true, "VAULT_DEV_DEK_HEX"},
+		{"serve with only rotate vars", rotEnv, false, "VAULT_CERT"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg, err := loadConfig(func(k string) string { return c.env[k] }, c.rotate)
+			if c.mention == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("no error; want one naming %s", c.mention)
+			}
+			if !strings.Contains(err.Error(), c.mention) {
+				t.Errorf("error %q does not name %s", err, c.mention)
+			}
+			for k, v := range c.env {
+				if v != "dev" && v != "prod" && strings.Contains(err.Error(), v) {
+					t.Errorf("error contains the value of %s", k) // never print the value
+				}
+			}
+			_ = cfg
+		})
+	}
+
+	// Field mapping and defaults.
+	cfg, err := loadConfig(func(k string) string { return testDevEnv()[k] }, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.env != "dev" || cfg.publicAddr != ":8443" || cfg.internalAddr != ":9443" ||
+		cfg.certFile != "/etc/vault/srv-cert.pem" || cfg.keyFile != "/etc/vault/srv-key.pem" ||
+		cfg.clientCAFile != "/etc/vault/client-ca.pem" || cfg.allowOrigin != testOrigin ||
+		cfg.dbURL != testDevEnv()["VAULT_DB_URL"] || cfg.kmsKey != "" {
+		t.Error("dev config fields or defaults wrong")
+	}
+	if !bytes.Equal(cfg.devDEK, bytes.Repeat([]byte{0xab}, 32)) || !bytes.Equal(cfg.devHMAC, bytes.Repeat([]byte{0xcd}, 32)) ||
+		cfg.devStripeSecret != testSecret {
+		t.Error("dev secrets not decoded")
+	}
+	cfg, err = loadConfig(func(k string) string { return testProdEnv()[k] }, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.env != "prod" || cfg.kmsKey != testKMSKey || cfg.hmacSecretName != testHMACName ||
+		cfg.stripeSecretName != testStripeName || cfg.devDEK != nil || cfg.devHMAC != nil || cfg.devStripeSecret != "" {
+		t.Error("prod config fields wrong")
+	}
+	cfg, err = loadConfig(func(k string) string { return rotEnv[k] }, true)
+	if err != nil || cfg.env != "prod" || cfg.kmsKey != testKMSKey || cfg.dbURL != rotEnv["VAULT_DB_URL"] {
+		t.Error("rotate config fields wrong")
+	}
+}
+
+func TestDevVarSet(t *testing.T) {
+	if name, ok := devVarSet([]string{"PATH=/bin", "VAULT_ENV=prod", "VAULT_DEV_ANYTHING=", "HOME=/root"}); !ok || name != "VAULT_DEV_ANYTHING" {
+		t.Errorf("got %q %v, want VAULT_DEV_ANYTHING", name, ok)
+	}
+	if _, ok := devVarSet([]string{"PATH=/bin", "VAULT_ENV=prod", "XVAULT_DEV_X=1", "VAULT_DEVX=1"}); ok {
+		t.Error("false positive")
+	}
+}
+
+func TestTokenSourceCaches(t *testing.T) {
+	hits := newFakeMetadata(t, nil)
+	ts := &tokenSource{client: newOutboundClient(nil)}
+	ctx := context.Background()
+	for i := range 2 {
+		tok, err := ts.token(ctx)
+		if err != nil || tok != testGCPToken {
+			t.Fatalf("call %d: token wrong, err %v", i, err)
+		}
+	}
+	if n := hits.Load(); n != 1 {
+		t.Errorf("metadata hits %d, want 1", n)
+	}
+	// Within 60s of expiry the token is refreshed.
+	ts.mu.Lock()
+	ts.exp = time.Now().Add(59 * time.Second)
+	ts.mu.Unlock()
+	if _, err := ts.token(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := hits.Load(); n != 2 {
+		t.Errorf("metadata hits %d after near-expiry, want 2", n)
+	}
+}
+
+func TestTokenSourceRejects(t *testing.T) {
+	good := func(w http.ResponseWriter, body string) {
+		w.Header().Set("Metadata-Flavor", "Google")
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, body)
+	}
+	cases := map[string]func(w http.ResponseWriter){
+		"status 500":         func(w http.ResponseWriter) { w.Header().Set("Metadata-Flavor", "Google"); w.WriteHeader(500) },
+		"redirect":           func(w http.ResponseWriter) { w.Header().Set("Location", "http://evil.example/"); w.WriteHeader(302) },
+		"no flavor header":   func(w http.ResponseWriter) { io.WriteString(w, `{"access_token":"abc","expires_in":3599}`) },
+		"empty token":        func(w http.ResponseWriter) { good(w, `{"access_token":"","expires_in":3599}`) },
+		"token with space":   func(w http.ResponseWriter) { good(w, `{"access_token":"ab c","expires_in":3599}`) },
+		"token with newline": func(w http.ResponseWriter) { good(w, `{"access_token":"abc\r\nX: y","expires_in":3599}`) },
+		"zero expiry":        func(w http.ResponseWriter) { good(w, `{"access_token":"abc","expires_in":0}`) },
+		"not json":           func(w http.ResponseWriter) { good(w, `nope`) },
+		"oversize": func(w http.ResponseWriter) {
+			good(w, `{"access_token":"`+strings.Repeat("a", 1<<20)+`","expires_in":3599}`)
+		},
+	}
+	for name, respond := range cases {
+		t.Run(name, func(t *testing.T) {
+			newFakeMetadata(t, respond)
+			ts := &tokenSource{client: newOutboundClient(nil)}
+			if tok, err := ts.token(context.Background()); err == nil {
+				t.Errorf("accepted (token len %d)", len(tok))
+			}
+		})
+	}
+}
+
+func TestKMSRoundTrip(t *testing.T) {
+	newFakeMetadata(t, nil)
+	k := newFakeKMS(t)
+	c := newOutboundClient(nil)
+	ts := &tokenSource{client: c}
+	ctx := context.Background()
+	pt := make([]byte, 32)
+	for i := range pt {
+		pt[i] = byte(i + 1)
+	}
+	wrapped, err := kmsEncrypt(ctx, c, ts, testKMSKey, pt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(wrapped, reversed(pt)) {
+		t.Error("encrypt did not return the KMS ciphertext")
+	}
+	got, err := kmsDecrypt(ctx, c, ts, testKMSKey, wrapped)
+	if err != nil || !bytes.Equal(got, pt) {
+		t.Fatalf("decrypt round trip failed: %v", err)
+	}
+
+	k.setMode("short")
+	if got, err := kmsDecrypt(ctx, c, ts, testKMSKey, wrapped); err == nil {
+		t.Errorf("31-byte plaintext accepted (len %d)", len(got))
+	}
+	k.setMode("500")
+	if _, err := kmsDecrypt(ctx, c, ts, testKMSKey, wrapped); err == nil {
+		t.Error("decrypt: status 500 accepted")
+	} else if strings.Contains(err.Error(), testKMSKey) {
+		t.Error("error names the key")
+	}
+	if _, err := kmsEncrypt(ctx, c, ts, testKMSKey, pt); err == nil {
+		t.Error("encrypt: status 500 accepted")
+	}
+	k.setMode("")
+	before := k.count()
+	for _, bad := range []string{"", "projects/p1/locations/global/keyRings/r1/cryptoKeys/k1/../../x", testKMSKey + "?a=b"} {
+		if _, err := kmsDecrypt(ctx, c, ts, bad, wrapped); err == nil {
+			t.Error("bad key name accepted")
+		}
+	}
+	if k.count() != before {
+		t.Error("bad key name reached KMS")
+	}
+}
+
+func TestAccessSecret(t *testing.T) {
+	newFakeMetadata(t, nil)
+	newFakeSecretManager(t, map[string]string{testStripeName: testSecret}, false)
+	c := newOutboundClient(nil)
+	ts := &tokenSource{client: c}
+	ctx := context.Background()
+	got, err := accessSecret(ctx, c, ts, testStripeName)
+	if err != nil || string(got) != testSecret {
+		t.Fatalf("payload wrong (len %d), err %v", len(got), err)
+	}
+	if _, err := accessSecret(ctx, c, ts, "projects/p1/secrets/missing"); err == nil {
+		t.Error("404 accepted")
+	}
+	if _, err := accessSecret(ctx, c, ts, "projects/p1/secrets/../x"); err == nil {
+		t.Error("bad name accepted")
+	}
+
+	newFakeSecretManager(t, map[string]string{testStripeName: testSecret}, true)
+	if _, err := accessSecret(ctx, c, ts, testStripeName); err == nil {
+		t.Error("CRC mismatch accepted")
+	}
+}
+
+func TestLoadSecrets(t *testing.T) {
+	ctx := context.Background()
+	hmacKey := bytes.Repeat([]byte{0x5a}, 32)
+
+	// Dev values: no network at all (nil client and token source).
+	cfg := config{env: "dev", devHMAC: hmacKey, devStripeSecret: testSecret}
+	k, s, err := loadSecrets(ctx, cfg, nil, nil)
+	if err != nil || !bytes.Equal(k, hmacKey) || s != testSecret {
+		t.Fatalf("dev secrets wrong: %v", err)
+	}
+	for name, cfg := range map[string]config{
+		"stripe trailing newline": {env: "dev", devHMAC: hmacKey, devStripeSecret: "sk_test_x\n"},
+		"stripe inner space":      {env: "dev", devHMAC: hmacKey, devStripeSecret: "sk_test x"},
+		"stripe control char":     {env: "dev", devHMAC: hmacKey, devStripeSecret: "sk_test_\x01x"},
+		"HMAC 31 bytes":           {env: "dev", devHMAC: hmacKey[:31], devStripeSecret: testSecret},
+		"prod with dev HMAC":      {env: "prod", devHMAC: hmacKey, devStripeSecret: testSecret, hmacSecretName: testHMACName, stripeSecretName: testStripeName},
+	} {
+		if _, _, err := loadSecrets(ctx, cfg, nil, nil); err == nil {
+			t.Errorf("%s: accepted", name)
+		} else if strings.Contains(err.Error(), "sk_test") {
+			t.Errorf("%s: error contains the secret", name)
+		}
+	}
+
+	// Secret Manager path.
+	newFakeMetadata(t, nil)
+	c := newOutboundClient(nil)
+	prod := config{env: "prod", hmacSecretName: testHMACName, stripeSecretName: testStripeName}
+	newFakeSecretManager(t, map[string]string{testHMACName: hex.EncodeToString(hmacKey), testStripeName: testSecret}, false)
+	k, s, err = loadSecrets(ctx, prod, c, &tokenSource{client: c})
+	if err != nil || !bytes.Equal(k, hmacKey) || s != testSecret {
+		t.Fatalf("Secret Manager secrets wrong: %v", err)
+	}
+	for name, sm := range map[string]map[string]string{
+		"HMAC trailing newline": {testHMACName: hex.EncodeToString(hmacKey) + "\n", testStripeName: testSecret},
+		"HMAC 62 hex":           {testHMACName: hex.EncodeToString(hmacKey[:31]), testStripeName: testSecret},
+		"HMAC not hex":          {testHMACName: strings.Repeat("zz", 32), testStripeName: testSecret},
+		"stripe with space":     {testHMACName: hex.EncodeToString(hmacKey), testStripeName: testSecret + " "},
+		"stripe empty":          {testHMACName: hex.EncodeToString(hmacKey), testStripeName: ""},
+		"stripe missing":        {testHMACName: hex.EncodeToString(hmacKey)},
+	} {
+		newFakeSecretManager(t, sm, false)
+		if _, _, err := loadSecrets(ctx, prod, c, &tokenSource{client: c}); err == nil {
+			t.Errorf("%s: accepted", name)
+		} else if strings.Contains(err.Error(), testSecret) || strings.Contains(err.Error(), hex.EncodeToString(hmacKey)) {
+			t.Errorf("%s: error contains secret material", name)
+		}
+	}
+}
+
+func TestLoadDEKsDev(t *testing.T) {
+	dek := bytes.Repeat([]byte{0x33}, 32)
+	deks, cur, err := loadDEKs(context.Background(), config{env: "dev", devDEK: dek}, nil, nil, nil)
+	if err != nil || cur != 1 || len(deks) != 1 || !bytes.Equal(deks[1], dek) {
+		t.Fatalf("dev DEK not loaded as version 1: %v", err)
+	}
+	if _, _, err := loadDEKs(context.Background(), config{env: "prod", devDEK: dek, kmsKey: testKMSKey}, nil, nil, nil); err == nil {
+		t.Error("prod accepted a dev DEK")
+	}
+	if _, _, err := loadDEKs(context.Background(), config{env: "dev", devDEK: dek[:31]}, nil, nil, nil); err == nil {
+		t.Error("31-byte dev DEK accepted")
+	}
+}
+
+func TestDEKVersionList(t *testing.T) {
+	if got := dekVersions(map[int][]byte{10: nil, 2: nil, 1: nil}); got != "1,2,10" {
+		t.Errorf("got %q", got)
+	}
+}
+
+// rotateDEK verifies the wrapped DEK unwraps to the generated one before storing it; a KMS that
+// does not round-trip fails before the database is touched (db is nil here).
+func TestRotateDEKVerifiesWrap(t *testing.T) {
+	newFakeMetadata(t, nil)
+	k := newFakeKMS(t)
+	c := newOutboundClient(nil)
+	cfg := config{env: "prod", kmsKey: testKMSKey}
+	for _, mode := range []string{"corrupt", "short", "500"} {
+		k.setMode(mode)
+		if _, err := rotateDEK(context.Background(), cfg, nil, c, &tokenSource{client: c}); err == nil {
+			t.Errorf("mode %s: accepted", mode)
+		}
+	}
+	if _, err := rotateDEK(context.Background(), config{env: "prod"}, nil, c, &tokenSource{client: c}); err == nil {
+		t.Error("empty KMS key accepted")
+	}
+}
+
+func TestOpenDB(t *testing.T) {
+	const devURL = "postgres://vault_app:pw-x9q@127.0.0.1:1/vault?sslmode=disable&connect_timeout=2"
+	db, err := openDB(config{env: "dev", dbURL: devURL}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := db.Stats().MaxOpenConnections; n != 16 {
+		t.Errorf("dev MaxOpenConnections %d, want 16", n)
+	}
+	db.Close()
+
+	// prod: the password is a metadata access token fetched before every new connection.
+	hits := newFakeMetadata(t, nil)
+	c := newOutboundClient(nil)
+	const prodURL = "postgres://vault_app@127.0.0.1:1/vault?sslmode=verify-full&connect_timeout=2"
+	db, err = openDB(config{env: "prod", dbURL: prodURL}, &tokenSource{client: c})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if n := db.Stats().MaxOpenConnections; n != 16 {
+		t.Errorf("prod MaxOpenConnections %d, want 16", n)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if db.PingContext(ctx) == nil {
+		t.Fatal("ping to a closed port succeeded")
+	}
+	if hits.Load() < 1 {
+		t.Error("BeforeConnect did not fetch a metadata token")
+	}
+
+	for name, cfg := range map[string]config{
+		"prod sslmode=disable": {env: "prod", dbURL: "postgres://vault_app@127.0.0.1:1/vault?sslmode=disable"},
+		"prod sslmode=prefer":  {env: "prod", dbURL: "postgres://vault_app@127.0.0.1:1/vault?sslmode=prefer"},
+		"prod sslmode=allow":   {env: "prod", dbURL: "postgres://vault_app@127.0.0.1:1/vault?sslmode=allow"},
+		"prod sslmode=require": {env: "prod", dbURL: "postgres://vault_app@127.0.0.1:1/vault?sslmode=require"},
+		"prod default sslmode": {env: "prod", dbURL: "postgres://vault_app@127.0.0.1:1/vault"},
+		"unparseable":          {env: "dev", dbURL: "postgres://vault_app:pw-x9q@127.0.0.1:notaport/vault"},
+		"unparseable keyword":  {env: "dev", dbURL: "host=127.0.0.1 password=pw-x9q port=bad"},
+	} {
+		if db, err := openDB(cfg, &tokenSource{client: c}); err == nil {
+			db.Close()
+			t.Errorf("%s: accepted", name)
+		} else if strings.Contains(err.Error(), "pw-x9q") || strings.Contains(err.Error(), "127.0.0.1") {
+			t.Errorf("%s: error reveals the URL", name)
+		}
+	}
+	if db, err := openDB(config{env: "prod", dbURL: prodURL}, nil); err == nil {
+		db.Close()
+		t.Error("prod without a token source accepted")
+	}
+}
+
+// testCertPEM returns a PEM certificate: a self-signed CA when parent is nil and isCA, else a
+// leaf signed by parent (or self-signed). It also returns the cert and key for chaining.
+func testCertPEM(t *testing.T, isCA bool, parent *x509.Certificate, parentKey *ecdsa.PrivateKey) ([]byte, *x509.Certificate, *ecdsa.PrivateKey) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(0x0A1B2C),
+		Subject:               pkix.Name{CommonName: "test"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		BasicConstraintsValid: true,
+		IsCA:                  isCA,
+	}
+	if isCA {
+		tmpl.KeyUsage = x509.KeyUsageCertSign
+	} else {
+		tmpl.KeyUsage = x509.KeyUsageDigitalSignature
+		tmpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
+	}
+	signer, signerKey := tmpl, key
+	if parent != nil {
+		signer, signerKey = parent, parentKey
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, signer, &key.PublicKey, signerKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), cert, key
+}
+
+func TestLoadClientCA(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string, b []byte) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	caPEM, ca, caKey := testCertPEM(t, true, nil, nil)
+	ca2PEM, _, _ := testCertPEM(t, true, nil, nil)
+	_, leaf, _ := testCertPEM(t, false, ca, caKey)
+	selfLeafPEM, _, _ := testCertPEM(t, false, nil, nil)
+	keyDER, _ := x509.MarshalECPrivateKey(caKey)
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+
+	pool, err := loadClientCA(write("ca.pem", caPEM))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := leaf.Verify(x509.VerifyOptions{Roots: pool, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
+		t.Errorf("leaf signed by the CA does not verify: %v", err)
+	}
+	for name, b := range map[string][]byte{
+		"two CAs":        append(slices.Clone(caPEM), ca2PEM...),
+		"CA plus key":    append(slices.Clone(caPEM), keyPEM...),
+		"leaf (non-CA)":  selfLeafPEM,
+		"garbage":        []byte("not a certificate"),
+		"empty":          {},
+		"key only":       keyPEM,
+		"wrong PEM type": pem.EncodeToMemory(&pem.Block{Type: "TRUSTED CERTIFICATE", Bytes: ca.Raw}),
+		"corrupt DER":    pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.Raw[:len(ca.Raw)/2]}),
+	} {
+		if _, err := loadClientCA(write(strings.ReplaceAll(name, " ", "_")+".pem", b)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if _, err := loadClientCA(filepath.Join(dir, "missing.pem")); err == nil {
+		t.Error("missing file accepted")
+	}
+}
+
+func TestNewVault(t *testing.T) {
+	db, err := openDB(config{env: "dev", dbURL: "postgres://vault_app@127.0.0.1:1/vault?sslmode=disable&connect_timeout=2"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	deks := map[int][]byte{1: bytes.Repeat([]byte{1}, 32), 2: bytes.Repeat([]byte{2}, 32)}
+	c := newOutboundClient(nil)
+	logger := log.New(&testLog, "", 0)
+	v := newVault(config{env: "dev", allowOrigin: testOrigin}, db, deks, 2, testHMACKey, testSecret, c, logger)
+	if v.putCard == nil || v.getCard == nil || v.ping == nil || v.cvv == nil || v.now == nil {
+		t.Fatal("function fields or CVV cache not wired")
+	}
+	if v.currentDEK != 2 || len(v.deks) != 2 || !bytes.Equal(v.hmacKey, testHMACKey) || v.allowOrigin != testOrigin ||
+		v.client != c || v.log != logger {
+		t.Error("fields not wired")
+	}
+	if p, ok := v.providers["stripe"]; !ok || p.secret != testSecret {
+		t.Error("stripe provider secret not wired")
+	}
+	if v.cvv.ttl != 15*time.Minute {
+		t.Errorf("CVV TTL %v", v.cvv.ttl)
+	}
+	if d := time.Since(v.now()); d < 0 || d > time.Minute {
+		t.Error("now is not the wall clock")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if v.ping(ctx) == nil {
+		t.Error("ping is not wired to the database")
+	}
+}
+
+func TestNewServersConfig(t *testing.T) {
+	v, _ := newTestVault(t)
+	pool := x509.NewCertPool()
+	cert := tls.Certificate{Certificate: [][]byte{{1, 2, 3}}}
+	cfg := config{publicAddr: "127.0.0.1:18443", internalAddr: "127.0.0.1:19443"}
+	pub, internal := newServers(v, cfg, cert, pool)
+	for _, s := range []struct {
+		name  string
+		srv   *http.Server
+		addr  string
+		write time.Duration
+	}{{"public", pub, cfg.publicAddr, 30 * time.Second}, {"internal", internal, cfg.internalAddr, 60 * time.Second}} {
+		srv := s.srv
+		if srv.Addr != s.addr || srv.Handler == nil {
+			t.Errorf("%s: addr or handler wrong", s.name)
+		}
+		if srv.ReadHeaderTimeout != 5*time.Second || srv.ReadTimeout != 10*time.Second || srv.WriteTimeout != s.write ||
+			srv.IdleTimeout != 60*time.Second || srv.MaxHeaderBytes != 16<<10 {
+			t.Errorf("%s: timeouts or MaxHeaderBytes wrong", s.name)
+		}
+		if srv.ErrorLog == nil || srv.ErrorLog.Writer() != io.Discard {
+			t.Errorf("%s: ErrorLog does not discard", s.name)
+		}
+		tc := srv.TLSConfig
+		if tc == nil || tc.MinVersion != tls.VersionTLS13 || len(tc.Certificates) != 1 || tc.InsecureSkipVerify {
+			t.Fatalf("%s: TLS config wrong", s.name)
+		}
+	}
+	if pub.TLSConfig.ClientAuth != tls.NoClientCert || pub.TLSConfig.ClientCAs != nil {
+		t.Error("public listener asks for client certs")
+	}
+	if internal.TLSConfig.ClientAuth != tls.RequireAndVerifyClientCert || internal.TLSConfig.ClientCAs != pool {
+		t.Error("internal listener does not require and verify client certs against the CA")
+	}
+	if pub.TLSConfig == internal.TLSConfig {
+		t.Error("listeners share one *tls.Config")
+	}
+
+	// Each handler is the right one: /tokenize answers on public, /healthz (with a cert) on internal.
+	rec := httptest.NewRecorder()
+	pub.Handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("public /healthz status %d, want 404", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	internal.Handler.ServeHTTP(rec, withClientCert(httptest.NewRequest(http.MethodGet, "/healthz", nil)))
+	if rec.Code != http.StatusOK {
+		t.Errorf("internal /healthz status %d, want 200", rec.Code)
 	}
 }

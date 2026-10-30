@@ -11,29 +11,37 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"flag"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"os/signal"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5/stdlib"
 )
-
-func main() {}
 
 // ---------------------------------------------------------------------------
 // Card primitives (SPEC §5.5, §5.6, §8.1, §8.5)
@@ -1239,4 +1247,767 @@ func dbAddDEK(ctx context.Context, db *sql.DB, wrapped []byte) (int, error) {
 		return 0, dbErr("vault.add_dek", err)
 	}
 	return version, nil
+}
+
+// ---------------------------------------------------------------------------
+// Boot: configuration, GCP REST access, DEKs, secrets, rotation, listeners, shutdown
+// (SPEC §5.1, §6.1, §8.2–§8.6, §10.1, §11)
+// ---------------------------------------------------------------------------
+
+// config is the parsed environment (§11). Secret values held here (dev mode only) are never logged.
+type config struct {
+	env, publicAddr, internalAddr, certFile, keyFile, clientCAFile, allowOrigin, dbURL string
+	kmsKey, hmacSecretName, stripeSecretName                                           string
+	devDEK, devHMAC                                                                    []byte
+	devStripeSecret                                                                    string
+}
+
+// devVars are the dev-mode secret variables; each is refused when VAULT_ENV=prod.
+var devVars = []string{"VAULT_DEV_DEK_HEX", "VAULT_DEV_SESSION_HMAC_HEX", "VAULT_DEV_STRIPE_SECRET"}
+
+// SPEC-DECISION: KMS key and Secret Manager names must have exactly the documented shape, with
+// segments of [A-Za-z0-9_-] only. They are concatenated into request URLs, so "..", "?", "#",
+// ":" or an extra "/versions/N" could otherwise redirect the call to another resource. (Domain-
+// scoped project IDs like "example.com:p" are therefore not supported.)
+var (
+	kmsKeyRe     = regexp.MustCompile(`^projects/[A-Za-z0-9_-]+/locations/[A-Za-z0-9_-]+/keyRings/[A-Za-z0-9_-]+/cryptoKeys/[A-Za-z0-9_-]+$`)
+	secretNameRe = regexp.MustCompile(`^projects/[A-Za-z0-9_-]+/secrets/[A-Za-z0-9_-]+$`)
+)
+
+// loadConfig parses the environment (§11). Errors name the variable, never its value.
+// rotate selects -rotate-dek mode, which needs only VAULT_ENV, VAULT_DB_URL and VAULT_KMS_KEY.
+// SPEC-DECISION: an empty variable counts as unset. With VAULT_ENV=prod each VAULT_DEV_* variable
+// refuses boot (main additionally refuses any other VAULT_DEV_* name, see devVarSet), in rotate
+// mode too.
+func loadConfig(getenv func(string) string, rotate bool) (config, error) {
+	cfg := config{env: getenv("VAULT_ENV")}
+	if cfg.env != "dev" && cfg.env != "prod" {
+		return config{}, errors.New("VAULT_ENV must be dev or prod")
+	}
+	if cfg.env == "prod" {
+		for _, k := range devVars {
+			if getenv(k) != "" {
+				return config{}, errors.New(k + " is refused when VAULT_ENV=prod")
+			}
+		}
+	}
+	if !rotate {
+		for _, f := range []struct {
+			name string
+			dst  *string
+		}{
+			{"VAULT_CERT", &cfg.certFile},
+			{"VAULT_KEY", &cfg.keyFile},
+			{"VAULT_CLIENT_CA", &cfg.clientCAFile},
+			{"VAULT_ALLOW_ORIGIN", &cfg.allowOrigin},
+		} {
+			if *f.dst = getenv(f.name); *f.dst == "" {
+				return config{}, errors.New(f.name + " is required")
+			}
+		}
+		if !validOrigin(cfg.allowOrigin, cfg.env == "prod") {
+			return config{}, errors.New("VAULT_ALLOW_ORIGIN must be an exact origin (scheme://host[:port], https in prod)")
+		}
+	}
+	if cfg.dbURL = getenv("VAULT_DB_URL"); cfg.dbURL == "" {
+		return config{}, errors.New("VAULT_DB_URL is required")
+	}
+	cfg.kmsKey = getenv("VAULT_KMS_KEY")
+	if cfg.kmsKey != "" && !kmsKeyRe.MatchString(cfg.kmsKey) {
+		return config{}, errors.New("VAULT_KMS_KEY must be projects/P/locations/L/keyRings/R/cryptoKeys/K")
+	}
+	if rotate {
+		if cfg.kmsKey == "" {
+			return config{}, errors.New("VAULT_KMS_KEY is required for -rotate-dek")
+		}
+		return cfg, nil
+	}
+
+	cfg.publicAddr = getenv("VAULT_PUBLIC_ADDR")
+	if cfg.publicAddr == "" {
+		cfg.publicAddr = ":8443"
+	}
+	cfg.internalAddr = getenv("VAULT_INTERNAL_ADDR")
+	if cfg.internalAddr == "" {
+		cfg.internalAddr = ":9443"
+	}
+
+	cfg.hmacSecretName = getenv("VAULT_SESSION_HMAC_SECRET")
+	cfg.stripeSecretName = getenv("VAULT_STRIPE_SECRET")
+	for _, f := range []struct{ name, val string }{
+		{"VAULT_SESSION_HMAC_SECRET", cfg.hmacSecretName},
+		{"VAULT_STRIPE_SECRET", cfg.stripeSecretName},
+	} {
+		if f.val != "" && !secretNameRe.MatchString(f.val) {
+			return config{}, errors.New(f.name + " must be projects/P/secrets/S")
+		}
+	}
+
+	// In prod every secret comes from KMS / Secret Manager (dev vars were refused above); in dev
+	// each comes from its VAULT_DEV_* variable when set, otherwise from KMS / Secret Manager.
+	if s := getenv("VAULT_DEV_DEK_HEX"); s != "" {
+		b, ok := decodeKey64(s)
+		if !ok {
+			return config{}, errors.New("VAULT_DEV_DEK_HEX must be exactly 64 hex chars")
+		}
+		cfg.devDEK = b
+	} else if cfg.kmsKey == "" {
+		return config{}, errors.New("VAULT_KMS_KEY is required (or VAULT_DEV_DEK_HEX in dev)")
+	}
+	if s := getenv("VAULT_DEV_SESSION_HMAC_HEX"); s != "" {
+		b, ok := decodeKey64(s)
+		if !ok {
+			return config{}, errors.New("VAULT_DEV_SESSION_HMAC_HEX must be exactly 64 hex chars")
+		}
+		cfg.devHMAC = b
+	} else if cfg.hmacSecretName == "" {
+		return config{}, errors.New("VAULT_SESSION_HMAC_SECRET is required (or VAULT_DEV_SESSION_HMAC_HEX in dev)")
+	}
+	if cfg.devStripeSecret = getenv("VAULT_DEV_STRIPE_SECRET"); cfg.devStripeSecret == "" && cfg.stripeSecretName == "" {
+		return config{}, errors.New("VAULT_STRIPE_SECRET is required (or VAULT_DEV_STRIPE_SECRET in dev)")
+	}
+	return cfg, nil
+}
+
+// devVarSet returns the name of the first VAULT_DEV_* variable present in environ (os.Environ
+// form), even if empty. main refuses prod boot if there is one, whatever its name.
+func devVarSet(environ []string) (string, bool) {
+	for _, kv := range environ {
+		name, _, _ := strings.Cut(kv, "=")
+		if strings.HasPrefix(name, "VAULT_DEV_") {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// decodeKey64 decodes exactly 64 hex chars into 32 bytes.
+func decodeKey64(s string) ([]byte, bool) {
+	if len(s) != 64 {
+		return nil, false
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return nil, false
+	}
+	return b, true
+}
+
+// validOrigin reports whether s is exactly a serialized origin: scheme://host[:port] with no
+// userinfo, path, query or fragment, in canonical form (lowercase scheme and host).
+// SPEC-DECISION: the browser's Origin header is compared byte-for-byte (§5.3), so a value that
+// could never match one (trailing slash, uppercase host, "*") refuses boot; prod requires https.
+func validOrigin(s string, requireHTTPS bool) bool {
+	u, err := url.Parse(s)
+	if err != nil || u.Opaque != "" || u.User != nil || u.Host == "" || u.Path != "" || u.RawQuery != "" ||
+		u.ForceQuery || u.Fragment != "" || u.Host != strings.ToLower(u.Host) || u.String() != s {
+		return false
+	}
+	return u.Scheme == "https" || (!requireHTTPS && u.Scheme == "http")
+}
+
+// Google endpoints (§8.3, §8.6). Variables only so tests can point them at fakes.
+var (
+	metadataTokenURL     = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
+	kmsBaseURL           = "https://cloudkms.googleapis.com/v1/"
+	secretManagerBaseURL = "https://secretmanager.googleapis.com/v1/"
+)
+
+const (
+	maxGCPResponse = 64 << 10 // metadata, KMS and Secret Manager responses are tiny
+	tokenMargin    = 60 * time.Second
+)
+
+// gcpCall sends req with c and decodes a 200 JSON response into out. Errors carry only a status
+// code or a fixed phrase: never a URL, a response body, or a transport error (which names hosts).
+// requireFlavor additionally demands the metadata server's "Metadata-Flavor: Google" header.
+func gcpCall(c *http.Client, req *http.Request, requireFlavor bool, out any) error {
+	if c == nil {
+		return errors.New("no HTTP client")
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return errors.New("request failed")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+	if requireFlavor && resp.Header.Get("Metadata-Flavor") != "Google" {
+		return errors.New("response is not from the metadata server")
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxGCPResponse+1))
+	defer zero(body) // may hold secret material; best effort (§8.5)
+	if err != nil {
+		return errors.New("reading response failed")
+	}
+	if len(body) > maxGCPResponse {
+		return errors.New("response too large")
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return errors.New("malformed response")
+	}
+	return nil
+}
+
+// tokenSource fetches the service account's access token from the metadata server (§8.3 step 1)
+// and caches it until 60s before it expires.
+type tokenSource struct {
+	client *http.Client
+	mu     sync.Mutex
+	tok    string
+	exp    time.Time
+}
+
+// token returns a cached or freshly fetched access token.
+// SPEC-DECISION: the token must be 1–4096 printable non-space ASCII chars (it goes into an
+// Authorization header and a DB password) and expires_in must be positive.
+func (ts *tokenSource) token(ctx context.Context) (string, error) {
+	if ts == nil {
+		return "", errors.New("metadata token: no token source")
+	}
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if ts.tok != "" && time.Now().Before(ts.exp.Add(-tokenMargin)) {
+		return ts.tok, nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metadataTokenURL, nil)
+	if err != nil {
+		return "", errors.New("metadata token: invalid request")
+	}
+	req.Header.Set("Metadata-Flavor", "Google")
+	var out struct {
+		AccessToken string `json:"access_token"`
+		ExpiresIn   int64  `json:"expires_in"`
+	}
+	if err := gcpCall(ts.client, req, true, &out); err != nil {
+		return "", errors.New("metadata token: " + err.Error())
+	}
+	if out.ExpiresIn <= 0 || out.ExpiresIn > 86400 || out.AccessToken == "" || len(out.AccessToken) > 4096 {
+		return "", errors.New("metadata token: invalid token response")
+	}
+	for i := 0; i < len(out.AccessToken); i++ {
+		if c := out.AccessToken[i]; c < 0x21 || c > 0x7e {
+			return "", errors.New("metadata token: invalid token response")
+		}
+	}
+	ts.tok = out.AccessToken
+	ts.exp = time.Now().Add(time.Duration(out.ExpiresIn) * time.Second)
+	return ts.tok, nil
+}
+
+// kmsResponse covers both encrypt ({ciphertext}) and decrypt ({plaintext}) responses.
+type kmsResponse struct {
+	Plaintext  string `json:"plaintext"`
+	Ciphertext string `json:"ciphertext"`
+}
+
+// kmsPost calls POST {kmsBaseURL}{key}:{verb} with {field: base64(data)} (§8.3 step 2).
+func kmsPost(ctx context.Context, c *http.Client, ts *tokenSource, key, verb, field string, data []byte) (kmsResponse, error) {
+	var out kmsResponse
+	if !kmsKeyRe.MatchString(key) {
+		return out, errors.New("kms " + verb + ": invalid key name")
+	}
+	tok, err := ts.token(ctx)
+	if err != nil {
+		return out, err
+	}
+	// The encrypt body carries the plaintext DEK. The base64 string cannot be zeroed; the
+	// marshalled body is zeroed best effort (§8.5).
+	body, err := json.Marshal(map[string]string{field: base64.StdEncoding.EncodeToString(data)})
+	defer zero(body)
+	if err != nil {
+		return out, errors.New("kms " + verb + ": encoding failed")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, kmsBaseURL+key+":"+verb, bytes.NewReader(body))
+	if err != nil {
+		return out, errors.New("kms " + verb + ": invalid request")
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	if err := gcpCall(c, req, false, &out); err != nil {
+		return out, errors.New("kms " + verb + ": " + err.Error())
+	}
+	return out, nil
+}
+
+// kmsDecrypt unwraps a DEK via KMS decrypt. The plaintext must be exactly 32 bytes.
+func kmsDecrypt(ctx context.Context, c *http.Client, ts *tokenSource, key string, wrapped []byte) ([]byte, error) {
+	out, err := kmsPost(ctx, c, ts, key, "decrypt", "ciphertext", wrapped)
+	if err != nil {
+		return nil, err
+	}
+	pt, err := base64.StdEncoding.DecodeString(out.Plaintext)
+	if err != nil || len(pt) != dekSize {
+		zero(pt)
+		return nil, errors.New("kms decrypt: plaintext is not a 32-byte DEK")
+	}
+	return pt, nil
+}
+
+// kmsEncrypt wraps plaintext via KMS encrypt and returns the ciphertext.
+func kmsEncrypt(ctx context.Context, c *http.Client, ts *tokenSource, key string, plaintext []byte) ([]byte, error) {
+	out, err := kmsPost(ctx, c, ts, key, "encrypt", "plaintext", plaintext)
+	if err != nil {
+		return nil, err
+	}
+	ct, err := base64.StdEncoding.DecodeString(out.Ciphertext)
+	if err != nil || len(ct) == 0 {
+		return nil, errors.New("kms encrypt: malformed ciphertext")
+	}
+	return ct, nil
+}
+
+var castagnoli = crc32.MakeTable(crc32.Castagnoli)
+
+// accessSecret reads the latest version of a Secret Manager secret (§8.6):
+// GET {secretManagerBaseURL}{name}/versions/latest:access → payload.data (base64).
+// SPEC-DECISION: when the response carries payload.dataCrc32c it must match the data.
+func accessSecret(ctx context.Context, c *http.Client, ts *tokenSource, name string) ([]byte, error) {
+	if !secretNameRe.MatchString(name) {
+		return nil, errors.New("secret manager: invalid secret name")
+	}
+	tok, err := ts.token(ctx)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, secretManagerBaseURL+name+"/versions/latest:access", nil)
+	if err != nil {
+		return nil, errors.New("secret manager: invalid request")
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	var out struct {
+		Payload struct {
+			Data       string      `json:"data"`
+			DataCrc32c json.Number `json:"dataCrc32c"`
+		} `json:"payload"`
+	}
+	if err := gcpCall(c, req, false, &out); err != nil {
+		return nil, errors.New("secret manager: " + err.Error())
+	}
+	data, err := base64.StdEncoding.DecodeString(out.Payload.Data)
+	if err != nil {
+		return nil, errors.New("secret manager: malformed payload")
+	}
+	if out.Payload.DataCrc32c != "" {
+		want, err := strconv.ParseUint(string(out.Payload.DataCrc32c), 10, 32)
+		if err != nil || uint32(want) != crc32.Checksum(data, castagnoli) {
+			zero(data)
+			return nil, errors.New("secret manager: payload checksum mismatch")
+		}
+	}
+	return data, nil
+}
+
+// openDB opens the pool (it connects lazily). dev uses VAULT_DB_URL as is; prod authenticates
+// with Cloud SQL IAM: before every new connection the password is set to a fresh metadata
+// access token (globals decision 8). The pool is capped at 16 open connections in both modes
+// (user decision 2026-10-30, §7 notes). Errors never contain the URL (it can hold credentials).
+// SPEC-DECISION: in prod every connection path must use TLS with server certificate
+// verification (sslmode=verify-ca or verify-full, or require with sslrootcert): the password is
+// an OAuth token that also authorizes KMS decrypt, so it must not be sent in clear text or to an
+// unverified server. sslmode=prefer/allow/require-without-root-cert/disable refuse boot.
+func openDB(cfg config, ts *tokenSource) (*sql.DB, error) {
+	pc, err := pgx.ParseConfig(cfg.dbURL)
+	if err != nil {
+		return nil, errors.New("VAULT_DB_URL cannot be parsed")
+	}
+	var db *sql.DB
+	switch cfg.env {
+	case "dev":
+		db = stdlib.OpenDB(*pc)
+	case "prod":
+		if ts == nil {
+			return nil, errors.New("prod database access needs a token source")
+		}
+		verified := func(tc *tls.Config) bool {
+			return tc != nil && (!tc.InsecureSkipVerify || tc.VerifyPeerCertificate != nil)
+		}
+		ok := verified(pc.TLSConfig)
+		for _, fb := range pc.Fallbacks {
+			ok = ok && verified(fb.TLSConfig)
+		}
+		if !ok {
+			return nil, errors.New("VAULT_DB_URL must use sslmode=verify-ca or verify-full in prod")
+		}
+		db = stdlib.OpenDB(*pc, stdlib.OptionBeforeConnect(func(ctx context.Context, cc *pgx.ConnConfig) error {
+			tok, err := ts.token(ctx)
+			if err != nil {
+				return err
+			}
+			cc.Password = tok
+			return nil
+		}))
+	default:
+		return nil, errors.New("VAULT_ENV must be dev or prod")
+	}
+	db.SetMaxOpenConns(16)
+	return db, nil
+}
+
+// errNoDEKs is the §8.3 step 4 boot failure.
+var errNoDEKs = errors.New("no DEKs found; run vault -rotate-dek first")
+
+// loadDEKs returns every DEK by version and the current (highest) version (§8.3). In dev with
+// VAULT_DEV_DEK_HEX the dev DEK is version 1 and neither the database nor KMS is used.
+// Otherwise every vault.list_deks() row is unwrapped via KMS; any failure fails the whole load.
+func loadDEKs(ctx context.Context, cfg config, db *sql.DB, c *http.Client, ts *tokenSource) (map[int][]byte, int, error) {
+	if cfg.devDEK != nil {
+		if cfg.env != "dev" {
+			return nil, 0, errors.New("a dev DEK is refused when VAULT_ENV=prod")
+		}
+		if len(cfg.devDEK) != dekSize {
+			return nil, 0, errors.New("VAULT_DEV_DEK_HEX must decode to 32 bytes")
+		}
+		return map[int][]byte{1: bytes.Clone(cfg.devDEK)}, 1, nil
+	}
+	if cfg.kmsKey == "" {
+		return nil, 0, errors.New("VAULT_KMS_KEY is required")
+	}
+	wrapped, err := dbListDEKs(ctx, db)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(wrapped) == 0 {
+		return nil, 0, errNoDEKs
+	}
+	deks := make(map[int][]byte, len(wrapped))
+	current := 0
+	for version, w := range wrapped {
+		dek, err := kmsDecrypt(ctx, c, ts, cfg.kmsKey, w)
+		if err != nil {
+			for _, d := range deks {
+				zero(d)
+			}
+			return nil, 0, fmt.Errorf("DEK version %d: %s", version, err.Error())
+		}
+		deks[version] = dek
+		current = max(current, version)
+	}
+	return deks, current, nil
+}
+
+// dekVersions lists the map's versions in ascending order, comma-separated, for the boot log.
+func dekVersions(deks map[int][]byte) string {
+	vs := make([]int, 0, len(deks))
+	for v := range deks {
+		vs = append(vs, v)
+	}
+	slices.Sort(vs)
+	parts := make([]string, len(vs))
+	for i, v := range vs {
+		parts[i] = strconv.Itoa(v)
+	}
+	return strings.Join(parts, ",")
+}
+
+// validSecretValue reports whether s is a non-empty run of printable, non-space ASCII.
+// SPEC-DECISION: stricter than "no whitespace or control chars": provider keys are ASCII and go
+// into an HTTP header, so any non-ASCII byte refuses boot too.
+func validSecretValue(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x21 || s[i] > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+// loadSecrets returns the session HMAC key (32 bytes) and the Stripe secret (§8.6): from the
+// VAULT_DEV_* values in dev when set, otherwise from Secret Manager. The HMAC payload must be
+// exactly 64 hex chars. Errors name the variable, never the value.
+func loadSecrets(ctx context.Context, cfg config, c *http.Client, ts *tokenSource) (hmacKey []byte, stripeSecret string, err error) {
+	if cfg.env != "dev" && (cfg.devHMAC != nil || cfg.devStripeSecret != "") {
+		return nil, "", errors.New("dev secrets are refused when VAULT_ENV=prod")
+	}
+	if cfg.devHMAC != nil {
+		hmacKey = bytes.Clone(cfg.devHMAC)
+	} else {
+		raw, err := accessSecret(ctx, c, ts, cfg.hmacSecretName)
+		if err != nil {
+			return nil, "", errors.New("VAULT_SESSION_HMAC_SECRET: " + err.Error())
+		}
+		var ok bool
+		hmacKey, ok = decodeKey64(string(raw))
+		zero(raw)
+		if !ok {
+			return nil, "", errors.New("VAULT_SESSION_HMAC_SECRET: payload must be exactly 64 hex chars")
+		}
+	}
+	if len(hmacKey) != 32 {
+		zero(hmacKey)
+		return nil, "", errors.New("session HMAC key must be 32 bytes")
+	}
+
+	name := "VAULT_DEV_STRIPE_SECRET"
+	stripeSecret = cfg.devStripeSecret
+	if stripeSecret == "" {
+		name = "VAULT_STRIPE_SECRET"
+		raw, err := accessSecret(ctx, c, ts, cfg.stripeSecretName)
+		if err != nil {
+			zero(hmacKey)
+			return nil, "", errors.New(name + ": " + err.Error())
+		}
+		stripeSecret = string(raw)
+		zero(raw)
+	}
+	if !validSecretValue(stripeSecret) {
+		zero(hmacKey)
+		return nil, "", errors.New(name + ": secret must be non-empty printable ASCII without whitespace")
+	}
+	return hmacKey, stripeSecret, nil
+}
+
+// rotateDEK generates a 32-byte DEK, wraps it via KMS encrypt, checks that KMS decrypt returns it,
+// stores it via vault.add_dek and returns the new version (§8.4).
+// SPEC-DECISION: the unwrap check runs before anything is stored, so a wrapped value that boot
+// could not unwrap (which would make every later boot fail) never reaches the database.
+func rotateDEK(ctx context.Context, cfg config, db *sql.DB, c *http.Client, ts *tokenSource) (int, error) {
+	if cfg.kmsKey == "" {
+		return 0, errors.New("VAULT_KMS_KEY is required")
+	}
+	dek := make([]byte, dekSize)
+	defer zero(dek)
+	rand.Read(dek) // never fails; see newToken
+	wrapped, err := kmsEncrypt(ctx, c, ts, cfg.kmsKey, dek)
+	if err != nil {
+		return 0, err
+	}
+	back, err := kmsDecrypt(ctx, c, ts, cfg.kmsKey, wrapped)
+	if err != nil {
+		return 0, err
+	}
+	same := hmac.Equal(back, dek)
+	zero(back)
+	if !same {
+		return 0, errors.New("kms: wrapped DEK does not unwrap to the generated DEK")
+	}
+	return dbAddDEK(ctx, db, wrapped)
+}
+
+// loadClientCA reads the mTLS client CA (§6.1): the file must contain exactly one PEM block, of
+// type CERTIFICATE, holding a CA certificate.
+// SPEC-DECISION: any second PEM block (another certificate, a private key) refuses boot, as does
+// a certificate without basicConstraints CA:TRUE.
+func loadClientCA(path string) (*x509.CertPool, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, errors.New("client CA: cannot read file")
+	}
+	block, rest := pem.Decode(b)
+	if block == nil || block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
+		return nil, errors.New("client CA: first PEM block is not a CERTIFICATE")
+	}
+	if extra, _ := pem.Decode(rest); extra != nil {
+		return nil, errors.New("client CA: file must contain exactly one PEM block")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, errors.New("client CA: certificate does not parse")
+	}
+	if !cert.BasicConstraintsValid || !cert.IsCA {
+		return nil, errors.New("client CA: certificate is not a CA")
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(cert)
+	return pool, nil
+}
+
+// newVault wires the vault to the database and the loaded key material.
+func newVault(cfg config, db *sql.DB, deks map[int][]byte, current int, hmacKey []byte, stripeSecret string, client *http.Client, logger *log.Logger) *vault {
+	return &vault{
+		putCard: func(ctx context.Context, token string, ciphertext []byte, last4 string, keyVersion int) error {
+			return dbPutCard(ctx, db, token, ciphertext, last4, keyVersion)
+		},
+		getCard: func(ctx context.Context, token, caller string) ([]byte, int, error) {
+			return dbGetCard(ctx, db, token, caller)
+		},
+		ping:        db.PingContext,
+		deks:        deks,
+		currentDEK:  current,
+		hmacKey:     hmacKey,
+		allowOrigin: cfg.allowOrigin,
+		cvv:         newCVVCache(15*time.Minute, time.Now),
+		now:         time.Now,
+		log:         logger,
+		providers:   newProviders(stripeSecret),
+		client:      client,
+	}
+}
+
+// newServers builds both listeners (§5.1, §6.1). net/http's own error lines are discarded
+// (globals decision 5): they are neither boot nor ALERT lines and can quote client input.
+func newServers(v *vault, cfg config, cert tls.Certificate, clientCAs *x509.CertPool) (public, internal *http.Server) {
+	public = &http.Server{
+		Addr:              cfg.publicAddr,
+		Handler:           v.publicHandler(),
+		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{cert}},
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+		ErrorLog:          log.New(io.Discard, "", 0),
+	}
+	internal = &http.Server{
+		Addr:    cfg.internalAddr,
+		Handler: v.internalHandler(),
+		TLSConfig: &tls.Config{
+			MinVersion:   tls.VersionTLS13,
+			Certificates: []tls.Certificate{cert},
+			ClientAuth:   tls.RequireAndVerifyClientCert,
+			ClientCAs:    clientCAs,
+		},
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+		ErrorLog:          log.New(io.Discard, "", 0),
+	}
+	return public, internal
+}
+
+const (
+	bootDBTimeout   = 5 * time.Second
+	bootGCPTimeout  = 60 * time.Second
+	shutdownTimeout = 20 * time.Second
+)
+
+// main runs the boot sequence of §11, or -rotate-dek (§8.4). Every log line goes through logf;
+// failures log "boot failed: <reason>" with reasons built only from variable names, fixed
+// phrases, status codes and SQLSTATEs, and exit 1.
+func main() {
+	rotate := flag.Bool("rotate-dek", false, "generate, wrap and store a new DEK, print its version, and exit")
+	flag.Parse()
+	logger := log.New(os.Stderr, "", 0)
+	boot := &vault{log: logger, now: time.Now} // logging only, until the real vault exists
+	fail := func(reason string) {
+		boot.logf("boot failed: %s", reason)
+		os.Exit(1)
+	}
+
+	// 1. Parse env and fail fast.
+	cfg, err := loadConfig(os.Getenv, *rotate)
+	if err != nil {
+		fail(err.Error())
+	}
+	if name, ok := devVarSet(os.Environ()); ok && cfg.env == "prod" {
+		fail(name + " is refused when VAULT_ENV=prod")
+	}
+	boot.logf("config loaded env=%s", cfg.env)
+
+	client := newOutboundClient(nil) // the single shared client: metadata, KMS, SM, providers
+	ts := &tokenSource{client: client}
+
+	// 2. Open the DB (the error never contains the URL).
+	db, err := openDB(cfg, ts)
+	if err != nil {
+		fail(err.Error())
+	}
+
+	if *rotate {
+		ctx, cancel := context.WithTimeout(context.Background(), bootGCPTimeout)
+		version, err := rotateDEK(ctx, cfg, db, client, ts)
+		cancel()
+		if err != nil {
+			fail("rotate: " + err.Error())
+		}
+		db.Close()
+		fmt.Println(version)
+		os.Exit(0)
+	}
+
+	// SPEC-DECISION: the ping error is not logged: pgx connect errors name the host, user and
+	// database from VAULT_DB_URL.
+	ctx, cancel := context.WithTimeout(context.Background(), bootDBTimeout)
+	err = db.PingContext(ctx)
+	cancel()
+	if err != nil {
+		fail("database ping failed")
+	}
+
+	// 3. Load DEKs.
+	ctx, cancel = context.WithTimeout(context.Background(), bootGCPTimeout)
+	deks, current, err := loadDEKs(ctx, cfg, db, client, ts)
+	cancel()
+	if errors.Is(err, errNoDEKs) {
+		boot.logf("%s", errNoDEKs.Error())
+		os.Exit(1)
+	}
+	if err != nil {
+		fail(err.Error())
+	}
+	boot.logf("deks loaded versions=%s current=%d", dekVersions(deks), current)
+
+	// 4. Load secrets.
+	ctx, cancel = context.WithTimeout(context.Background(), bootGCPTimeout)
+	hmacKey, stripeSecret, err := loadSecrets(ctx, cfg, client, ts)
+	cancel()
+	if err != nil {
+		fail(err.Error())
+	}
+
+	// 5. Build the vault (and with it the provider catalog).
+	v := newVault(cfg, db, deks, current, hmacKey, stripeSecret, client, logger)
+
+	// 6. Certificate and client CA.
+	cert, err := tls.LoadX509KeyPair(cfg.certFile, cfg.keyFile)
+	if err != nil {
+		fail("VAULT_CERT/VAULT_KEY: cannot load key pair")
+	}
+	clientCAs, err := loadClientCA(cfg.clientCAFile)
+	if err != nil {
+		fail("VAULT_CLIENT_CA: " + err.Error())
+	}
+
+	// 7. Start both listeners.
+	// SPEC-DECISION: each socket is bound with net.Listen before serving (ServeTLS("", "") is what
+	// ListenAndServeTLS("", "") does after binding), so a bind failure exits 1 before "ready".
+	public, internal := newServers(v, cfg, cert, clientCAs)
+	pubLn, err := net.Listen("tcp", cfg.publicAddr)
+	if err != nil {
+		fail("VAULT_PUBLIC_ADDR: cannot listen")
+	}
+	intLn, err := net.Listen("tcp", cfg.internalAddr)
+	if err != nil {
+		fail("VAULT_INTERNAL_ADDR: cannot listen")
+	}
+	serveErr := make(chan string, 2)
+	go func() {
+		if err := public.ServeTLS(pubLn, "", ""); !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- "public"
+		}
+	}()
+	go func() {
+		if err := internal.ServeTLS(intLn, "", ""); !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- "internal"
+		}
+	}()
+	v.logf("listening public=%s internal=%s", cfg.publicAddr, cfg.internalAddr)
+
+	// 8. Ready.
+	v.logf("ready")
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+	select {
+	case <-sig:
+		// Stop accepting and drain both listeners concurrently within one 20s budget (§11).
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		var wg sync.WaitGroup
+		for _, srv := range []*http.Server{public, internal} {
+			wg.Go(func() { srv.Shutdown(ctx) })
+		}
+		wg.Wait()
+		cancel()
+		db.Close()
+		os.Exit(0)
+	case name := <-serveErr:
+		v.logf("listener failed listener=%s", name)
+		os.Exit(1)
+	}
 }
