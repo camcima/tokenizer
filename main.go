@@ -359,17 +359,24 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	}{msg})
 }
 
-// callerSerial returns the verified client certificate's serial number as uppercase hex, or ""
-// if there is none.
+// callerSerial returns the verified client certificate's serial number as byte-wise uppercase
+// hex, the way `openssl x509 -serial` prints it (serial 0x0A1B2C → "0A1B2C", zero → "00"), or ""
+// if there is none (§10.1).
+// SPEC-DECISION: a negative serial (invalid per RFC 5280; its magnitude would collide with a
+// positive serial) yields "", i.e. it is treated as no caller identity at all.
 func callerSerial(r *http.Request) string {
 	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
 		return ""
 	}
 	leaf := r.TLS.PeerCertificates[0]
-	if leaf == nil || leaf.SerialNumber == nil {
+	if leaf == nil || leaf.SerialNumber == nil || leaf.SerialNumber.Sign() < 0 {
 		return ""
 	}
-	return fmt.Sprintf("%X", leaf.SerialNumber)
+	b := leaf.SerialNumber.Bytes()
+	if len(b) == 0 {
+		return "00"
+	}
+	return strings.ToUpper(hex.EncodeToString(b))
 }
 
 // ---------------------------------------------------------------------------

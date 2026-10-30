@@ -440,12 +440,17 @@ func (c *fakeClock) advance(d time.Duration) {
 }
 
 // TestMain runs every test, then scans everything the test vaults logged (§13.1 log leak test).
+// The scan checks the log as written and a copy with space/hyphen runs between digits removed
+// (so "4242 4242 4242 4242" is caught), and within every maximal digit run it tests every window
+// of length 13–19 (so a PAN embedded in a longer digit run is caught). Only offsets are printed.
 func TestMain(m *testing.M) {
 	code := m.Run()
 	out := regexp.MustCompile(`tok_[0-9a-f]{32}`).ReplaceAllString(testLog.String(), "tok_")
-	for _, loc := range regexp.MustCompile(`\d{13,19}`).FindAllStringIndex(out, -1) {
-		if luhnValid(out[loc[0]:loc[1]]) {
-			fmt.Fprintf(os.Stderr, "LOG LEAK: Luhn-valid digit run at offset %d\n", loc[0]) // never print it
+	for _, v := range []struct {
+		name, text string
+	}{{"as logged", out}, {"separators removed", joinDigitSeparators(out)}} {
+		for _, off := range luhnWindowOffsets(v.text) {
+			fmt.Fprintf(os.Stderr, "LOG LEAK: Luhn-valid 13–19 digit window at offset %d (%s)\n", off, v.name) // never print it
 			code = 1
 		}
 	}
@@ -456,6 +461,82 @@ func TestMain(m *testing.M) {
 		}
 	}
 	os.Exit(code)
+}
+
+// joinDigitSeparators removes every run of spaces and hyphens that sits between two ASCII
+// digits, mirroring what normalizePAN strips.
+func joinDigitSeparators(s string) string {
+	isDigit := func(c byte) bool { return c >= '0' && c <= '9' }
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] == ' ' || s[i] == '-' {
+			j := i
+			for j < len(s) && (s[j] == ' ' || s[j] == '-') {
+				j++
+			}
+			if i > 0 && isDigit(s[i-1]) && j < len(s) && isDigit(s[j]) {
+				i = j
+				continue
+			}
+			b.WriteString(s[i:j])
+			i = j
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
+// luhnWindowOffsets returns the offset of every substring of length 13–19 inside a maximal
+// ASCII digit run of s that passes Luhn.
+func luhnWindowOffsets(s string) []int {
+	var offs []int
+	for _, run := range regexp.MustCompile(`[0-9]{13,}`).FindAllStringIndex(s, -1) {
+		for i := run[0]; i < run[1]; i++ {
+			for n := 13; n <= 19 && i+n <= run[1]; n++ {
+				if luhnValid(s[i : i+n]) {
+					offs = append(offs, i)
+				}
+			}
+		}
+	}
+	return offs
+}
+
+// The leak scanner itself: separated and embedded PANs are found; short digit runs are not.
+// Failure messages print only case indexes.
+func TestLeakScanner(t *testing.T) {
+	found := func(s string) bool {
+		return len(luhnWindowOffsets(s)) > 0 || len(luhnWindowOffsets(joinDigitSeparators(s))) > 0
+	}
+	for i, s := range []string{
+		"x " + testPAN + " y",
+		"x 4242 4242 4242 4242 y",
+		"x 4242-4242-4242-4242 y",
+		"x 4242 - 4242  4242--4242 y",
+		"x 99" + testPAN + "77 y",            // embedded in a longer run
+		"x 1" + "4242 4242 4242 4242" + " y", // embedded after separator removal
+		"x 4222222222222 y",                  // 13 digits
+		"x 4000000000000000006 y",            // 19 digits
+	} {
+		if !found(s) {
+			t.Errorf("leak case %d not found", i)
+		}
+	}
+	for i, s := range []string{
+		"2026-10-30T15:04:05Z req listener=internal method=POST path=/proxy status=200 dur=183ms caller=0A1B2C",
+		"x 4242 4242 4242 y", // 12 digits
+		"x 4242\n4242 y",     // newlines are not joined
+		"",
+	} {
+		if found(s) {
+			t.Errorf("clean case %d flagged", i)
+		}
+	}
+	if got := joinDigitSeparators("a 1 - 2 b -3- c"); got != "a 12 b -3- c" {
+		t.Errorf("joinDigitSeparators: got %q", got)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -695,17 +776,17 @@ func TestGuardLogLine(t *testing.T) {
 	}
 
 	// Internal listener: caller serial is appended.
-	internal := regexp.MustCompile(`^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ req listener=internal method=POST path=/proxy status=204 dur=\d+ms caller=A1B2C\n$`)
+	internal := regexp.MustCompile(`^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ req listener=internal method=POST path=/proxy status=204 dur=\d+ms caller=0A1B2C\n$`)
 	_, out = serveGuard(v, "internal", noContent, withClientCert(httptest.NewRequest("POST", "/proxy", nil)))
 	if !internal.MatchString(out) {
-		t.Fatalf("internal log line has unexpected shape: %q", out)
+		t.Fatalf("internal log line has unexpected shape (len %d, %d lines)", len(out), strings.Count(out, "\n"))
 	}
 
 	// A handler that writes nothing is logged as 200.
 	_, out = serveGuard(v, "internal", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
 		withClientCert(httptest.NewRequest("GET", "/healthz", nil)))
 	if !strings.Contains(out, " method=GET path=/healthz status=200 ") {
-		t.Fatalf("empty handler logged as %q", out)
+		t.Fatalf("empty handler log line unexpected (len %d, %d lines)", len(out), strings.Count(out, "\n"))
 	}
 
 	// A body write without WriteHeader is logged as 200; a later WriteHeader does not change it.
@@ -714,7 +795,7 @@ func TestGuardLogLine(t *testing.T) {
 		w.WriteHeader(http.StatusTeapot)
 	}), httptest.NewRequest("OPTIONS", "/tokenize", nil))
 	if !strings.Contains(out, " method=OPTIONS path=/tokenize status=200 ") {
-		t.Fatalf("implicit 200 logged as %q", out)
+		t.Fatalf("implicit 200 log line unexpected (len %d, %d lines)", len(out), strings.Count(out, "\n"))
 	}
 
 	// An unknown path never lands in the log (a PAN in the URL path).
@@ -725,7 +806,7 @@ func TestGuardLogLine(t *testing.T) {
 	for _, p := range []string{"/", "/tokenize/", "/TOKENIZE", "/tokenize/x", "//tokenize", "/proxy/"} {
 		_, out = serveGuard(v, "public", noContent, httptest.NewRequest("POST", p, nil))
 		if !strings.Contains(out, " path=other ") {
-			t.Errorf("path %q logged as %q", p, out)
+			t.Errorf("path %q not logged as path=other (len %d, %d lines)", p, len(out), strings.Count(out, "\n"))
 		}
 	}
 	// The query string is never logged.
@@ -738,14 +819,14 @@ func TestGuardLogLine(t *testing.T) {
 	for _, m := range []string{"BREW", "PUT", "DELETE", "post", "HEAD"} {
 		_, out = serveGuard(v, "public", noContent, httptest.NewRequest(m, "/tokenize", nil))
 		if !strings.Contains(out, " method=other ") {
-			t.Errorf("method %q logged as %q", m, out)
+			t.Errorf("method %q not logged as method=other (len %d, %d lines)", m, len(out), strings.Count(out, "\n"))
 		}
 	}
 
 	// Without a client certificate the internal line carries an empty caller.
 	_, out = serveGuard(v, "internal", noContent, httptest.NewRequest("POST", "/proxy", nil))
 	if !strings.HasSuffix(out, "ms caller=\n") {
-		t.Fatalf("internal line without cert: %q", out)
+		t.Fatalf("internal line without cert unexpected (len %d, %d lines)", len(out), strings.Count(out, "\n"))
 	}
 
 	// Exactly one line per request.
@@ -770,7 +851,7 @@ func TestGuardRecoversPanic(t *testing.T) {
 			t.Fatalf("panic body len %d is not the internal error body", len(got))
 		}
 		if !strings.Contains(out, " path=/tokenize status=500 dur=") || strings.Count(out, "\n") != 1 {
-			t.Fatalf("panic log line: %q", out)
+			t.Fatalf("panic log line unexpected (len %d, %d lines)", len(out), strings.Count(out, "\n"))
 		}
 	}
 
@@ -809,7 +890,7 @@ func TestGuardPanicAfterWrite(t *testing.T) {
 	}()
 	out := testLog.since(start)
 	if !strings.Contains(out, " path=/proxy status=500 dur=") || strings.Contains(out, "marker") {
-		t.Fatalf("late panic log line: %q", out)
+		t.Fatalf("late panic log line unexpected (len %d, %d lines)", len(out), strings.Count(out, "\n"))
 	}
 }
 
@@ -826,8 +907,26 @@ func TestCallerSerial(t *testing.T) {
 	if got := callerSerial(r); got != "" {
 		t.Errorf("nil serial: got %q", got)
 	}
-	if got := callerSerial(withClientCert(httptest.NewRequest("POST", "/proxy", nil))); got != "A1B2C" {
-		t.Errorf("got %q, want A1B2C", got)
+	if got := callerSerial(withClientCert(httptest.NewRequest("POST", "/proxy", nil))); got != "0A1B2C" {
+		t.Errorf("got %q, want 0A1B2C", got)
+	}
+	// Byte-wise uppercase hex as `openssl x509 -serial` prints it (§10.1).
+	for _, c := range []struct {
+		serial *big.Int
+		want   string
+	}{
+		{big.NewInt(0), "00"},
+		{big.NewInt(0x0F), "0F"},
+		{big.NewInt(0xFF), "FF"},
+		{big.NewInt(0x100), "0100"},
+		{new(big.Int).SetBytes([]byte{0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01}), "DEADBEEF0001"},
+		{big.NewInt(-5), ""}, // negative serials are invalid (RFC 5280) and never identify a caller
+	} {
+		r := httptest.NewRequest("POST", "/proxy", nil)
+		r.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{SerialNumber: c.serial}}}
+		if got := callerSerial(r); got != c.want {
+			t.Errorf("serial %s: got %q, want %q", c.serial, got, c.want)
+		}
 	}
 }
 
@@ -894,7 +993,7 @@ func TestNewTestVaultStore(t *testing.T) {
 	if err := v.ping(ctx); err != nil {
 		t.Fatal("ping failed")
 	}
-	if _, _, err := v.getCard(ctx, "tok_absent", "A1B2C"); !errors.Is(err, errUnknownToken) {
+	if _, _, err := v.getCard(ctx, "tok_absent", "0A1B2C"); !errors.Is(err, errUnknownToken) {
 		t.Fatal("absent token did not return errUnknownToken")
 	}
 	if err := v.putCard(ctx, "tok_a", []byte{1, 2, 3}, "4242", 1); err != nil {
@@ -903,12 +1002,12 @@ func TestNewTestVaultStore(t *testing.T) {
 	if err := v.putCard(ctx, "tok_a", []byte{1}, "4242", 1); err == nil {
 		t.Fatal("duplicate putCard accepted")
 	}
-	ct, ver, err := v.getCard(ctx, "tok_a", "A1B2C")
+	ct, ver, err := v.getCard(ctx, "tok_a", "0A1B2C")
 	if err != nil || ver != 1 || !bytes.Equal(ct, []byte{1, 2, 3}) {
 		t.Fatal("getCard did not return the stored row")
 	}
 	s.velocity = true
-	if _, _, err := v.getCard(ctx, "tok_a", "A1B2C"); !errors.Is(err, errVelocity) {
+	if _, _, err := v.getCard(ctx, "tok_a", "0A1B2C"); !errors.Is(err, errVelocity) {
 		t.Fatal("velocity flag did not return errVelocity")
 	}
 	if !v.now().Equal(testNow) || !v.cvv.now().Equal(testNow) || len(v.deks[v.currentDEK]) != 32 {
