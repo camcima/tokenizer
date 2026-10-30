@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -12,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"maps"
 	"math/big"
@@ -24,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -358,10 +361,12 @@ type fakeRow struct {
 }
 
 type fakeStore struct {
-	mu       sync.Mutex
-	rows     map[string]fakeRow
-	velocity bool
-	putErr   error // when set, putCard returns it and stores nothing
+	mu         sync.Mutex
+	rows       map[string]fakeRow
+	velocity   bool
+	putErr     error  // when set, putCard returns it and stores nothing
+	getErr     error  // when set (and velocity is not), getCard returns it
+	lastCaller string // caller passed to the most recent getCard (the audit identity, §6.4 step 1)
 }
 
 func (s *fakeStore) putCard(_ context.Context, token string, ciphertext []byte, last4 string, keyVersion int) error {
@@ -377,11 +382,15 @@ func (s *fakeStore) putCard(_ context.Context, token string, ciphertext []byte, 
 	return nil
 }
 
-func (s *fakeStore) getCard(_ context.Context, token, _ string) ([]byte, int, error) {
+func (s *fakeStore) getCard(_ context.Context, token, caller string) ([]byte, int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.lastCaller = caller
 	if s.velocity {
 		return nil, 0, errVelocity
+	}
+	if s.getErr != nil {
+		return nil, 0, s.getErr
 	}
 	r, ok := s.rows[token]
 	if !ok {
@@ -392,7 +401,7 @@ func (s *fakeStore) getCard(_ context.Context, token, _ string) ([]byte, int, er
 
 // newTestVault returns a vault wired to an in-memory fakeStore: DEK v1 = 32×0x01, session key
 // testHMACKey, origin testOrigin, logger → &testLog, clock fixed at testNow, providers =
-// newProviders(testSecret) (client stays nil; proxy tests set it). The CVV cache reads
+// newProviders(testSecret) (client stays nil; proxyVault points it at a fake provider). The CVV cache reads
 // the clock through v.now, so a test that replaces v.now moves both.
 func newTestVault(t *testing.T) (*vault, *fakeStore) {
 	t.Helper()
@@ -1669,9 +1678,6 @@ func TestCatalogShape(t *testing.T) {
 	if s, ok := v.providers["stripe"]; !ok || s.secret != testSecret || s.base.Host != "api.stripe.com" {
 		t.Fatal("newTestVault does not wire newProviders(testSecret)")
 	}
-	if v.client != nil {
-		t.Fatal("newTestVault must leave client nil; proxy tests set it per fake provider")
-	}
 }
 
 // egress-hosts.txt is the file the infra repo's firewall check diffs against (§9.1); it must list
@@ -1761,8 +1767,36 @@ func TestMaskPAN(t *testing.T) {
 		t.Errorf("clean body changed or flagged (found=%v)", found)
 	}
 
-	// A PAN too short to be real masks nothing (and never loops on an empty needle).
-	for _, pan := range []string{"", "42"} {
+	// The hyphen-grouped form is masked too (same left-to-right grouping in fours).
+	got, found = maskPAN([]byte(`{"f":"4242-4242-4242-4242","a":"3782-8224-6310-005"}`), testPAN)
+	if !found || string(got) != `{"f":"****4242","a":"3782-8224-6310-005"}` {
+		t.Errorf("hyphen form: found=%v, still has PAN=%v, len %d", found, bytes.Contains(got, []byte("4242-4242")), len(got))
+	}
+	got, found = maskPAN([]byte("x 3782-8224-6310-005 y"), amex)
+	if !found || string(got) != "x ****0005 y" {
+		t.Errorf("amex hyphen form: found=%v, len %d", found, len(got))
+	}
+
+	// Residue: PAN+PAN[4:] (last 4 == first 4) leaves a full PAN after one ReplaceAll pass
+	// ("****4242"+"424242424242"); the replacement repeats until no form remains.
+	for i, in := range []string{
+		testPAN + testPAN[4:],
+		testPAN + testPAN[4:] + testPAN[4:],
+		"4242 4242 4242 4242 4242 4242 4242",
+		"4242-4242-4242-4242-4242-4242-4242",
+	} {
+		got, found := maskPAN([]byte(in), testPAN)
+		if !found || len(luhnWindowOffsets(joinDigitSeparators(string(got)))) != 0 || bytes.Contains(got, []byte(testPAN)) {
+			t.Errorf("residue case %d: found=%v, a PAN remains (len %d)", i, found, len(got))
+		}
+	}
+	if got, _ := maskPAN([]byte(testPAN+testPAN[4:]), testPAN); string(got) != "********4242" {
+		t.Errorf("residue: masked to len %d, want ********4242", len(got))
+	}
+
+	// A PAN too short to be real masks nothing (never loops on an empty needle, or on a needle the
+	// mask itself contains).
+	for _, pan := range []string{"", "42", "4242", "424242424242"} {
 		if got, found := maskPAN(clean, pan); found || !bytes.Equal(got, clean) {
 			t.Errorf("short pan len %d: found=%v", len(pan), found)
 		}
@@ -1796,5 +1830,739 @@ func TestOutboundClientConfig(t *testing.T) {
 	}
 	if maxProviderResponse != 4<<20 {
 		t.Errorf("maxProviderResponse %d", maxProviderResponse)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// POST /proxy and GET /healthz (§6, §9.3, §10.1, §13.1)
+// ---------------------------------------------------------------------------
+
+// fakeProvider is an httptest TLS server standing in for Stripe. It records the last request
+// it received; respond (if set) writes the response, else it answers 200 {"id":"pm_123"}.
+type fakeProvider struct {
+	ts      *httptest.Server
+	respond func(w http.ResponseWriter, r *http.Request)
+
+	mu     sync.Mutex
+	hits   int
+	method string
+	path   string
+	header http.Header
+	body   []byte
+}
+
+func newFakeProvider(t *testing.T, respond func(w http.ResponseWriter, r *http.Request)) *fakeProvider {
+	t.Helper()
+	fp := &fakeProvider{respond: respond}
+	fp.ts = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var buf bytes.Buffer
+		buf.ReadFrom(r.Body)
+		fp.mu.Lock()
+		fp.hits++
+		fp.method, fp.path, fp.header, fp.body = r.Method, r.URL.Path, r.Header.Clone(), buf.Bytes()
+		fp.mu.Unlock()
+		if fp.respond != nil {
+			fp.respond(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"pm_123"}`))
+	}))
+	fp.ts.Config.ErrorLog = log.New(io.Discard, "", 0) // e.g. handshakes from an untrusting client
+	fp.ts.StartTLS()
+	t.Cleanup(fp.ts.Close)
+	return fp
+}
+
+// last returns a snapshot of the last recorded request.
+func (fp *fakeProvider) last() (hits int, method, path string, header http.Header, body []byte) {
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	return fp.hits, fp.method, fp.path, fp.header, fp.body
+}
+
+// pointStripe aims the vault's stripe provider at base (copy out, set base, store back) and its
+// client at a pool that trusts cert.
+func pointStripe(t *testing.T, v *vault, base string, cert *x509.Certificate) {
+	t.Helper()
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatal("bad fake provider URL")
+	}
+	p := v.providers["stripe"]
+	p.base = u
+	v.providers["stripe"] = p
+	pool := x509.NewCertPool()
+	pool.AddCert(cert)
+	v.client = newOutboundClient(pool)
+}
+
+// proxyVault returns a test vault whose stripe provider is the fake provider.
+func proxyVault(t *testing.T, fp *fakeProvider) (*vault, *fakeStore) {
+	t.Helper()
+	v, s := newTestVault(t)
+	pointStripe(t, v, fp.ts.URL, fp.ts.Certificate())
+	return v, s
+}
+
+// seedCard seals testPAN 12/2030 under DEK 1 into the store, caches cvv if non-empty, and
+// returns the token.
+func seedCard(t *testing.T, v *vault, s *fakeStore, cvv string) string {
+	t.Helper()
+	pt, err := json.Marshal(card{PAN: testPAN, ExpMonth: "12", ExpYear: "2030"})
+	if err != nil {
+		t.Fatal("marshal card failed")
+	}
+	tok := newToken()
+	s.mu.Lock()
+	s.rows[tok] = fakeRow{ciphertext: seal(v.deks[1], pt), last4: "4242", keyVersion: 1}
+	s.mu.Unlock()
+	if cvv != "" {
+		v.cvv.put(tok, cvv)
+	}
+	return tok
+}
+
+// proxyBody returns a /proxy JSON body.
+func proxyBody(provider, op, token string, params map[string]string) string {
+	m := map[string]any{"provider": provider, "op": op, "token": token}
+	if params != nil {
+		m["params"] = params
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		panic("proxyBody: marshal failed")
+	}
+	return string(b)
+}
+
+// newProxyRequest builds POST /proxy with a client certificate and Content-Type application/json.
+func newProxyRequest(body string) *http.Request {
+	r := withClientCert(httptest.NewRequest("POST", "/proxy", strings.NewReader(body)))
+	r.Header.Set("Content-Type", "application/json")
+	return r
+}
+
+// serveInternal runs r through the internal handler (guard included).
+func serveInternal(v *vault, r *http.Request) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	v.internalHandler().ServeHTTP(rec, r)
+	return rec
+}
+
+// errBody is the exact error response body for msg.
+func errBody(msg string) string {
+	b, _ := json.Marshal(map[string]string{"error": msg})
+	return string(b) + "\n"
+}
+
+func TestProxyValidation(t *testing.T) {
+	fp := newFakeProvider(t, nil)
+	v, s := proxyVault(t, fp)
+	tok := seedCard(t, v, s, testCVV)
+	unseeded := "tok_" + strings.Repeat("ab", 16)
+	pm := func(params map[string]string) string {
+		return proxyBody("stripe", "create_payment_method", tok, params)
+	}
+	big := padBody(pm(nil), maxInternalBody+1)
+
+	cases := []struct {
+		name       string
+		method     string // default POST
+		target     string // default /proxy
+		ctype      string // default application/json; omit = absent
+		body       string
+		idem       []string // Idempotency-Key values to add
+		noCert     bool
+		wantStatus int
+		wantError  string
+	}{
+		{name: "unknown provider", body: proxyBody("adyen", "create_token", tok, nil), wantStatus: 400, wantError: msgUnknownProvider},
+		{name: "provider case", body: proxyBody("Stripe", "create_token", tok, nil), wantStatus: 400, wantError: msgUnknownProvider},
+		{name: "missing provider", body: `{"op":"create_token","token":"` + tok + `"}`, wantStatus: 400, wantError: msgUnknownProvider},
+		{name: "unknown op", body: proxyBody("stripe", "refund", tok, nil), wantStatus: 400, wantError: msgUnknownOp},
+		{name: "missing op", body: `{"provider":"stripe","token":"` + tok + `"}`, wantStatus: 400, wantError: msgUnknownOp},
+		{name: "bad token", body: proxyBody("stripe", "create_token", "tok_XYZ", nil), wantStatus: 400, wantError: msgInvalidToken},
+		{name: "uppercase token", body: proxyBody("stripe", "create_token", strings.ToUpper(tok), nil), wantStatus: 400, wantError: msgInvalidToken},
+		{name: "missing token", body: `{"provider":"stripe","op":"create_token"}`, wantStatus: 400, wantError: msgInvalidToken},
+		{name: "unseeded token", body: proxyBody("stripe", "create_token", unseeded, nil), wantStatus: 400, wantError: msgUnknownToken},
+		{name: "undeclared param", body: pm(map[string]string{"amount": "1"}), wantStatus: 400, wantError: msgInvalidParams},
+		{name: "param on create_token", body: proxyBody("stripe", "create_token", tok, map[string]string{"customer": "c"}), wantStatus: 400, wantError: msgInvalidParams},
+		{name: "card override param", body: pm(map[string]string{"card[number]": "4000056655665556"}), wantStatus: 400, wantError: msgInvalidParams},
+		{name: "customer 1025 bytes", body: pm(map[string]string{"customer": strings.Repeat("c", 1025)}), wantStatus: 400, wantError: msgInvalidParams},
+		{name: "customer newline", body: pm(map[string]string{"customer": "a\nb"}), wantStatus: 400, wantError: msgInvalidParams},
+		{name: "customer NUL", body: pm(map[string]string{"customer": "a\x00b"}), wantStatus: 400, wantError: msgInvalidParams},
+		{name: "customer DEL", body: pm(map[string]string{"customer": "a\x7fb"}), wantStatus: 400, wantError: msgInvalidParams},
+		{name: "customer C1 control", body: pm(map[string]string{"customer": "a\u0085b"}), wantStatus: 400, wantError: msgInvalidParams},
+		{name: "empty customer", body: pm(map[string]string{"customer": ""}), wantStatus: 400, wantError: msgInvalidParams},
+		{name: "param number", body: `{"provider":"stripe","op":"create_payment_method","token":"` + tok + `","params":{"customer":1}}`, wantStatus: 400, wantError: msgBadBody},
+		{name: "params array", body: `{"provider":"stripe","op":"create_token","token":"` + tok + `","params":[]}`, wantStatus: 400, wantError: msgBadBody},
+		{name: "unknown field", body: `{"provider":"stripe","op":"create_token","token":"` + tok + `","body":"x"}`, wantStatus: 400, wantError: msgBadBody},
+		{name: "case-variant field", body: `{"Provider":"stripe","op":"create_token","token":"` + tok + `"}`, wantStatus: 400, wantError: msgBadBody},
+		{name: "duplicate field", body: `{"provider":"adyen","provider":"stripe","op":"create_token","token":"` + tok + `"}`, wantStatus: 400, wantError: msgBadBody},
+		{name: "duplicate param", body: `{"provider":"stripe","op":"create_payment_method","token":"` + tok + `","params":{"customer":"a","customer":"b"}}`, wantStatus: 400, wantError: msgBadBody},
+		{name: "trailing object", body: pm(nil) + `{}`, wantStatus: 400, wantError: msgBadBody},
+		{name: "not json", body: "provider=stripe", wantStatus: 400, wantError: msgBadBody},
+		{name: "array body", body: `[]`, wantStatus: 400, wantError: msgBadBody},
+		{name: "null body", body: `null`, wantStatus: 400, wantError: msgBadBody},
+		{name: "empty body", body: "", wantStatus: 400, wantError: msgBadBody},
+		{name: "body 65537", body: big, wantStatus: 413, wantError: msgTooLarge},
+		{name: "text/plain", ctype: "text/plain", body: pm(nil), wantStatus: 400, wantError: msgContentType},
+		{name: "missing ctype", ctype: omit, body: pm(nil), wantStatus: 400, wantError: msgContentType},
+		{name: "query", target: "/proxy?x=1", body: pm(nil), wantStatus: 400, wantError: msgQuery},
+		{name: "bare question mark", target: "/proxy?", body: pm(nil), wantStatus: 400, wantError: msgQuery},
+		{name: "healthz query", method: "GET", target: "/healthz?x=1", wantStatus: 400, wantError: msgQuery},
+		{name: "GET /proxy", method: "GET", body: pm(nil), wantStatus: 405, wantError: msgMethod},
+		{name: "PUT /proxy", method: "PUT", body: pm(nil), wantStatus: 405, wantError: msgMethod},
+		{name: "POST /other", target: "/other", body: pm(nil), wantStatus: 404, wantError: msgNotFound},
+		{name: "POST /tokenize", target: "/tokenize", body: pm(nil), wantStatus: 404, wantError: msgNotFound},
+		{name: "POST /proxy/", target: "/proxy/", body: pm(nil), wantStatus: 404, wantError: msgNotFound},
+		{name: "encoded path", target: "/%70roxy", body: pm(nil), wantStatus: 404, wantError: msgNotFound},
+		{name: "POST /healthz", target: "/healthz", body: pm(nil), wantStatus: 405, wantError: msgMethod},
+		{name: "idempotency 256", body: pm(nil), idem: []string{strings.Repeat("k", 256)}, wantStatus: 400, wantError: msgInvalidIdempotency},
+		{name: "idempotency DEL", body: pm(nil), idem: []string{"a\x7fb"}, wantStatus: 400, wantError: msgInvalidIdempotency},
+		{name: "idempotency tab", body: pm(nil), idem: []string{"a\tb"}, wantStatus: 400, wantError: msgInvalidIdempotency},
+		{name: "idempotency non-ASCII", body: pm(nil), idem: []string{"clé"}, wantStatus: 400, wantError: msgInvalidIdempotency},
+		{name: "idempotency twice", body: pm(nil), idem: []string{"a", "b"}, wantStatus: 400, wantError: msgInvalidIdempotency},
+		{name: "no client cert", body: pm(nil), noCert: true, wantStatus: 401, wantError: msgUnauthorized},
+		{name: "no client cert healthz", method: "GET", target: "/healthz", noCert: true, wantStatus: 401, wantError: msgUnauthorized},
+
+		// Check order: each case fails two checks; the earlier one wins.
+		{name: "order cert>404", target: "/other", noCert: true, wantStatus: 401, wantError: msgUnauthorized},
+		{name: "order 404>405", method: "PUT", target: "/x", wantStatus: 404, wantError: msgNotFound},
+		{name: "order 405>query", method: "GET", target: "/proxy?x=1", wantStatus: 405, wantError: msgMethod},
+		{name: "order query>ctype", target: "/proxy?x=1", ctype: "text/plain", body: pm(nil), wantStatus: 400, wantError: msgQuery},
+		{name: "order ctype>size", ctype: "text/plain", body: big, wantStatus: 400, wantError: msgContentType},
+		{name: "order size>shape", body: big + "x", wantStatus: 413, wantError: msgTooLarge},
+		{name: "order shape>provider", body: `{"provider":"adyen","x":1}`, wantStatus: 400, wantError: msgBadBody},
+		{name: "order provider>op", body: proxyBody("adyen", "refund", "x", nil), wantStatus: 400, wantError: msgUnknownProvider},
+		{name: "order op>token", body: proxyBody("stripe", "refund", "x", nil), wantStatus: 400, wantError: msgUnknownOp},
+		{name: "order token>params", body: proxyBody("stripe", "create_token", "x", map[string]string{"a": "b"}), wantStatus: 400, wantError: msgInvalidToken},
+		{name: "order params>idempotency", body: pm(map[string]string{"a": "b"}), idem: []string{"a\x7f"}, wantStatus: 400, wantError: msgInvalidParams},
+		{name: "order idempotency>store", body: proxyBody("stripe", "create_token", unseeded, nil), idem: []string{"a\x7f"}, wantStatus: 400, wantError: msgInvalidIdempotency},
+	}
+	for _, c := range cases {
+		method, target := c.method, c.target
+		if method == "" {
+			method = "POST"
+		}
+		if target == "" {
+			target = "/proxy"
+		}
+		r := httptest.NewRequest(method, target, strings.NewReader(c.body))
+		if !c.noCert {
+			withClientCert(r)
+		}
+		switch c.ctype {
+		case "":
+			r.Header.Set("Content-Type", "application/json")
+		case omit:
+		default:
+			r.Header.Set("Content-Type", c.ctype)
+		}
+		for _, k := range c.idem {
+			r.Header.Add("Idempotency-Key", k)
+		}
+		rec := serveInternal(v, r)
+		if rec.Code != c.wantStatus {
+			t.Errorf("%s: status %d, want %d (body len %d)", c.name, rec.Code, c.wantStatus, rec.Body.Len())
+			continue
+		}
+		if rec.Body.String() != errBody(c.wantError) {
+			t.Errorf("%s: body (len %d) is not exactly the %q error body", c.name, rec.Body.Len(), c.wantError)
+		}
+		if rec.Header().Get("Cache-Control") != "no-store" {
+			t.Errorf("%s: Cache-Control not no-store", c.name)
+		}
+	}
+	if hits, _, _, _, _ := fp.last(); hits != 0 {
+		t.Fatalf("validation failures reached the provider %d times", hits)
+	}
+	if v.cvv.take(tok) != testCVV {
+		t.Fatal("a rejected request consumed the cached CVV")
+	}
+
+	// 405 names the allowed method.
+	if rec := serveInternal(v, withClientCert(httptest.NewRequest("GET", "/proxy", nil))); rec.Header().Get("Allow") != "POST" {
+		t.Errorf("GET /proxy Allow %q", rec.Header().Get("Allow"))
+	}
+	if rec := serveInternal(v, withClientCert(httptest.NewRequest("POST", "/healthz", nil))); rec.Header().Get("Allow") != "GET" {
+		t.Errorf("POST /healthz Allow %q", rec.Header().Get("Allow"))
+	}
+
+	// Boundaries that pass validation: a 1024-byte customer, a 255-char key of every printable
+	// byte, a body of exactly 64 KiB, params null.
+	printable := make([]byte, 0, 95)
+	for b := byte(0x20); b <= 0x7e; b++ {
+		printable = append(printable, b)
+	}
+	// HTTP trims leading/trailing spaces from header values, so the run sits inside the key.
+	key := "k" + string(printable) + strings.Repeat("k", 254-len(printable))
+	for i, c := range []struct {
+		body string
+		idem string
+	}{
+		{pm(map[string]string{"customer": strings.Repeat("c", 1024)}), ""},
+		{pm(map[string]string{"customer": "cus_ü"}), key},
+		{padBody(pm(nil), maxInternalBody), ""},
+		{`{"provider":"stripe","op":"create_token","token":"` + tok + `","params":null}`, ""},
+		{pm(map[string]string{}), ""},
+	} {
+		r := newProxyRequest(c.body)
+		if c.idem != "" {
+			r.Header.Set("Idempotency-Key", c.idem)
+		}
+		before, _, _, _, _ := fp.last()
+		rec := serveInternal(v, r)
+		after, _, _, hdr, _ := fp.last()
+		if rec.Code != http.StatusOK || after != before+1 {
+			t.Errorf("boundary case %d: status %d, provider hits +%d", i, rec.Code, after-before)
+			continue
+		}
+		if c.idem != "" && hdr.Get("Idempotency-Key") != c.idem {
+			t.Errorf("boundary case %d: Idempotency-Key not forwarded unchanged", i)
+		}
+	}
+
+	// Two Content-Type headers are ambiguous and rejected.
+	r := newProxyRequest(pm(nil))
+	r.Header.Add("Content-Type", "application/json")
+	if rec := serveInternal(v, r); rec.Code != http.StatusBadRequest || rec.Body.String() != errBody(msgContentType) {
+		t.Errorf("two Content-Type headers: status %d", rec.Code)
+	}
+}
+
+func TestProxyCreatePaymentMethod(t *testing.T) {
+	fp := newFakeProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Provider-Header", "x")
+		w.Header().Set("Set-Cookie", "provider=1")
+		w.Write([]byte(`{"id":"pm_123"}`))
+	})
+	v, s := proxyVault(t, fp)
+	tok := seedCard(t, v, s, testCVV)
+
+	send := func() *httptest.ResponseRecorder {
+		r := newProxyRequest(proxyBody("stripe", "create_payment_method", tok, map[string]string{"customer": "cus_123"}))
+		r.Header.Set("Authorization", "Bearer sk_test_attacker")
+		r.Header.Set("Idempotency-Key", "idem-1")
+		r.Header.Set("Cookie", "a=b")
+		r.Header.Set("X-Forwarded-For", "1.2.3.4")
+		r.Header.Set("User-Agent", "platform/9")
+		return serveInternal(v, r)
+	}
+
+	start := testLog.Len()
+	rec := send()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200 (body len %d)", rec.Code, rec.Body.Len())
+	}
+	hits, method, path, hdr, body := fp.last()
+	if hits != 1 || method != "POST" || path != "/v1/payment_methods" {
+		t.Fatalf("outbound: hits %d, %s %s", hits, method, path)
+	}
+	const want = "card%5Bcvc%5D=9071&card%5Bexp_month%5D=12&card%5Bexp_year%5D=2030&card%5Bnumber%5D=4242424242424242&customer=cus_123&type=card"
+	if string(body) != want {
+		t.Errorf("outbound body mismatch (card values redacted)\n got  %s\n want %s", redactBody(body), redactBody([]byte(want)))
+	}
+	if got := hdr.Values("Authorization"); len(got) != 1 || got[0] != "Bearer "+testSecret {
+		t.Errorf("outbound Authorization is not exactly the vault credential (%d values)", len(got)) // never print it
+	}
+	if hdr.Get("Idempotency-Key") != "idem-1" || hdr.Get("User-Agent") != "pan-vault/1" ||
+		hdr.Get("Content-Type") != "application/x-www-form-urlencoded" {
+		t.Error("outbound Idempotency-Key, User-Agent or Content-Type wrong")
+	}
+	allowed := map[string]bool{"Authorization": true, "Content-Type": true, "Idempotency-Key": true,
+		"User-Agent": true, "Content-Length": true, "Accept-Encoding": true}
+	for k := range hdr {
+		if !allowed[k] {
+			t.Errorf("unexpected outbound header %q", k) // name only, never the value
+		}
+	}
+	if s.lastCaller != "0A1B2C" {
+		t.Errorf("getCard caller %q, want 0A1B2C", s.lastCaller)
+	}
+
+	if rec.Header().Get("Content-Type") != "application/json" || rec.Header().Get("Cache-Control") != "no-store" {
+		t.Error("response Content-Type or Cache-Control wrong")
+	}
+	if rec.Header().Get("X-Provider-Header") != "" || rec.Header().Get("Set-Cookie") != "" {
+		t.Error("provider response headers forwarded")
+	}
+	if rec.Body.String() != `{"id":"pm_123"}` {
+		t.Errorf("response body len %d is not the provider body", rec.Body.Len())
+	}
+	out := testLog.since(start)
+	if strings.Count(out, "\n") != 1 || !strings.Contains(out, " path=/proxy status=200 ") || !strings.HasSuffix(out, " caller=0A1B2C\n") {
+		t.Errorf("success log unexpected (len %d, %d lines)", len(out), strings.Count(out, "\n"))
+	}
+
+	// Second call: the CVV was single use.
+	if rec := send(); rec.Code != http.StatusOK {
+		t.Fatalf("second call status %d", rec.Code)
+	}
+	_, _, _, _, body = fp.last()
+	if bytes.Contains(body, []byte("card%5Bcvc%5D")) || bytes.Contains(body, []byte(testCVV)) {
+		t.Error("second call sent a CVV")
+	}
+	if !bytes.Contains(body, []byte("card%5Bnumber%5D=")) {
+		t.Error("second call lacks the card number")
+	}
+}
+
+func TestProxyCreateToken(t *testing.T) {
+	fp := newFakeProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusPaymentRequired)
+		w.Write([]byte(`card_declined`))
+	})
+	v, s := proxyVault(t, fp)
+	tok := seedCard(t, v, s, "")
+	rec := serveInternal(v, newProxyRequest(proxyBody("stripe", "create_token", tok, nil)))
+	_, method, path, hdr, body := fp.last()
+	if method != "POST" || path != "/v1/tokens" {
+		t.Fatalf("outbound %s %s", method, path)
+	}
+	const want = "card%5Bexp_month%5D=12&card%5Bexp_year%5D=2030&card%5Bnumber%5D=4242424242424242"
+	if string(body) != want {
+		t.Errorf("outbound body mismatch (card values redacted)\n got  %s\n want %s", redactBody(body), redactBody([]byte(want)))
+	}
+	if hdr.Get("Idempotency-Key") != "" {
+		t.Error("Idempotency-Key sent although none was given")
+	}
+	// The provider's status is passed through; Go sniffs a Content-Type for it, which is forwarded.
+	if rec.Code != http.StatusPaymentRequired || rec.Body.String() != "card_declined" || rec.Header().Get("Cache-Control") != "no-store" {
+		t.Errorf("status %d, body len %d", rec.Code, rec.Body.Len())
+	}
+
+	// A provider response with no Content-Type gets none from the vault either.
+	fp.respond = func(w http.ResponseWriter, r *http.Request) {
+		w.Header()["Content-Type"] = nil // suppress sniffing
+		w.Write([]byte(`ok`))
+	}
+	rec = serveInternal(v, newProxyRequest(proxyBody("stripe", "create_token", tok, nil)))
+	if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != "" {
+		t.Errorf("no Content-Type case: status %d, Content-Type %q", rec.Code, rec.Header().Get("Content-Type"))
+	}
+}
+
+func TestProxyVelocity(t *testing.T) {
+	fp := newFakeProvider(t, nil)
+	v, s := proxyVault(t, fp)
+	tok := seedCard(t, v, s, testCVV)
+	s.velocity = true
+	start := testLog.Len()
+	rec := serveInternal(v, newProxyRequest(proxyBody("stripe", "create_token", tok, nil)))
+	if rec.Code != http.StatusTooManyRequests || rec.Body.String() != errBody(msgVelocity) {
+		t.Fatalf("status %d, body len %d, want 429 velocity", rec.Code, rec.Body.Len())
+	}
+	if !strings.Contains(testLog.since(start), " ALERT velocity token="+tok+" caller=0A1B2C\n") {
+		t.Fatal("no ALERT velocity line with token and caller")
+	}
+	if hits, _, _, _, _ := fp.last(); hits != 0 || s.lastCaller != "0A1B2C" {
+		t.Fatalf("hits %d, caller %q", hits, s.lastCaller)
+	}
+	if v.cvv.take(tok) != testCVV {
+		t.Fatal("a velocity-limited request consumed the CVV")
+	}
+}
+
+func TestProxyStoreError(t *testing.T) {
+	fp := newFakeProvider(t, nil)
+	v, s := proxyVault(t, fp)
+	tok := seedCard(t, v, s, "")
+	const marker = "store-error-marker-91ab"
+	s.getErr = errors.New(marker)
+	start := testLog.Len()
+	rec := serveInternal(v, newProxyRequest(proxyBody("stripe", "create_token", tok, nil)))
+	if rec.Code != http.StatusInternalServerError || rec.Body.String() != errBody(msgInternal) {
+		t.Fatalf("status %d, body len %d, want 500 internal", rec.Code, rec.Body.Len())
+	}
+	if out := testLog.since(start); strings.Contains(out, marker) || strings.Contains(out, "ALERT") || strings.Count(out, "\n") != 1 {
+		t.Fatalf("store error log unexpected (len %d, %d lines)", len(out), strings.Count(out, "\n"))
+	}
+	if hits, _, _, _, _ := fp.last(); hits != 0 {
+		t.Fatal("store error reached the provider")
+	}
+
+	// A wrapped velocity/unknown error is still recognized.
+	s.getErr = nil
+	s.velocity = false
+	v.getCard = func(context.Context, string, string) ([]byte, int, error) {
+		return nil, 0, fmt.Errorf("wrapped: %w", errUnknownToken)
+	}
+	if rec := serveInternal(v, newProxyRequest(proxyBody("stripe", "create_token", tok, nil))); rec.Body.String() != errBody(msgUnknownToken) {
+		t.Fatalf("wrapped errUnknownToken: status %d", rec.Code)
+	}
+}
+
+func TestProxyDecryptFailed(t *testing.T) {
+	fp := newFakeProvider(t, nil)
+	v, s := proxyVault(t, fp)
+	tok := seedCard(t, v, s, testCVV)
+	row := s.rows[tok]
+	row.ciphertext[len(row.ciphertext)-1] ^= 0x01
+	start := testLog.Len()
+	rec := serveInternal(v, newProxyRequest(proxyBody("stripe", "create_token", tok, nil)))
+	if rec.Code != http.StatusInternalServerError || rec.Body.String() != errBody(msgInternal) {
+		t.Fatalf("status %d, body len %d, want 500 internal", rec.Code, rec.Body.Len())
+	}
+	if !strings.Contains(testLog.since(start), " ALERT decrypt_failed token="+tok+" key_version=1\n") {
+		t.Fatal("no ALERT decrypt_failed line")
+	}
+
+	// A row whose key version has no loaded DEK is a decrypt failure too.
+	tok2 := seedCard(t, v, s, "")
+	row = s.rows[tok2]
+	row.keyVersion = 9
+	s.rows[tok2] = row
+	start = testLog.Len()
+	rec = serveInternal(v, newProxyRequest(proxyBody("stripe", "create_token", tok2, nil)))
+	if rec.Code != http.StatusInternalServerError || !strings.Contains(testLog.since(start), " ALERT decrypt_failed token="+tok2+" key_version=9\n") {
+		t.Fatalf("missing DEK: status %d, or no alert", rec.Code)
+	}
+
+	// Authentic ciphertext whose plaintext is not a card record is a decrypt failure too.
+	tok3 := newToken()
+	s.rows[tok3] = fakeRow{ciphertext: seal(v.deks[1], []byte("not json")), last4: "0000", keyVersion: 1}
+	start = testLog.Len()
+	rec = serveInternal(v, newProxyRequest(proxyBody("stripe", "create_token", tok3, nil)))
+	if rec.Code != http.StatusInternalServerError || !strings.Contains(testLog.since(start), " ALERT decrypt_failed token="+tok3+" key_version=1\n") {
+		t.Fatalf("bad plaintext: status %d, or no alert", rec.Code)
+	}
+
+	if hits, _, _, _, _ := fp.last(); hits != 0 {
+		t.Fatal("decrypt failure reached the provider")
+	}
+}
+
+func TestProxyEgressInvariant(t *testing.T) {
+	fp := newFakeProvider(t, nil)
+	v, s := proxyVault(t, fp)
+	tok := seedCard(t, v, s, "")
+	p := v.providers["stripe"]
+	p.base = &url.URL{Scheme: "http", Host: strings.TrimPrefix(fp.ts.URL, "https://")}
+	v.providers["stripe"] = p
+	start := testLog.Len()
+	rec := serveInternal(v, newProxyRequest(proxyBody("stripe", "create_token", tok, nil)))
+	if rec.Code != http.StatusInternalServerError || rec.Body.String() != errBody(msgInternal) {
+		t.Fatalf("status %d, body len %d, want 500 internal", rec.Code, rec.Body.Len())
+	}
+	if !strings.Contains(testLog.since(start), " ALERT egress_invariant provider=stripe\n") {
+		t.Fatal("no ALERT egress_invariant line")
+	}
+	if hits, _, _, _, _ := fp.last(); hits != 0 {
+		t.Fatal("egress invariant failure reached the provider")
+	}
+}
+
+func TestProxyRedirectNotFollowed(t *testing.T) {
+	var landed sync.Mutex
+	landedHit := false
+	fp := newFakeProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/landed" {
+			landed.Lock()
+			landedHit = true
+			landed.Unlock()
+			return
+		}
+		w.Header().Set("Location", "/landed")
+		w.WriteHeader(http.StatusFound)
+	})
+	v, s := proxyVault(t, fp)
+	tok := seedCard(t, v, s, "")
+	rec := serveInternal(v, newProxyRequest(proxyBody("stripe", "create_token", tok, nil)))
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status %d, want 302 passed through", rec.Code)
+	}
+	landed.Lock()
+	defer landed.Unlock()
+	if landedHit {
+		t.Fatal("redirect was followed")
+	}
+	if rec.Header().Get("Location") != "" {
+		t.Fatal("Location header forwarded")
+	}
+}
+
+func TestProxyPANEchoMasked(t *testing.T) {
+	fp := newFakeProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"number":"4242424242424242","f":"4242 4242 4242 4242","h":"4242-4242-4242-4242"}`))
+	})
+	v, s := proxyVault(t, fp)
+	tok := seedCard(t, v, s, "")
+	start := testLog.Len()
+	rec := serveInternal(v, newProxyRequest(proxyBody("stripe", "create_token", tok, nil)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	if got := rec.Body.String(); got != `{"number":"****4242","f":"****4242","h":"****4242"}` {
+		t.Fatalf("body not masked as expected (len %d, has PAN %v)", len(got), len(luhnWindowOffsets(joinDigitSeparators(got))) > 0)
+	}
+	out := testLog.since(start)
+	if !strings.Contains(out, " ALERT pan_echo provider=stripe op=create_token token="+tok+"\n") {
+		t.Fatal("no ALERT pan_echo line")
+	}
+	if strings.Count(out, "ALERT") != 1 {
+		t.Fatalf("%d ALERT lines, want 1", strings.Count(out, "ALERT"))
+	}
+
+	// A clean response raises no alert.
+	fp.respond = nil
+	start = testLog.Len()
+	serveInternal(v, newProxyRequest(proxyBody("stripe", "create_token", tok, nil)))
+	if strings.Contains(testLog.since(start), "ALERT") {
+		t.Fatal("clean response raised an alert")
+	}
+}
+
+// The transport asks for gzip itself and decompresses transparently, so maskPAN sees the
+// decompressed bytes. Any Content-Encoding still present on the response means the body arrived
+// encoded (and could hide a PAN from maskPAN): 502.
+func TestProxyContentEncoding(t *testing.T) {
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	zw.Write([]byte(`{"number":"4242424242424242"}`))
+	zw.Close()
+	var enc, payload atomic.Value
+	fp := newFakeProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Encoding", enc.Load().(string))
+		w.Write(payload.Load().([]byte))
+	})
+	v, s := proxyVault(t, fp)
+	tok := seedCard(t, v, s, "")
+
+	// Valid gzip: decompressed by the transport, then masked.
+	enc.Store("gzip")
+	payload.Store(gz.Bytes())
+	start := testLog.Len()
+	rec := serveInternal(v, newProxyRequest(proxyBody("stripe", "create_token", tok, nil)))
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"number":"****4242"}` || rec.Header().Get("Content-Encoding") != "" {
+		t.Fatalf("gzip: status %d, body len %d", rec.Code, rec.Body.Len())
+	}
+	if !strings.Contains(testLog.since(start), "ALERT pan_echo") {
+		t.Fatal("gzip: no pan_echo alert")
+	}
+	if _, _, _, hdr, _ := fp.last(); hdr.Get("Accept-Encoding") != "gzip" {
+		t.Fatal("transport did not request gzip itself")
+	}
+
+	for i, c := range []struct {
+		enc  string
+		body []byte
+	}{
+		{"gzip", []byte(`{"number":"4242424242424242"}`)}, // claims gzip, is not: read error
+		{"br", gz.Bytes()},
+		{"deflate", gz.Bytes()},
+		{"identity", []byte(`{"number":"4242424242424242"}`)},
+		{"gzip, gzip", gz.Bytes()},
+	} {
+		enc.Store(c.enc)
+		payload.Store(c.body)
+		rec := serveInternal(v, newProxyRequest(proxyBody("stripe", "create_token", tok, nil)))
+		if rec.Code != http.StatusBadGateway || rec.Body.String() != errBody(msgProvider) {
+			t.Errorf("encoding case %d: status %d, body len %d, want 502", i, rec.Code, rec.Body.Len())
+		}
+	}
+}
+
+func TestProxyProviderUnreachable(t *testing.T) {
+	closed := httptest.NewTLSServer(http.NotFoundHandler())
+	closedURL, cert := closed.URL, closed.Certificate()
+	closed.Close()
+	v, s := newTestVault(t)
+	pointStripe(t, v, closedURL, cert)
+	tok := seedCard(t, v, s, "")
+	start := testLog.Len()
+	rec := serveInternal(v, newProxyRequest(proxyBody("stripe", "create_token", tok, nil)))
+	if rec.Code != http.StatusBadGateway || rec.Body.String() != `{"error":"provider unreachable"}`+"\n" {
+		t.Fatalf("status %d, body len %d, want 502 provider unreachable", rec.Code, rec.Body.Len())
+	}
+	if out := testLog.since(start); strings.Count(out, "\n") != 1 || strings.Contains(out, "127.0.0.1") {
+		t.Fatalf("unreachable log unexpected (len %d, %d lines)", len(out), strings.Count(out, "\n"))
+	}
+
+	// A provider whose certificate is not trusted is unreachable too (TLS is verified). (All
+	// httptest servers share one certificate, so trust nothing at all here.)
+	fp := newFakeProvider(t, nil)
+	pointStripe(t, v, fp.ts.URL, cert)
+	v.client = newOutboundClient(x509.NewCertPool())
+	if rec := serveInternal(v, newProxyRequest(proxyBody("stripe", "create_token", tok, nil))); rec.Code != http.StatusBadGateway {
+		t.Fatalf("untrusted cert: status %d, want 502", rec.Code)
+	}
+}
+
+func TestProxyOversizeProviderResponse(t *testing.T) {
+	var size atomic.Int64
+	fp := newFakeProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		n := int(size.Load())
+		b := bytes.Repeat([]byte("x"), n)
+		copy(b[n-len(testPAN)-10:], testPAN)
+		w.Header().Set("Content-Type", "text/plain")
+		w.Write(b)
+	})
+	v, s := proxyVault(t, fp)
+	tok := seedCard(t, v, s, "")
+
+	size.Store(maxProviderResponse + 1)
+	rec := serveInternal(v, newProxyRequest(proxyBody("stripe", "create_token", tok, nil)))
+	if rec.Code != http.StatusBadGateway || rec.Body.String() != errBody(msgProvider) {
+		t.Fatalf("status %d, body len %d, want 502", rec.Code, rec.Body.Len())
+	}
+	if bytes.Contains(rec.Body.Bytes(), []byte(testPAN)) {
+		t.Fatal("oversize response leaked the PAN")
+	}
+
+	// Exactly 4 MiB is accepted and masked, PAN near the end included.
+	size.Store(maxProviderResponse)
+	rec = serveInternal(v, newProxyRequest(proxyBody("stripe", "create_token", tok, nil)))
+	if rec.Code != http.StatusOK || bytes.Contains(rec.Body.Bytes(), []byte(testPAN)) ||
+		!bytes.Contains(rec.Body.Bytes(), []byte("****4242")) {
+		t.Fatalf("4 MiB response: status %d, body len %d", rec.Code, rec.Body.Len())
+	}
+}
+
+func TestHealthz(t *testing.T) {
+	v, _ := newTestVault(t)
+	var (
+		mu       sync.Mutex
+		deadline time.Time
+		hasDL    bool
+	)
+	var pingErr error
+	v.ping = func(ctx context.Context) error {
+		mu.Lock()
+		defer mu.Unlock()
+		deadline, hasDL = ctx.Deadline()
+		return pingErr
+	}
+	get := func() *httptest.ResponseRecorder {
+		return serveInternal(v, withClientCert(httptest.NewRequest("GET", "/healthz", nil)))
+	}
+
+	before := time.Now()
+	rec := get()
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"status":"ok"}`+"\n" {
+		t.Fatalf("healthy: status %d, body len %d", rec.Code, rec.Body.Len())
+	}
+	if rec.Header().Get("Content-Type") != "application/json" || rec.Header().Get("Cache-Control") != "no-store" {
+		t.Error("healthz headers wrong")
+	}
+	mu.Lock()
+	if !hasDL || deadline.After(before.Add(2*time.Second+50*time.Millisecond)) || deadline.Before(before.Add(time.Second)) {
+		t.Errorf("ping deadline present=%v, %v from request start, want ≤ 2s", hasDL, deadline.Sub(before))
+	}
+	mu.Unlock()
+
+	const marker = "ping-failure-marker-3c0d"
+	pingErr = errors.New(marker)
+	start := testLog.Len()
+	rec = get()
+	if rec.Code != http.StatusServiceUnavailable || rec.Body.String() != errBody(msgUnavailable) {
+		t.Fatalf("unhealthy: status %d, body len %d", rec.Code, rec.Body.Len())
+	}
+	if out := testLog.since(start); strings.Contains(out, marker) || !strings.Contains(out, " path=/healthz status=503 ") {
+		t.Fatalf("unhealthy log unexpected (len %d)", len(out))
 	}
 }

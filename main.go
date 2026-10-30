@@ -25,6 +25,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
@@ -535,28 +537,41 @@ func singleHeader(h http.Header, name string) (string, bool) {
 	return vals[0], true
 }
 
+// jsonContentType reports whether h carries exactly one Content-Type and it is application/json.
+// SPEC-DECISION: the media type must be application/json (case-insensitive, per RFC 9110);
+// the only parameter allowed is charset=utf-8, since JSON is UTF-8 (RFC 8259).
+func jsonContentType(h http.Header) bool {
+	ct, ok := singleHeader(h, "Content-Type")
+	if !ok {
+		return false
+	}
+	mt, params, err := mime.ParseMediaType(ct)
+	return err == nil && mt == "application/json" && len(params) <= 1 &&
+		(len(params) == 0 || strings.EqualFold(params["charset"], "utf-8"))
+}
+
 // tokenizeFields is the exact set of keys a /tokenize body may contain.
 var tokenizeFields = map[string]bool{"pan": true, "exp_month": true, "exp_year": true, "cvv": true}
 
-// exactKeys reports whether body is a JSON object whose keys are all in tokenizeFields, spelled
-// exactly, each at most once.
+// exactKeys reports whether body is a JSON object whose keys are all in fields (any key if fields
+// is nil), spelled exactly, each at most once.
 // SPEC-DECISION: encoding/json matches keys case-insensitively and keeps the last of duplicate
 // keys, so DisallowUnknownFields alone accepts {"PAN":…} and {"pan":A,"pan":B}. Both are
 // rejected as unknown fields: a body that different JSON parsers would read differently is
 // never tokenized.
-func exactKeys(body []byte) bool {
+func exactKeys(body []byte, fields map[string]bool) bool {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
 		return false
 	}
-	seen := make(map[string]bool, len(tokenizeFields))
+	seen := make(map[string]bool, len(fields))
 	for dec.More() {
 		t, err := dec.Token()
 		if err != nil {
 			return false
 		}
 		k, ok := t.(string)
-		if !ok || !tokenizeFields[k] || seen[k] {
+		if !ok || (fields != nil && !fields[k]) || seen[k] {
 			return false
 		}
 		seen[k] = true
@@ -622,16 +637,7 @@ func (v *vault) handleTokenize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// SPEC-DECISION: the media type must be application/json (case-insensitive, per RFC 9110);
-	// the only parameter allowed is charset=utf-8, since JSON is UTF-8 (RFC 8259).
-	ct, ok := singleHeader(r.Header, "Content-Type")
-	if !ok {
-		writeError(w, http.StatusBadRequest, msgContentType)
-		return
-	}
-	mt, params, err := mime.ParseMediaType(ct)
-	if err != nil || mt != "application/json" || len(params) > 1 ||
-		(len(params) == 1 && !strings.EqualFold(params["charset"], "utf-8")) {
+	if !jsonContentType(r.Header) {
 		writeError(w, http.StatusBadRequest, msgContentType)
 		return
 	}
@@ -655,7 +661,7 @@ func (v *vault) handleTokenize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var extra json.RawMessage
-	if err := dec.Decode(&extra); err != io.EOF || !exactKeys(body) {
+	if err := dec.Decode(&extra); err != io.EOF || !exactKeys(body, tokenizeFields) {
 		writeError(w, http.StatusBadRequest, msgBadBody)
 		return
 	}
@@ -819,25 +825,37 @@ func providerURL(base *url.URL, path string) (*url.URL, error) {
 }
 
 // maskPAN replaces every occurrence of pan, and of pan grouped in fours from the left with single
-// spaces ("4242 4242 4242 4242", "3782 8224 6310 005"), with "****"+last4 (§6.4 step 9). found
-// reports whether anything was replaced; if not, body is returned unchanged.
+// spaces ("4242 4242 4242 4242", "3782 8224 6310 005") or single hyphens ("4242-4242-4242-4242"),
+// with "****"+last4 (§6.4 step 9). found reports whether anything was replaced; if not, body is
+// returned unchanged.
+// SPEC-DECISION: the hyphen-grouped form is masked too (§6.4 names only the exact and spaced
+// forms; hyphens are the other separator normalizePAN accepts). The replacement repeats until no
+// form remains: one bytes.ReplaceAll pass over pan+pan[4:] leaves a full PAN when the last 4
+// digits equal the first 4 ("4242…4242" + "4242…" → "****4242" + "4242…"). Each pass replaces a
+// needle of >= 13 bytes with an 8-byte mask, so the body strictly shrinks and the loop ends.
 func maskPAN(body []byte, pan string) ([]byte, bool) {
-	if len(pan) < 4 { // never a real PAN; also keeps an empty needle out of bytes.ReplaceAll
+	if len(pan) < 13 { // never a real PAN (§5.5); keeps every needle longer than the mask
 		return body, false
 	}
-	var spaced strings.Builder
+	var spaced, hyphen strings.Builder
 	for i := 0; i < len(pan); i++ {
 		if i > 0 && i%4 == 0 {
 			spaced.WriteByte(' ')
+			hyphen.WriteByte('-')
 		}
 		spaced.WriteByte(pan[i])
+		hyphen.WriteByte(pan[i])
 	}
+	forms := [][]byte{[]byte(pan), []byte(spaced.String()), []byte(hyphen.String())}
 	mask := []byte("****" + pan[len(pan)-4:])
 	found := false
-	for _, form := range []string{pan, spaced.String()} {
-		if bytes.Contains(body, []byte(form)) {
-			body = bytes.ReplaceAll(body, []byte(form), mask)
-			found = true
+	for again := true; again; {
+		again = false
+		for _, form := range forms {
+			if bytes.Contains(body, form) {
+				body = bytes.ReplaceAll(body, form, mask)
+				found, again = true, true
+			}
 		}
 	}
 	return body, found
@@ -861,4 +879,286 @@ func newOutboundClient(roots *x509.CertPool) *http.Client {
 			IdleConnTimeout:     90 * time.Second,
 		},
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Internal API: POST /proxy and GET /healthz (SPEC §3.2, §6, §9.3, §10.1)
+// ---------------------------------------------------------------------------
+
+const (
+	maxInternalBody = 64 << 10 // §6.2: 64 KiB request body limit
+	maxParamValue   = 1 << 10  // §6.2: 1 KiB per param value
+	maxIdempotency  = 255      // §6.2: Idempotency-Key length limit
+	healthzTimeout  = 2 * time.Second
+)
+
+type proxyRequest struct {
+	Provider string            `json:"provider"`
+	Op       string            `json:"op"`
+	Token    string            `json:"token"`
+	Params   map[string]string `json:"params"`
+}
+
+// proxyFields is the exact set of keys a /proxy body may contain.
+var proxyFields = map[string]bool{"provider": true, "op": true, "token": true, "params": true}
+
+// internalHandler is the complete handler for the internal listener: /proxy (POST) and /healthz
+// (GET). Checks run client certificate (401) → path (404) → method (405) → query (400).
+// SPEC-DECISION: the client certificate is checked first, so a caller without one (impossible
+// behind RequireAndVerifyClientCert; this is defence in depth) learns nothing about routing. A
+// certificate with no usable serial (callerSerial == "") counts as no certificate.
+func (v *vault) internalHandler() http.Handler {
+	return v.guard("internal", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if callerSerial(r) == "" {
+			writeError(w, http.StatusUnauthorized, msgUnauthorized)
+			return
+		}
+		var method string
+		var h http.HandlerFunc
+		switch r.URL.Path {
+		case "/proxy":
+			method, h = http.MethodPost, v.handleProxy
+		case "/healthz":
+			method, h = http.MethodGet, v.handleHealthz
+		}
+		// SPEC-DECISION: as on /tokenize, a percent-encoded spelling of a route is 404.
+		if h == nil || r.URL.RawPath != "" {
+			writeError(w, http.StatusNotFound, msgNotFound)
+			return
+		}
+		if r.Method != method {
+			w.Header().Set("Allow", method)
+			writeError(w, http.StatusMethodNotAllowed, msgMethod)
+			return
+		}
+		if r.URL.RawQuery != "" || r.URL.ForceQuery {
+			writeError(w, http.StatusBadRequest, msgQuery)
+			return
+		}
+		h(w, r)
+	}))
+}
+
+// validParamValue reports whether s is at most 1 KiB of valid UTF-8 without control characters.
+// SPEC-DECISION: an empty value is invalid too. No op gives "" a meaning, and rejecting it here
+// (rather than in the builder, after the single-use CVV has been taken) keeps the CVV intact.
+func validParamValue(s string) bool {
+	if s == "" || len(s) > maxParamValue || !utf8.ValidString(s) {
+		return false
+	}
+	for _, c := range s {
+		if unicode.IsControl(c) {
+			return false
+		}
+	}
+	return true
+}
+
+// validIdempotencyKey reports whether k is 1–255 bytes of printable ASCII (0x20–0x7E).
+func validIdempotencyKey(k string) bool {
+	if k == "" || len(k) > maxIdempotency {
+		return false
+	}
+	for i := 0; i < len(k); i++ {
+		if k[i] < 0x20 || k[i] > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+// handleProxy implements POST /proxy (§3.2, §6.4). Routing, method, query and client certificate
+// were checked by internalHandler. The checks run in a fixed order and each failing check returns
+// immediately; error bodies use only the msg* constants. Nothing from the request or the provider
+// response is logged; the only log lines are the ALERTs of §10.1.
+func (v *vault) handleProxy(w http.ResponseWriter, r *http.Request) {
+	if !jsonContentType(r.Header) {
+		writeError(w, http.StatusBadRequest, msgContentType)
+		return
+	}
+	reqBody, err := io.ReadAll(io.LimitReader(r.Body, maxInternalBody+1))
+	if len(reqBody) > maxInternalBody {
+		writeError(w, http.StatusRequestEntityTooLarge, msgTooLarge)
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, msgBadBody)
+		return
+	}
+
+	// Strict decode: one object, no unknown/case-variant/duplicate top-level keys, no duplicate
+	// params keys, params a string→string map.
+	// SPEC-DECISION: as on /tokenize, encoding/json's case-insensitive key matching and
+	// last-duplicate-wins are closed off, at the top level and inside params: a body that
+	// different JSON parsers would read differently is never acted on.
+	var req proxyRequest
+	dec := json.NewDecoder(bytes.NewReader(reqBody))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, msgBadBody)
+		return
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF || !exactKeys(reqBody, proxyFields) {
+		writeError(w, http.StatusBadRequest, msgBadBody)
+		return
+	}
+	var raw struct {
+		Params json.RawMessage `json:"params"`
+	}
+	if err := json.Unmarshal(reqBody, &raw); err != nil ||
+		(len(raw.Params) > 0 && string(raw.Params) != "null" && !exactKeys(raw.Params, nil)) {
+		writeError(w, http.StatusBadRequest, msgBadBody)
+		return
+	}
+
+	p, ok := v.providers[req.Provider]
+	if !ok {
+		writeError(w, http.StatusBadRequest, msgUnknownProvider)
+		return
+	}
+	o, ok := p.ops[req.Op]
+	if !ok {
+		writeError(w, http.StatusBadRequest, msgUnknownOp)
+		return
+	}
+	if !tokenRe.MatchString(req.Token) {
+		writeError(w, http.StatusBadRequest, msgInvalidToken)
+		return
+	}
+	for k, val := range req.Params {
+		if !o.params[k] || !validParamValue(val) {
+			writeError(w, http.StatusBadRequest, msgInvalidParams)
+			return
+		}
+	}
+	// SPEC-DECISION: more than one Idempotency-Key header is ambiguous and rejected; a single
+	// empty one is treated as absent.
+	idem := ""
+	if vals := r.Header.Values("Idempotency-Key"); len(vals) > 1 {
+		writeError(w, http.StatusBadRequest, msgInvalidIdempotency)
+		return
+	} else if len(vals) == 1 && vals[0] != "" {
+		if !validIdempotencyKey(vals[0]) {
+			writeError(w, http.StatusBadRequest, msgInvalidIdempotency)
+			return
+		}
+		idem = vals[0]
+	}
+
+	// §6.4 step 3. The caller serial is passed for the database audit trail (§10.2).
+	ctx := r.Context()
+	ciphertext, keyVersion, err := v.getCard(ctx, req.Token, callerSerial(r))
+	switch {
+	case errors.Is(err, errVelocity):
+		v.logf("ALERT velocity token=%s caller=%s", req.Token, callerSerial(r))
+		writeError(w, http.StatusTooManyRequests, msgVelocity)
+		return
+	case errors.Is(err, errUnknownToken):
+		writeError(w, http.StatusBadRequest, msgUnknownToken)
+		return
+	case err != nil:
+		// Never logged or returned: it could carry driver or query detail.
+		writeError(w, http.StatusInternalServerError, msgInternal)
+		return
+	}
+
+	// §6.4 step 4.
+	// SPEC-DECISION: authentic plaintext that is not a card record is reported as decrypt_failed
+	// as well: it can only mean key or data corruption.
+	var c card
+	plaintext, err := unseal(v.deks[keyVersion], ciphertext) // a missing DEK (nil) fails unseal
+	if err == nil {
+		err = json.Unmarshal(plaintext, &c)
+	}
+	zero(plaintext) // best effort (§8.5)
+	if err != nil {
+		v.logf("ALERT decrypt_failed token=%s key_version=%d", req.Token, keyVersion)
+		writeError(w, http.StatusInternalServerError, msgInternal)
+		return
+	}
+
+	// §6.4 steps 5–6. Absence of a CVV is not an error; the op decides.
+	cvv := v.cvv.take(req.Token)
+	path, contentType, outBody, err := o.build(req.Params, c, cvv)
+	defer zero(outBody) // best effort (§8.5); after the response has been read
+	if err != nil {
+		writeError(w, http.StatusBadRequest, msgInvalidParams)
+		return
+	}
+	u, err := providerURL(p.base, path)
+	if err != nil {
+		v.logf("ALERT egress_invariant provider=%s", req.Provider)
+		writeError(w, http.StatusInternalServerError, msgInternal)
+		return
+	}
+
+	// §6.4 step 7. A fresh header set: no inbound header but Idempotency-Key reaches the
+	// provider, and the credential comes only from the catalog (§9.3).
+	// Accept-Encoding is deliberately not set: the transport then requests gzip itself and
+	// decompresses transparently, so maskPAN always sees plain bytes.
+	out, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(outBody))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, msgInternal)
+		return
+	}
+	out.Header.Set("Content-Type", contentType)
+	p.auth(out, p.secret)
+	if idem != "" {
+		out.Header.Set("Idempotency-Key", idem)
+	}
+	out.Header.Set("User-Agent", "pan-vault/1")
+
+	// §6.4 steps 8–9. Transport errors are never logged or returned (they name hosts and causes).
+	resp, err := v.client.Do(out)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, msgProvider)
+		return
+	}
+	defer resp.Body.Close()
+	// SPEC-DECISION: a Content-Encoding still present means the transport did not decode the
+	// body; maskPAN cannot see a PAN inside compressed bytes, so the response is refused (502).
+	for _, ce := range resp.Header.Values("Content-Encoding") {
+		if ce != "" {
+			writeError(w, http.StatusBadGateway, msgProvider)
+			return
+		}
+	}
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxProviderResponse+1))
+	defer zero(respBody) // best effort; runs after the masked copy has been written
+	if err != nil || len(respBody) > maxProviderResponse {
+		// Never a truncated (and so possibly partially masked) body (globals decision 6).
+		writeError(w, http.StatusBadGateway, msgProvider)
+		return
+	}
+	masked, found := maskPAN(respBody, c.PAN)
+	if found {
+		v.logf("ALERT pan_echo provider=%s op=%s token=%s", req.Provider, req.Op, req.Token)
+	}
+
+	// §6.4 step 10: status, Content-Type and the scrubbed body; no other provider header.
+	h := w.Header()
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		h.Set("Content-Type", ct)
+	} else {
+		h["Content-Type"] = nil // the provider sent none: stop net/http from sniffing one
+	}
+	h.Set("Cache-Control", "no-store")
+	h.Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(masked)
+}
+
+// handleHealthz implements GET /healthz (§6.5): 200 {"status":"ok"} if the database answers a
+// ping within 2 seconds, else 503 {"error":"unavailable"}. The ping error is never revealed.
+func (v *vault) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), healthzTimeout)
+	defer cancel()
+	if err := v.ping(ctx); err != nil {
+		writeError(w, http.StatusServiceUnavailable, msgUnavailable)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Status string `json:"status"`
+	}{"ok"})
 }
