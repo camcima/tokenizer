@@ -553,3 +553,45 @@ func TestRefreshFailureKeepsSnapshot(t *testing.T) {
 		t.Fatal("a failed refresh was not recorded as an attempt")
 	}
 }
+
+// The refresh function runs under its own deadline and is not cancelled with the caller: a
+// caller that goes away mid-refresh neither fails the attempt nor holds queued callers beyond
+// dekRefreshTimeout.
+func TestRefreshTimeout(t *testing.T) {
+	if dekRefreshTimeout != 30*time.Second {
+		t.Fatalf("dekRefreshTimeout = %v, want 30s", dekRefreshTimeout)
+	}
+	v, _ := newTestVault(t)
+	type ctxKey struct{}
+	started, callerGone := make(chan struct{}), make(chan struct{})
+	var errAfterCancel error
+	var left time.Duration
+	var hasDeadline, hasValue bool
+	v.refreshDEKs = func(ctx context.Context) error {
+		dl, ok := ctx.Deadline()
+		left, hasDeadline = time.Until(dl), ok
+		hasValue = ctx.Value(ctxKey{}) != nil
+		close(started)
+		<-callerGone
+		errAfterCancel = ctx.Err()
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), ctxKey{}, true))
+	done := make(chan error, 1)
+	go func() { done <- v.refresh(ctx) }()
+	<-started
+	cancel()
+	close(callerGone)
+	if err := <-done; err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if !hasDeadline || left > dekRefreshTimeout || left < dekRefreshTimeout-5*time.Second {
+		t.Errorf("refresh context deadline ok=%v %v away, want ≤%v", hasDeadline, left, dekRefreshTimeout)
+	}
+	if errAfterCancel != nil {
+		t.Errorf("the caller's cancellation reached the refresh context: %v", errAfterCancel)
+	}
+	if !hasValue {
+		t.Error("the refresh context is not derived from the caller's context")
+	}
+}

@@ -332,7 +332,9 @@ func dekRefresher(v *vault, cfg config, db *sql.DB, c *http.Client, ts *tokenSou
 		return func(context.Context) error { return nil }
 	}
 	return func(ctx context.Context) error {
-		wrapped, err := dbListDEKs(ctx, db)
+		dbCtx, cancel := context.WithTimeout(ctx, dbCallTimeout)
+		wrapped, err := dbListDEKs(dbCtx, db)
+		cancel()
 		if err != nil {
 			return err
 		}
