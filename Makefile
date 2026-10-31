@@ -1,5 +1,5 @@
 .PHONY: build test lint vuln deps-check vendor-check image image-repro ci tools itest stripe-mock-test ci-all \
-        fuzz fuzz-long gitleaks hooks
+        fuzz fuzz-long gitleaks hooks docs-check comment-check commit-check
 
 # Tools from the module's toolchain (go.mod `toolchain go1.27.3`), not whatever is first on PATH.
 GOFMT   = $(shell go env GOROOT)/bin/gofmt
@@ -83,7 +83,48 @@ image-repro:
 	if [ "$$a" != "$$b" ]; then echo "image-repro: digests differ: $$a vs $$b"; exit 1; fi; \
 	echo "image-repro: ok $$a"
 
-ci: lint vuln deps-check vendor-check gitleaks test build
+ci: lint vuln deps-check vendor-check docs-check comment-check gitleaks test build
+
+# The three READMEs are one document in three languages. docs-check fails if any of them repeats
+# a retired claim (case-insensitive), or if their heading, table-row or Mermaid-block counts
+# differ, which catches a section, table row or diagram changed in one language only.
+READMES       = README.md README.es.md README.pt-BR.md
+RETIRED_DOCS  = rewraps automatically|reenvuelve automáticamente|reencapsula automaticamente|\
+                keeps the platform out of PCI scope|mantiene la plataforma fuera del alcance|\
+                mantiene a la plataforma fuera del alcance|mantém a plataforma fora do escopo|\
+                created daily|se crea diariamente|se crea una nueva clave de datos cada día|\
+                criada diariamente
+docs-check:
+	@fail=0; retired='$(RETIRED_DOCS)'; \
+	oldifs=$$IFS; IFS='|'; \
+	for p in $$retired; do \
+		p=$$(printf '%s' "$$p" | sed 's/^ *//; s/ *$$//'); \
+		if grep -n -i -F -e "$$p" $(READMES); then echo "docs-check: retired claim: $$p"; fail=1; fi; \
+	done; \
+	IFS=$$oldifs; \
+	for pat in '^#' '^|' '^```mermaid'; do \
+		counts=""; for f in $(READMES); do counts="$$counts $$(grep -c -e "$$pat" $$f)"; done; \
+		if [ $$(printf '%s\n' $$counts | sort -u | wc -l) -ne 1 ]; then \
+			echo "docs-check: '$$pat' line counts differ across $(READMES):$$counts"; fail=1; \
+		fi; \
+	done; \
+	[ $$fail -eq 0 ] && echo "docs-check: ok"
+
+# The comment rule of the pre-commit hook, over every tracked Go file outside vendor/.
+comment-check:
+	@scripts/check-comments.sh $$(git ls-files '*.go' ':!:vendor/*') && echo "comment-check: ok"
+
+# The commit-msg hook's rule over every commit in COMMIT_RANGE (CI passes the pull request's or
+# the push's range), so a commit made without the hook still fails CI.
+COMMIT_RANGE ?= origin/main..HEAD
+commit-check:
+	@commits=$$(git rev-list --reverse $(COMMIT_RANGE)) || { echo "commit-check: bad range $(COMMIT_RANGE)"; exit 1; }; \
+	fail=0; n=0; \
+	for c in $$commits; do \
+		n=$$((n+1)); \
+		out=$$(scripts/check-commit-msg.sh "$$(git log -1 --format=%B $$c)") || { echo "commit-check: $$c"; echo "$$out"; fail=1; }; \
+	done; \
+	[ $$fail -eq 0 ] && echo "commit-check: ok ($$n commits in $(COMMIT_RANGE))"
 
 # Fuzzing: every Fuzz* target in the package, one after another (the engine fuzzes one target per
 # run). `make fuzz` runs each for 20s (pull requests); `make fuzz-long` for FUZZTIME (nightly). The

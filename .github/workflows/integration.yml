@@ -1,0 +1,41 @@
+name: Integration
+
+# make itest: the database and end-to-end tests against a throwaway postgres:18 container.
+# make stripe-mock-test: the embedded catalog's Stripe requests against stripe-mock (pinned by
+# digest). Docker is preinstalled on the runner; psql and curl wait for the containers.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install psql and curl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client curl
+
+      - name: make itest
+        run: make itest
+
+      - name: make stripe-mock-test
+        run: make stripe-mock-test

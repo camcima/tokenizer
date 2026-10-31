@@ -8,7 +8,7 @@ This review records **three high-priority findings, four medium-priority finding
 
 **Scope and method**
 
-Reviewed all application Go source files, the SQL schema, embedded catalog, build configuration, tests, README, local original specification, and superseding provider-proxy design. The current requirements in [CLAUDE.md](../CLAUDE.md) and the [provider-agnostic design](superpowers/specs/2026-10-30-provider-agnostic-proxy-design.md) take precedence over superseded parts of the original specification.
+Reviewed all application Go source files, the SQL schema, embedded catalog, build configuration, tests, README, local original specification, and superseding provider-proxy design. The current requirements in [CLAUDE.md](../CLAUDE.md) and the provider-agnostic proxy design (2026-10-30) take precedence over superseded parts of the original specification.
 
 Validation included the race-enabled test suite, static analysis, dependency and vendor checks, an isolated PostgreSQL 18.4 instance, and seven temporary probes using synthetic fixtures. External documentation was checked for PCI guidance and Google Cloud behavior. Production infrastructure, Cloud SQL IAM configuration, provider sandbox behavior, deployment pipelines, and assessor-approved PCI scope were not available for verification. Source line references below refer to the baseline commit.
 
@@ -200,7 +200,7 @@ Live Stripe and stripe-mock tests were not run. Production pgaudit, Cloud SQL IA
 
 **Disposition (added 2026-10-30, after review by the project owner)**
 
-Each finding and release gate below records what was decided and why. Items marked *addressed* are implemented by the plan in `docs/superpowers/plans/2026-10-30-production-hardening.md` (design: `docs/superpowers/specs/2026-10-30-production-hardening-design.md`).
+Each finding and release gate below records what was decided and why. Items marked *addressed* are implemented by the production hardening design (2026-10-30) and its implementation plan.
 
 | ID | Decision | Reason |
 |---|---|---|
@@ -220,5 +220,5 @@ Each finding and release gate below records what was decided and why. Items mark
 | Real firewall correspondence | **Not addressed in this repository** | Firewall rules and their verification live in the infrastructure pipeline; this repository supplies the per-environment host lists it must match. |
 | Admission control and capacity | **Accepted as designed** | Reusable 15-minute session tokens bounded by Cloud Armor, and a shared global lookup limit, are explicit design choices; tuning the limits needs production traffic measurements that do not exist yet. |
 | Certificate and secret lifecycle | **Accepted as designed** | A single trust domain (any certificate from the pinned CA may call `/proxy`) is the intended v1 model; per-account authorization becomes necessary only with independent tenants. |
-| Required CI execution | **Addressed** (`.github/workflows/ci.yml` runs `make ci-all`) | Branch protection itself is a repository setting outside the code. |
+| Required CI execution | **Addressed** (four GitHub Actions workflows: CI runs `make ci` and checks every commit message, Integration runs `make itest` and `make stripe-mock-test`, Image runs `make image-repro` and keeps the image digest, Fuzz runs `make fuzz` on pull requests and `make fuzz-long` nightly) | Branch protection itself is a repository setting outside the code; the README says it should require all four. |
 | PCI boundary and browser control | **Addressed in wording** | The README now says the vault is designed to keep the platform's back end out of scope, subject to the assessor's scoping, consistent with its existing payment-page caveat. |
