@@ -221,7 +221,7 @@ flowchart LR
     Browser["Navegador del cliente<br/>(página de checkout)"]
     subgraph Platform["Plataforma: fuera del CDE"]
         API[Servicios de checkout y pagos]
-        PDB[(DB de la plataforma<br/>solo tokens)]
+        PDB[("DB de la plataforma<br/>tokens + datos del recibo")]
     end
     subgraph CDE["CDE: proyecto pci-cde, perímetro VPC-SC"]
         Vault["PAN Vault<br/>(Go, binario único)"]
@@ -234,8 +234,8 @@ flowchart LR
     Stripe["API del proveedor<br/>(host de la cuenta del catálogo)"]
 
     Browser -- "1. tarjeta + token de sesión<br/>(HTTPS :8443)" --> Vault
-    Vault -- "2. token" --> Browser
-    Browser -- "3. token" --> API
+    Vault -- "2. token + recibo firmado" --> Browser
+    Browser -- "3. token + recibo" --> API
     API --> PDB
     API -- "4. cuenta + token + solicitud con placeholders<br/>(mTLS :9443)" --> Vault
     Vault -- "5. solicitud con la tarjeta completada<br/>(HTTPS, host del catálogo, credencial del vault)" --> Stripe
@@ -246,7 +246,7 @@ flowchart LR
     Vault --- KMS
 ```
 
-**Lo que ve la plataforma:** tokens, `last4`, mes y año de vencimiento, y respuestas del proveedor en las que cualquier número de tarjeta devuelto se reemplaza por `****4242`.
+**Lo que ve la plataforma:** tokens, `last4`, mes y año de vencimiento, el BIN (los primeros 6 u 8 dígitos) y el nombre del titular que trae el recibo firmado (ver [§6.2](#62-el-recibo-firmado)), y respuestas del proveedor en las que cualquier número de tarjeta devuelto se reemplaza por `****4242`.
 
 **Lo que la plataforma nunca ve:** un número de tarjeta completo ni un CVV. No existe ninguna API que los devuelva.
 
@@ -270,7 +270,7 @@ flowchart LR
 
 El vault hace exactamente dos trabajos:
 
-1. **Tokenizar.** Recibe una tarjeta desde el navegador y, opcionalmente, el nombre del titular. Verifica la tarjeta, la cifra, la almacena y devuelve un token.
+1. **Tokenizar.** Recibe una tarjeta desde el navegador y, opcionalmente, el nombre del titular. Verifica la tarjeta, la cifra, la almacena y devuelve un token, junto con un **recibo firmado**: una constancia a prueba de manipulaciones de los primeros y últimos dígitos de la tarjeta, su vencimiento y su nombre, que la plataforma puede guardar.
 2. **Hacer de proxy.** La plataforma le envía al vault un token, el nombre de una de nuestras cuentas de proveedor de pagos y la solicitud completa que quiere enviar a ese proveedor. La solicitud tiene espacios en blanco, como `{{pan}}`, en cada lugar donde van los datos de la tarjeta. El vault verifica la solicitud contra un reglamento revisado (el **catálogo**). Si la solicitud pasa, el vault descifra la tarjeta, completa los espacios en blanco y su propia contraseña del proveedor, y envía la solicitud al proveedor de esa cuenta. Devuelve la respuesta con cualquier número de tarjeta borrado.
 
 Piensa en una carta modelo. La plataforma escribe la carta y deja espacios en blanco para la tarjeta. El vault la compara con una plantilla aprobada: el destinatario correcto, espacios en blanco solo en los lugares aprobados, nada que haga que el proveedor guarde la tarjeta. Luego el vault completa los espacios en blanco, la firma con nuestra propia firma y la envía a una dirección que elige el vault. La plataforma nunca ve la carta completada.
@@ -306,18 +306,57 @@ sequenceDiagram
     V->>DB: vault.put_card(token, ciphertext, last4, key_version)
     Note over DB: inserta la tarjeta + fila de auditoría
     Note over V: CVV → solo en memoria,<br/>un solo uso, 15 min
-    V-->>B: 200 {token, last4, exp_month, exp_year}
-    B->>P: token (nunca la tarjeta)
+    Note over V: recibo = token, BIN, last4, vencimiento, name?,<br/>hora de emisión, firmado con la clave Ed25519 del vault
+    V-->>B: 200 {token, last4, exp_month, exp_year, receipt}
+    B->>P: token + recibo (nunca la tarjeta)
+    Note over P: verifica el recibo con la clave pública<br/>del vault y luego guarda sus datos
 ```
 
 Detalles clave:
 
-- **El CVV nunca se almacena.** Queda en una caché en memoria, como bytes que se sobrescriben cuando se elimina la entrada (con el mejor esfuerzo posible, como todo borrado de memoria en Go). Se elimina cuando una llamada a `/proxy` lo lee, cuando el proveedor acepta con un 2xx cualquier llamada a `/proxy` para esa tarjeta (ver 6.2 más abajo), o cuando expira, 15 minutos después de la tokenización. Las entradas expiradas se eliminan cada 60 segundos, y también cuando la caché está llena, así que incluso una instancia inactiva conserva un CVV expirado como máximo alrededor de un minuto. La caché guarda como máximo 50.000 CVVs. Cuando está llena, `/tokenize` igual almacena la tarjeta y devuelve 200, pero no guarda el CVV en caché y registra `ALERT cvv_cache_full` (como máximo una vez por segundo). Una solicitud posterior con `{{cvv}}` para esa tarjeta recibe el 409 de siempre. Nunca se desaloja un CVV vigente para hacer lugar.
-- **El nombre del titular es opcional.** Si se envía, debe tener entre 1 y 100 caracteres de UTF-8 válido, sin caracteres de control (`"name": null` se rechaza). Se cifra junto con la tarjeta y solo se usa donde una solicitud al proveedor tiene un placeholder `{{name}}`. El vault en sí nunca lo devuelve, pero la respuesta de un proveedor puede devolverlo (el `card.name` de un token de Stripe, por ejemplo), y esa respuesta llega a la plataforma tal cual: el vault solo enmascara números de tarjeta, no nombres. Una tarjeta tokenizada sin nombre no puede completar `{{name}}`: esa llamada a `/proxy` recibe `409 {"error":"name unavailable"}`.
+- **El CVV nunca se almacena.** Queda en una caché en memoria, como bytes que se sobrescriben cuando se elimina la entrada (con el mejor esfuerzo posible, como todo borrado de memoria en Go). Se elimina cuando una llamada a `/proxy` lo lee, cuando el proveedor acepta con un 2xx cualquier llamada a `/proxy` para esa tarjeta (ver 6.3 más abajo), o cuando expira, 15 minutos después de la tokenización. Las entradas expiradas se eliminan cada 60 segundos, y también cuando la caché está llena, así que incluso una instancia inactiva conserva un CVV expirado como máximo alrededor de un minuto. La caché guarda como máximo 50.000 CVVs. Cuando está llena, `/tokenize` igual almacena la tarjeta y devuelve 200, pero no guarda el CVV en caché y registra `ALERT cvv_cache_full` (como máximo una vez por segundo). Una solicitud posterior con `{{cvv}}` para esa tarjeta recibe el 409 de siempre. Nunca se desaloja un CVV vigente para hacer lugar.
+- **El nombre del titular es opcional.** Si se envía, debe tener entre 1 y 100 caracteres de UTF-8 válido, sin caracteres de control (`"name": null` se rechaza). Se cifra junto con la tarjeta y solo se usa donde una solicitud al proveedor tiene un placeholder `{{name}}`. El vault lo devuelve solo dentro del recibo firmado (ver 6.2 más abajo), al navegador que lo envió. La respuesta de un proveedor también puede devolverlo (el `card.name` de un token de Stripe, por ejemplo), y esa respuesta llega a la plataforma tal cual: el vault solo enmascara números de tarjeta, no nombres. Una tarjeta tokenizada sin nombre no puede completar `{{name}}`: esa llamada a `/proxy` recibe `409 {"error":"name unavailable"}`.
+- **La respuesta trae un recibo firmado.** Además de `token`, `last4` y el vencimiento, que la página de checkout puede mostrar, `/tokenize` devuelve `receipt`, que también lleva el BIN y el nombre (ver 6.2 más abajo). El BIN y el nombre nunca aparecen como campos de primer nivel, y el recibo nunca se registra en los logs.
 - **Un query string se rechaza de plano.** Esto garantiza que un número de tarjeta nunca pueda terminar en una URL y, por lo tanto, nunca en ningún log basado en URLs a lo largo del camino.
 - **El navegador recibe el mismo formato de error sin importar qué salga mal**: `{"error":"invalid pan"}` y similares. Ese formato nunca devuelve la entrada.
 
-#### 6.2 Proxy: plataforma → vault → proveedor
+#### 6.2 El recibo firmado
+
+La plataforma necesita algunos datos de cada tarjeta: su marca y su emisor, cómo mostrársela al cliente y cuándo vence. No puede pedírselos al vault más tarde, porque el vault no tiene ningún endpoint que devuelva datos de tarjeta. Tampoco puede confiar en que el navegador se los informe, porque quien controle el JavaScript de la página de checkout podría informar cualquier cosa. Por eso `/tokenize` también devuelve un **recibo**: una breve declaración de los datos de la tarjeta, firmada por el vault.
+
+```
+rcpt.v1.<base64url(payload JSON, no padding)>.<base64url(Ed25519 signature over "rcpt.v1." + base64url payload, no padding)>
+```
+
+El payload es JSON compacto con estas claves, en este orden:
+
+```json
+{"token":"tok_…","bin":"42424242","last4":"4242","exp_month":"12","exp_year":"2030","name":"JANE Q DOE","iat":1793456789}
+```
+
+- `token`: el token emitido para esta tarjeta.
+- `bin`: el **BIN** de la tarjeta, sus primeros 8 dígitos cuando el número de tarjeta tiene 16 dígitos o más, y si no sus primeros 6. Junto con `last4` se mantiene dentro de los límites de truncamiento de PCI DSS (como máximo los primeros 8 y los últimos 4 dígitos de un número de tarjeta de 16 dígitos o más, y los primeros 6 y los últimos 4 de uno más corto), así que incluso una tarjeta de 13 dígitos mantiene 3 dígitos ocultos.
+- `last4`, `exp_month`, `exp_year`: los mismos valores que en la respuesta.
+- `name`: el nombre del titular exactamente como se envió. Se omite cuando la tarjeta se tokenizó sin nombre.
+- `iat`: cuándo emitió el vault el recibo, en segundos Unix.
+
+**Firmado con Ed25519, verificado con una clave pública.** El vault firma con una clave privada Ed25519 cuya semilla solo tiene el vault (ver [§9](#9-operarlo-de-forma-segura)). La plataforma verifica con la **clave pública** correspondiente, que no es secreta. Así, el servicio de checkout, las herramientas de soporte y los reportes pueden verificar recibos, y ninguno de ellos puede crear uno. El payload se codifica una sola vez y la firma cubre exactamente esos bytes, así que quien verifica nunca vuelve a serializarlo. En [§11.4](#114-verificar-un-recibo) se muestra cómo verificarlo.
+
+**Qué hace la plataforma con él:**
+
+1. El navegador reenvía `receipt` a la plataforma junto con el token.
+2. La plataforma verifica el recibo con la clave pública del vault, y comprueba que su `token` sea el token que recibió, antes de guardar nada de él. Un recibo inválido se rechaza entero, nunca se confía en una parte.
+3. La plataforma guarda el BIN, los últimos cuatro, el vencimiento y el nombre junto al token.
+
+**Por qué la plataforma puede guardar estos datos.** Un número de tarjeta truncado al BIN y los últimos cuatro, incluso con el vencimiento y el nombre, no es dato del titular de la tarjeta (CHD). El back end de la plataforma sigue fuera del CDE mientras guarde solo estos datos y cumpla tres reglas:
+
+- **Los clientes ven solo los últimos cuatro.** El BIN junto con los últimos cuatro solo puede mostrarse al personal con una necesidad de negocio (requisito 3.4.1 de PCI DSS).
+- **Ningún hash del número de tarjeta.** Nunca guardar un hash del número de tarjeta junto al número truncado: juntos acotan una búsqueda por fuerza bruta, y PCI trata ese par como una brecha de control. El vault nunca produce un hash así.
+- **La plataforma deriva los detalles de la tarjeta a partir del BIN.** La marca, el emisor, el país y el tipo de tarjeta salen de los datos de BIN propios de la plataforma (una base de datos licenciada o reglas de prefijos), que la plataforma mantiene actualizados sin cambiar el vault.
+
+El recibo nunca se registra en los logs, y tampoco la semilla que lo firma. Un recibo contiene como máximo 8 + 4 dígitos del número de tarjeta, en campos separados, así que nunca parece un número de tarjeta para el escaneo de fugas en los logs ([§7.6](#76-nada-sensible-en-los-logs-por-diseño)).
+
+#### 6.3 Proxy: plataforma → vault → proveedor
 
 La plataforma envía un **envelope** JSON de como máximo 64 KiB. Los campos desconocidos se rechazan:
 
@@ -385,7 +424,7 @@ Detalles clave:
 - **Los rechazos son específicos y nunca devuelven la entrada.** Una falla de política es un `400` con un único mensaje fijo: `unknown account`, `endpoint not allowed`, `header not allowed`, `invalid placeholder use`, `pinned field mismatch`, `forbidden field` o `invalid request body`. Una vez que se conoce la cuenta, toda falla de regla también genera `ALERT proxy_policy` (ver [§7.6](#76-nada-sensible-en-los-logs-por-diseño)). Una cuenta desconocida, un token mal formado o un envelope mal formado se rechazan sin alerta.
 - **Las redirecciones nunca se siguen.** El vault ignora `HTTP_PROXY`, rechaza las respuestas comprimidas que no puede inspeccionar y nunca devuelve un body truncado. El enmascaramiento tiene un límite preciso: el vault enmascara solo el número de esta misma tarjeta, como dígitos seguidos o en grupos de cuatro separados por espacios o por guiones. Otras agrupaciones (como el 4-6-5 de Amex) y cualquier otro dato que devuelva un proveedor, como un nombre o un mensaje de error, llegan a la plataforma tal cual, y por eso se revisan las respuestas documentadas de cada endpoint del catálogo antes de agregarlo.
 
-#### 6.3 La vida de una tarjeta
+#### 6.4 La vida de una tarjeta
 
 ```mermaid
 stateDiagram-v2
@@ -403,7 +442,7 @@ stateDiagram-v2
     end note
 ```
 
-#### 6.4 El catálogo actual
+#### 6.5 El catálogo actual
 
 El primer `catalog.json` incluye **solo Stripe**, porque Stripe es el único proveedor que podemos verificar en CI (mediante el `stripe-mock` oficial de Stripe). Adyen, Mercado Pago, PayU Latam y Pagar.me ya están modelados en el catálogo sintético de la suite de tests. Cada uno llegará como su propio cambio solo de datos, después de verificarse contra el sandbox de ese proveedor.
 
@@ -441,6 +480,8 @@ El vault asume que las cosas van a salir mal y limita el daño cuando eso pasa:
 | **C** | **Credenciales de base de datos robadas** | Llamar a `get_card` | Solo obtiene ciphertext AES-256-GCM. La clave no está en la base de datos. |
 | **D** | **Atacante desde internet** | Llegar a `/tokenize` | No puede llegar a `/proxy` en absoluto (requiere mTLS). No puede usar `/tokenize` como oráculo de validez de tarjetas sin un token de sesión emitido por la plataforma. |
 | **E** | **Proveedor de pagos deshonesto** | Recibe números de tarjeta legítimamente | Fuera del alcance del vault. La allowlist de egress impide que el tráfico se redirija a otro proveedor. |
+
+Un navegador o una página de checkout manipulados tampoco pueden falsificar los datos de la tarjeta: el BIN, los últimos cuatro, el vencimiento y el nombre que guarda la plataforma vienen de un recibo firmado por el vault (ver [§6.2](#62-el-recibo-firmado)), y solo el vault tiene la clave de firma.
 
 Fuera del alcance por diseño: el compromiso del owner del proyecto cloud o del administrador de KMS, una toolchain de Go comprometida, y los ataques de canal lateral y físicos. Estos están cubiertos por los controles cloud descritos en [§9](#9-operarlo-de-forma-segura).
 
@@ -518,7 +559,7 @@ Hay exactamente una línea de log de acceso por solicitud:
 ```
 
 - Las rutas y los métodos se registran solo si son valores conocidos. Cualquier otra cosa se convierte en `path=other` y `method=other`, así que un número de tarjeta escrito en una URL no puede llegar al log.
-- Las únicas otras líneas son los mensajes de arranque y estas líneas `ALERT`. Los nombres de cuentas y endpoints vienen del catálogo, nunca de la solicitud:
+- Las únicas otras líneas son los mensajes de arranque y estas líneas `ALERT`. Un mensaje de arranque imprime la clave pública de los recibos (`receipt public key=…`), que es pública por diseño. Los recibos y la semilla que los firma nunca se registran. Los nombres de cuentas y endpoints vienen del catálogo, nunca de la solicitud:
 
 | Alerta | Significado |
 |---|---|
@@ -685,6 +726,33 @@ sequenceDiagram
 - **Secretos de las cuentas.** Cada secreto nombrado por una cuenta del catálogo del entorno debe existir en Secret Manager y ser legible por la service account del vault, o el vault no arranca.
 - **Certificados de cliente de la plataforma.** La CA en `VAULT_CLIENT_CA` solo debería emitir certificados para los servicios de la plataforma que tienen permitido llamar a `/proxy`.
 - **Firewall de egress.** Para cada host de proveedor en `egress-hosts.dev.txt` o `egress-hosts.prod.txt`, el firewall de ese entorno debe permitir solo los rangos de IP publicados por ese proveedor. El firewall de prod solo permite hosts de prod.
+- **Clave de firma de los recibos.** La semilla de los recibos son 32 bytes aleatorios, guardados en Secret Manager como exactamente 64 caracteres hexadecimales sin salto de línea final (por ejemplo `openssl rand -hex 32 | tr -d '\n' | gcloud secrets create receipt-key --data-file=-`). `VAULT_RECEIPT_KEY_SECRET` la nombra, y la service account del vault debe poder leerla, o el vault no arranca. La plataforma solo necesita la clave pública, nunca la semilla. La clave se lee de la línea de log de arranque `receipt public key=<base64url>`, o se deriva de la semilla con este programa en Go (`gcloud secrets versions access latest --secret=receipt-key | go run pubkey.go`):
+
+  ```go
+  package main
+
+  import (
+  	"crypto/ed25519"
+  	"encoding/base64"
+  	"encoding/hex"
+  	"fmt"
+  	"io"
+  	"os"
+  	"strings"
+  )
+
+  func main() {
+  	in, _ := io.ReadAll(os.Stdin)
+  	seed, err := hex.DecodeString(strings.TrimSpace(string(in)))
+  	if err != nil || len(seed) != ed25519.SeedSize {
+  		fmt.Fprintln(os.Stderr, "expected 64 hex characters")
+  		os.Exit(1)
+  	}
+  	fmt.Println(base64.RawURLEncoding.EncodeToString(ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)))
+  }
+  ```
+
+  **Rotar** significa una semilla nueva y, por lo tanto, una clave pública nueva. Agregar la semilla nueva como una nueva versión del secreto (el vault lee la última versión al arrancar), agregar su clave pública a la lista de claves públicas aceptadas por la plataforma y luego reiniciar los vaults. Quitar la clave anterior cuando todas las instancias usen la semilla nueva y hayan terminado los checkouts que empezaron antes del cambio.
 - **Política de tokens de traspaso.** El código de la plataforma nunca debe guardar, asociar ni reutilizar una tarjeta mediante un token de un solo uso devuelto por el vault (ver [§7.4](#74-lo-que-el-vault-no-puede-imponer-tokens-de-traspaso)).
 
 ---
@@ -752,7 +820,9 @@ Todo se maneja con `make`. `make ci` ejecuta las verificaciones que todo cambio 
 | `VAULT_DB_URL` | sí | URL `postgres://`. Producción exige TLS verificado. |
 | `VAULT_KMS_KEY` | prod | `projects/P/locations/L/keyRings/R/cryptoKeys/K` |
 | `VAULT_SESSION_HMAC_SECRET` | prod | Nombre de recurso en Secret Manager de la clave HMAC de sesión |
+| `VAULT_RECEIPT_KEY_SECRET` | prod | Nombre de recurso en Secret Manager de la semilla de firma de los recibos (64 caracteres hexadecimales, ver [§9](#9-operarlo-de-forma-segura)) |
 | `VAULT_DEV_DEK_HEX`, `VAULT_DEV_SESSION_HMAC_HEX` | solo dev | Sustitutos locales para la DEK y la clave HMAC de sesión |
+| `VAULT_DEV_RECEIPT_KEY_HEX` | solo dev | Sustituto local para la semilla de firma de los recibos (64 caracteres hexadecimales) |
 | `VAULT_DEV_SECRET_<ACCOUNT>_<NAME>` | solo dev | Sustituto local para un secreto de una cuenta del catálogo (ver más abajo) |
 
 Los secretos de los proveedores no son variables de entorno. Cada cuenta del catálogo nombra sus secretos por su nombre de recurso en Secret Manager, y el vault carga al arrancar todos los secretos de todas las cuentas de su entorno. **El arranque falla si alguno de ellos falta o es inválido.** `VAULT_STRIPE_SECRET` y `VAULT_DEV_STRIPE_SECRET` ya no existen.
@@ -779,7 +849,7 @@ Los secretos de los proveedores no son variables de entorno. Cada cuenta del cat
 
 Un vault carga solo las cuentas cuyo `env` coincide con `VAULT_ENV`, y trata a las demás como desconocidas. Los nombres de campos de form deben coincidir con `^[A-Za-z0-9_-]+(\[[A-Za-z0-9_-]+\])*(\[\])?$`: sin `.`, y `[]` solo al final, así que `metadata[order.id]` se rechaza.
 
-El primer catálogo incluye solo Stripe (ver [§6.4](#64-el-catálogo-actual)). Adyen, Mercado Pago, PayU Latam y Pagar.me llegarán después de su verificación en sandbox, cada uno como su propio pull request solo de datos.
+El primer catálogo incluye solo Stripe (ver [§6.5](#65-el-catálogo-actual)). Adyen, Mercado Pago, PayU Latam y Pagar.me llegarán después de su verificación en sandbox, cada uno como su propio pull request solo de datos.
 
 **Para agregar un proveedor, un endpoint o una cuenta:**
 
@@ -798,6 +868,7 @@ El servicio es un único paquete Go (`package main`) en la raíz del repo:
 - `card.go`: validación de tarjetas, cifrado, formato del token y la caché del CVV en memoria.
 - `vault.go`: estado del vault, logging, la guarda de solicitudes, bodies de error.
 - `tokenize.go`: tokens de sesión y el `POST /tokenize` público con CORS.
+- `receipt.go`: el recibo firmado de la tarjeta: la regla del BIN, la firma y `verifyReceipt`, el verificador de referencia.
 - `scan.go`: el vocabulario de placeholders y los scanners estrictos de JSON y form.
 - `catalog.go`: el `catalog.json` embebido y su parser.
 - `policy.go`: las verificaciones de las solicitudes a `/proxy`.
@@ -810,6 +881,108 @@ Los tests están junto al código, en archivos `*_test.go` correspondientes (`bo
 
 Otros archivos: `catalog.json` (proveedores y cuentas, compilado en el binario), `egress-hosts.dev.txt` / `egress-hosts.prod.txt` (hosts de egress por entorno, verificados contra el catálogo), `schema.sql` (tablas, funciones y roles, aplicado por CI como `vault_owner`), `Makefile`, `Dockerfile`, `deps-baseline.txt`, `vendor/`, `CLAUDE.md` (reglas para agentes de programación con IA, incluidos el checklist de revisión del catálogo y las limitaciones conocidas), `LICENSE` (MIT), `lefthook.yml` (git hooks), `.gitleaks.toml` (allowlist del escaneo de secretos), `scripts/` (las verificaciones de mensajes de commit y de comentarios que comparten los hooks y CI), `.github/workflows/` (CI, Integration, Image, Fuzz), `docs/` (la revisión de arquitectura de seguridad y el registro de riesgos).
 
+#### 11.4 Verificar un recibo
+
+Cualquier lenguaje con Ed25519 puede verificar un recibo (formato en [§6.2](#62-el-recibo-firmado)). Se divide en `.`: debe haber exactamente cuatro partes, y las dos primeras deben ser `rcpt` y `v1`. Las dos últimas deben ser base64url sin padding y no vacías (solo `A–Z`, `a–z`, `0–9`, `-` y `_`, sin `=`). Se decodifica la cuarta parte en una firma de 64 bytes, y se verifica con la clave pública del vault sobre los bytes ASCII de `rcpt.v1.` seguidos de la tercera parte exactamente como llegó. Solo entonces se decodifica la tercera parte, y se interpreta como un único objeto JSON con solo las claves del recibo, escritas exactamente, cada una como máximo una vez y sin nada después, donde toda clave salvo `name` está presente y no vacía, e `iat` es positivo. Cualquier otra cosa invalida el recibo entero: nunca repararlo, recodificarlo ni confiar en una parte. Después se comprueba que `token` sea el token que envió el navegador. La versión en Go de abajo sigue a `verifyReceipt` en `receipt.go`, que los tests del vault ejecutan contra los recibos que firma:
+
+```go
+package receipt
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"io"
+	"strings"
+)
+
+// Receipt is what a vault receipt states about a card.
+type Receipt struct {
+	Token    string `json:"token"`
+	BIN      string `json:"bin"`
+	Last4    string `json:"last4"`
+	ExpMonth string `json:"exp_month"`
+	ExpYear  string `json:"exp_year"`
+	Name     string `json:"name,omitempty"`
+	IAT      int64  `json:"iat"`
+}
+
+var ErrInvalid = errors.New("invalid receipt")
+
+const b64url = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+var receiptKeys = map[string]bool{"token": true, "bin": true, "last4": true,
+	"exp_month": true, "exp_year": true, "name": true, "iat": true}
+
+// Verify returns the contents of receipt s if the vault key behind pub signed it.
+func Verify(pub ed25519.PublicKey, s string) (Receipt, error) {
+	if len(pub) != ed25519.PublicKeySize {
+		return Receipt{}, ErrInvalid
+	}
+	parts := strings.SplitN(s, ".", 5)
+	if len(parts) != 4 || parts[0] != "rcpt" || parts[1] != "v1" {
+		return Receipt{}, ErrInvalid
+	}
+	// Go's base64 decoder skips CR and LF, so check the alphabet first.
+	for _, p := range parts[2:] {
+		if p == "" || strings.Trim(p, b64url) != "" {
+			return Receipt{}, ErrInvalid
+		}
+	}
+	b64 := base64.RawURLEncoding.Strict()
+	sig, err := b64.DecodeString(parts[3])
+	if err != nil || len(sig) != ed25519.SignatureSize ||
+		!ed25519.Verify(pub, []byte("rcpt.v1."+parts[2]), sig) {
+		return Receipt{}, ErrInvalid
+	}
+	payload, err := b64.DecodeString(parts[2])
+	if err != nil || !exactKeys(payload) {
+		return Receipt{}, ErrInvalid
+	}
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	dec.DisallowUnknownFields()
+	var r Receipt
+	if err := dec.Decode(&r); err != nil {
+		return Receipt{}, ErrInvalid
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		return Receipt{}, ErrInvalid
+	}
+	if r.Token == "" || r.BIN == "" || r.Last4 == "" || r.ExpMonth == "" || r.ExpYear == "" || r.IAT <= 0 {
+		return Receipt{}, ErrInvalid
+	}
+	return r, nil
+}
+
+// exactKeys reports whether payload is one JSON object whose keys are receipt keys, spelled
+// exactly and each at most once. On its own, encoding/json matches keys case-insensitively and
+// lets a repeated key overwrite an earlier one.
+func exactKeys(payload []byte) bool {
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return false
+	}
+	seen := map[string]bool{}
+	for dec.More() {
+		t, err := dec.Token()
+		k, ok := t.(string)
+		if err != nil || !ok || !receiptKeys[k] || seen[k] {
+			return false
+		}
+		seen[k] = true
+		var v json.RawMessage
+		if err := dec.Decode(&v); err != nil {
+			return false
+		}
+	}
+	t, err := dec.Token()
+	return err == nil && t == json.Delim('}')
+}
+```
+
 ---
 
 ## 12. Glosario
@@ -819,7 +992,7 @@ Otros archivos: `catalog.json` (proveedores y cuentas, compilado en el binario),
 | **AoC** | Attestation of Compliance: el resumen firmado de una evaluación PCI. |
 | **ASV** | Approved Scanning Vendor: realiza los escaneos externos de vulnerabilidades trimestrales. |
 | **Catálogo** | `catalog.json`: la lista compilada en el binario de proveedores, endpoints permitidos y nuestras cuentas, contra la que se verifica cada solicitud a `/proxy`. |
-| **BIN / IIN** | Los primeros 6 a 8 dígitos de un número de tarjeta, que identifican al banco emisor. |
+| **BIN / IIN** | Los primeros 6 u 8 dígitos de un número de tarjeta, que identifican la marca y el banco emisor. Los emisores están pasando a BINs de 8 dígitos. El recibo del vault lleva los primeros 8 dígitos de un número de tarjeta de 16 dígitos o más, y los primeros 6 de uno más corto. |
 | **CDE** | Cardholder Data Environment: las personas, procesos y sistemas que manejan datos de tarjeta, más todo lo que esté conectado a ellos. |
 | **CHD** | Cardholder Data: el PAN, más el nombre, el vencimiento y el código de servicio cuando se almacenan junto con él. |
 | **CMEK** | Customer-Managed Encryption Keys: almacenamiento en la nube cifrado con claves que controlamos nosotros. |
@@ -837,6 +1010,7 @@ Otros archivos: `catalog.json` (proveedores y cuentas, compilado en el binario),
 | **PCI SSC** | PCI Security Standards Council: el organismo que publica PCI DSS. |
 | **Placeholder** | Un marcador como `{{pan}}` que la plataforma escribe donde el vault debe completar datos de tarjeta, un secreto o una firma. |
 | **QSA** | Qualified Security Assessor: un auditor certificado para evaluar el cumplimiento PCI. |
+| **Recibo (receipt)** | La declaración firmada por el vault que `/tokenize` devuelve con un token: el BIN, los últimos cuatro, el vencimiento y el nombre (si se envió) de la tarjeta, y cuándo se emitió, firmada con Ed25519 para que la plataforma pueda verificarla con una clave pública. |
 | **ROC** | Report on Compliance: el informe de evaluación completo de un QSA. |
 | **SAD** | Sensitive Authentication Data: CVV, PIN, datos completos de la banda magnética o del chip. |
 | **SAQ** | Self-Assessment Questionnaire (A, A-EP, D, …), para organizaciones que pueden autoevaluarse. |

@@ -221,7 +221,7 @@ flowchart LR
     Browser["Customer browser<br/>(checkout page)"]
     subgraph Platform["Platform: outside the CDE"]
         API[Checkout and payments services]
-        PDB[(Platform DB<br/>tokens only)]
+        PDB[("Platform DB<br/>tokens + receipt facts")]
     end
     subgraph CDE["CDE: pci-cde project, VPC-SC perimeter"]
         Vault["PAN Vault<br/>(Go, single binary)"]
@@ -234,8 +234,8 @@ flowchart LR
     Stripe["Provider API<br/>(catalog account host)"]
 
     Browser -- "1. card + session token<br/>(HTTPS :8443)" --> Vault
-    Vault -- "2. token" --> Browser
-    Browser -- "3. token" --> API
+    Vault -- "2. token + signed receipt" --> Browser
+    Browser -- "3. token + receipt" --> API
     API --> PDB
     API -- "4. account + token + request with placeholders<br/>(mTLS :9443)" --> Vault
     Vault -- "5. request with card filled in<br/>(HTTPS, catalog host, vault credential)" --> Stripe
@@ -246,7 +246,7 @@ flowchart LR
     Vault --- KMS
 ```
 
-**What the platform sees:** tokens, `last4`, expiry month and year, and provider responses with any echoed card number replaced by `****4242`.
+**What the platform sees:** tokens, `last4`, expiry month and year, the BIN (the first 6 or 8 digits) and the cardholder name from the signed receipt (see [§6.2](#62-the-signed-receipt)), and provider responses with any echoed card number replaced by `****4242`.
 
 **What the platform never sees:** a full card number or a CVV. There is no API that returns them.
 
@@ -270,7 +270,7 @@ flowchart LR
 
 The vault does exactly two jobs:
 
-1. **Tokenize.** It receives a card from the browser, and optionally the cardholder's name. It checks the card, encrypts it, stores it and returns a token.
+1. **Tokenize.** It receives a card from the browser, and optionally the cardholder's name. It checks the card, encrypts it, stores it and returns a token, together with a **signed receipt**: a tamper-proof note of the card's first and last digits, expiry and name that the platform can keep.
 2. **Proxy.** The platform sends the vault a token, the name of one of our payment-provider accounts, and the complete request it wants sent to that provider. The request has blanks, such as `{{pan}}`, wherever the card details go. The vault checks the request against a reviewed rulebook (the **catalog**). If the request passes, the vault decrypts the card, fills in the blanks and its own provider password, and sends the request to that account's provider. It returns the answer with any card number blanked out.
 
 Think of a form letter. The platform writes the letter and leaves blanks for the card. The vault checks it against an approved template: the right recipient, blanks only in the approved spots, nothing that would make the provider keep the card. Then the vault fills in the blanks, signs it with our own signature and posts it to an address the vault chooses. The platform never sees the filled-in letter.
@@ -306,18 +306,57 @@ sequenceDiagram
     V->>DB: vault.put_card(token, ciphertext, last4, key_version)
     Note over DB: inserts card + audit row
     Note over V: CVV → memory only,<br/>single use, 15 min
-    V-->>B: 200 {token, last4, exp_month, exp_year}
-    B->>P: token (never the card)
+    Note over V: receipt = token, BIN, last4, expiry, name?,<br/>issue time, signed with the vault's Ed25519 key
+    V-->>B: 200 {token, last4, exp_month, exp_year, receipt}
+    B->>P: token + receipt (never the card)
+    Note over P: verifies the receipt with the vault's<br/>public key, then stores its card facts
 ```
 
 Key details:
 
-- **The CVV is never stored.** It sits in a memory cache, as bytes that are overwritten when the entry is removed (best effort, like all clearing of Go memory). It is removed when a `/proxy` call reads it, when the provider accepts any `/proxy` call for that card with a 2xx (see 6.2 below), or when it expires 15 minutes after tokenization. Expired entries are swept every 60 seconds, and also when the cache is full, so even an idle instance holds an expired CVV for at most about a minute. The cache holds at most 50,000 CVVs. When it is full, `/tokenize` still stores the card and returns 200, but doesn't cache the CVV and logs `ALERT cvv_cache_full` (at most once a second). A later `{{cvv}}` request for that card gets the usual 409. Live CVVs are never evicted to make room.
-- **The cardholder name is optional.** If given, it must be 1–100 characters of valid UTF-8 with no control characters (`"name": null` is rejected). It is encrypted together with the card and only used where a provider request has a `{{name}}` placeholder. The vault itself never returns it, but a provider's response may echo it (a Stripe token's `card.name`, for example), and that response reaches the platform as is: the vault masks only card numbers, not names. A card tokenized without a name can't fill `{{name}}`: that `/proxy` call gets `409 {"error":"name unavailable"}`.
+- **The CVV is never stored.** It sits in a memory cache, as bytes that are overwritten when the entry is removed (best effort, like all clearing of Go memory). It is removed when a `/proxy` call reads it, when the provider accepts any `/proxy` call for that card with a 2xx (see 6.3 below), or when it expires 15 minutes after tokenization. Expired entries are swept every 60 seconds, and also when the cache is full, so even an idle instance holds an expired CVV for at most about a minute. The cache holds at most 50,000 CVVs. When it is full, `/tokenize` still stores the card and returns 200, but doesn't cache the CVV and logs `ALERT cvv_cache_full` (at most once a second). A later `{{cvv}}` request for that card gets the usual 409. Live CVVs are never evicted to make room.
+- **The cardholder name is optional.** If given, it must be 1–100 characters of valid UTF-8 with no control characters (`"name": null` is rejected). It is encrypted together with the card and only used where a provider request has a `{{name}}` placeholder. The vault returns it only inside the signed receipt (see 6.2 below), to the browser that supplied it. A provider's response may also echo it (a Stripe token's `card.name`, for example), and that response reaches the platform as is: the vault masks only card numbers, not names. A card tokenized without a name can't fill `{{name}}`: that `/proxy` call gets `409 {"error":"name unavailable"}`.
+- **The response carries a signed receipt.** Besides `token`, `last4` and the expiry, which the checkout page can show, `/tokenize` returns `receipt`, which also carries the BIN and the name (see 6.2 below). The BIN and the name never appear as top-level fields, and the receipt is never logged.
 - **A query string is rejected outright.** This guarantees a card number can never end up in a URL, and so never in any URL-based log along the way.
 - **The browser gets the same error format whatever goes wrong**: `{"error":"invalid pan"}` and the like. That format never echoes input back.
 
-#### 6.2 Proxy: platform → vault → provider
+#### 6.2 The signed receipt
+
+The platform needs a few facts about each card: its brand and issuer, how to show it to the customer, and when it expires. It can't ask the vault later, because the vault has no endpoint that returns card data. It can't trust the browser to report them either, because whoever controls the checkout page's JavaScript could report anything. So `/tokenize` also returns a **receipt**: a short statement of the card facts, signed by the vault.
+
+```
+rcpt.v1.<base64url(payload JSON, no padding)>.<base64url(Ed25519 signature over "rcpt.v1." + base64url payload, no padding)>
+```
+
+The payload is compact JSON with these keys, in this order:
+
+```json
+{"token":"tok_…","bin":"42424242","last4":"4242","exp_month":"12","exp_year":"2030","name":"JANE Q DOE","iat":1793456789}
+```
+
+- `token`: the token issued for this card.
+- `bin`: the card's **BIN**, its first 8 digits when the card number has 16 or more digits, otherwise its first 6. With `last4` this stays within the PCI DSS truncation limits (at most the first 8 and last 4 digits of a card number with 16 or more digits, the first 6 and last 4 of a shorter one), so even a 13-digit card keeps 3 digits hidden.
+- `last4`, `exp_month`, `exp_year`: the same values as in the response.
+- `name`: the cardholder name exactly as given. It is omitted when the card was tokenized without one.
+- `iat`: when the vault issued the receipt, in Unix seconds.
+
+**Signed with Ed25519, verified with a public key.** The vault signs with an Ed25519 private key whose seed only the vault holds (see [§9](#9-running-it-safely)). The platform verifies with the matching **public key**, which is not a secret. So the checkout service, support tools and reporting can all check receipts, and none of them can create one. The payload is encoded once and the signature covers exactly those bytes, so a verifier never re-serializes it. [§11.4](#114-verifying-a-receipt) shows how to verify.
+
+**What the platform does with it:**
+
+1. The browser forwards `receipt` to the platform together with the token.
+2. The platform verifies the receipt with the vault's public key, and checks that its `token` is the token it received, before storing anything from it. An invalid receipt is rejected as a whole, never partly trusted.
+3. The platform stores the BIN, last four, expiry and name next to the token.
+
+**Why the platform may keep these facts.** A card number truncated to the BIN and the last four, even with the expiry and the name, is not cardholder data. The platform's back end stays outside the CDE as long as it holds only these facts and follows three rules:
+
+- **Customers see only the last four.** The BIN together with the last four may be shown only to staff with a business need (PCI DSS requirement 3.4.1).
+- **No hash of the card number.** Never store a hash of the card number next to the truncated number: together they narrow a brute-force search, and PCI treats the pair as a control gap. The vault never produces such a hash.
+- **The platform derives the card's details from the BIN.** Brand, issuer, country and card type come from the platform's own BIN data (a licensed database or prefix rules), which the platform keeps current without changing the vault.
+
+The receipt is never logged, and neither is the seed that signs it. A receipt holds at most 8 + 4 digits of the card number, in separate fields, so it never looks like a card number to the log leak scan ([§7.6](#76-nothing-sensitive-in-logs-by-construction)).
+
+#### 6.3 Proxy: platform → vault → provider
 
 The platform sends a JSON **envelope** of at most 64 KiB. Unknown fields are rejected:
 
@@ -385,7 +424,7 @@ Key details:
 - **Rejections are specific and never echo input.** A policy failure is a `400` with one fixed message: `unknown account`, `endpoint not allowed`, `header not allowed`, `invalid placeholder use`, `pinned field mismatch`, `forbidden field` or `invalid request body`. Once the account is known, every rule failure also raises `ALERT proxy_policy` (see [§7.6](#76-nothing-sensitive-in-logs-by-construction)). An unknown account, a malformed token or a malformed envelope is rejected without an alert.
 - **Redirects are never followed.** The vault ignores `HTTP_PROXY`, refuses compressed responses it can't inspect, and never returns a truncated body. Masking has a precise limit: the vault masks only this card's own number, as plain digits or in groups of four separated by spaces or by dashes. Other groupings (such as Amex's 4-6-5) and any other data a provider returns, such as a name or an error message, reach the platform as is, which is why each catalog endpoint's documented responses are reviewed before it is added.
 
-#### 6.3 The life of a card
+#### 6.4 The life of a card
 
 ```mermaid
 stateDiagram-v2
@@ -403,7 +442,7 @@ stateDiagram-v2
     end note
 ```
 
-#### 6.4 The current catalog
+#### 6.5 The current catalog
 
 The first `catalog.json` ships **Stripe only**, because Stripe is the one provider we can verify in CI (through Stripe's official `stripe-mock`). Adyen, Mercado Pago, PayU Latam and Pagar.me are already modelled in the test suite's synthetic catalog. Each will land as its own data-only change after it has been verified against that provider's sandbox.
 
@@ -441,6 +480,8 @@ The vault assumes things will go wrong and limits the damage when they do:
 | **C** | **Stolen database credentials** | Call `get_card` | Gets only AES-256-GCM ciphertext. The key isn't in the database. |
 | **D** | **Internet attacker** | Reach `/tokenize` | Cannot reach `/proxy` at all (it needs mTLS). Can't use `/tokenize` as a card-validity oracle without a platform-minted session token. |
 | **E** | **Rogue payment provider** | Receives card numbers legitimately | Out of scope for the vault. The egress allowlist stops traffic being redirected to a different provider. |
+
+A tampered browser or checkout page can't forge card facts either: the BIN, last four, expiry and name the platform stores come from a receipt the vault signed (see [§6.2](#62-the-signed-receipt)), and only the vault holds the signing key.
 
 Out of scope by design: compromise of the cloud project owner or KMS admin, a compromised Go toolchain, side-channel and physical attacks. These are covered by the cloud controls described in [§9](#9-running-it-safely).
 
@@ -518,7 +559,7 @@ There is exactly one access-log line per request:
 ```
 
 - Paths and methods are logged only if they are known values. Anything else becomes `path=other` and `method=other`, so a card number typed into a URL can't reach the log.
-- The only other lines are boot messages and these `ALERT` lines. Account and endpoint names come from the catalog, never from the request:
+- The only other lines are boot messages and these `ALERT` lines. One boot message prints the receipt public key (`receipt public key=…`), which is public by design. Receipts and the seed that signs them are never logged. Account and endpoint names come from the catalog, never from the request:
 
 | Alert | Meaning |
 |---|---|
@@ -685,6 +726,33 @@ sequenceDiagram
 - **Account secrets.** Every secret named by a catalog account of the environment must exist in Secret Manager and be readable by the vault's service account, or the vault won't boot.
 - **Platform client certificates.** The CA in `VAULT_CLIENT_CA` should issue certificates only to the platform services that are allowed to call `/proxy`.
 - **Egress firewall.** For every provider host in `egress-hosts.dev.txt` or `egress-hosts.prod.txt`, that environment's firewall must allow only that provider's published IP ranges. The prod firewall allows only prod hosts.
+- **Receipt signing key.** The receipt seed is 32 random bytes, stored in Secret Manager as exactly 64 hex characters with no trailing newline (for example `openssl rand -hex 32 | tr -d '\n' | gcloud secrets create receipt-key --data-file=-`). `VAULT_RECEIPT_KEY_SECRET` names it, and the vault's service account must be able to read it, or the vault won't boot. The platform needs only the public key, never the seed. Read the key from the boot log line `receipt public key=<base64url>`, or derive it from the seed with this Go program (`gcloud secrets versions access latest --secret=receipt-key | go run pubkey.go`):
+
+  ```go
+  package main
+
+  import (
+  	"crypto/ed25519"
+  	"encoding/base64"
+  	"encoding/hex"
+  	"fmt"
+  	"io"
+  	"os"
+  	"strings"
+  )
+
+  func main() {
+  	in, _ := io.ReadAll(os.Stdin)
+  	seed, err := hex.DecodeString(strings.TrimSpace(string(in)))
+  	if err != nil || len(seed) != ed25519.SeedSize {
+  		fmt.Fprintln(os.Stderr, "expected 64 hex characters")
+  		os.Exit(1)
+  	}
+  	fmt.Println(base64.RawURLEncoding.EncodeToString(ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)))
+  }
+  ```
+
+  **Rotation** means a new seed, and so a new public key. Add the new seed as a new version of the secret (the vault reads the latest version at boot), add its public key to the platform's list of accepted public keys, then restart the vaults. Remove the old key once every instance runs the new seed and the checkouts that started before the switch have finished.
 - **Hand-off token policy.** Platform code must never save, attach or reuse a card through a single-use token the vault returned (see [§7.4](#74-what-the-vault-cannot-enforce-hand-off-tokens)).
 
 ---
@@ -752,7 +820,9 @@ Everything is driven by `make`. `make ci` runs the checks every change must pass
 | `VAULT_DB_URL` | yes | `postgres://` URL. Production requires verified TLS. |
 | `VAULT_KMS_KEY` | prod | `projects/P/locations/L/keyRings/R/cryptoKeys/K` |
 | `VAULT_SESSION_HMAC_SECRET` | prod | Secret Manager resource name of the session HMAC key |
+| `VAULT_RECEIPT_KEY_SECRET` | prod | Secret Manager resource name of the receipt signing seed (64 hex characters, see [§9](#9-running-it-safely)) |
 | `VAULT_DEV_DEK_HEX`, `VAULT_DEV_SESSION_HMAC_HEX` | dev only | Local stand-ins for the DEK and the session HMAC key |
+| `VAULT_DEV_RECEIPT_KEY_HEX` | dev only | Local stand-in for the receipt signing seed (64 hex characters) |
 | `VAULT_DEV_SECRET_<ACCOUNT>_<NAME>` | dev only | Local stand-in for a catalog account secret (see below) |
 
 Provider secrets are not environment variables. Each catalog account names its secrets by Secret Manager resource name, and the vault loads every secret of every account for its environment at boot. **Boot fails if any of them is missing or invalid.** `VAULT_STRIPE_SECRET` and `VAULT_DEV_STRIPE_SECRET` no longer exist.
@@ -779,7 +849,7 @@ Provider secrets are not environment variables. Each catalog account names its s
 
 A vault loads only the accounts whose `env` matches `VAULT_ENV`, and treats the others as unknown. Form field names must match `^[A-Za-z0-9_-]+(\[[A-Za-z0-9_-]+\])*(\[\])?$`: no `.`, and `[]` only at the end, so `metadata[order.id]` is rejected.
 
-The first catalog ships Stripe only (see [§6.4](#64-the-current-catalog)). Adyen, Mercado Pago, PayU Latam and Pagar.me land after sandbox verification, each as its own data-only pull request.
+The first catalog ships Stripe only (see [§6.5](#65-the-current-catalog)). Adyen, Mercado Pago, PayU Latam and Pagar.me land after sandbox verification, each as its own data-only pull request.
 
 **To add a provider, an endpoint or an account:**
 
@@ -798,6 +868,7 @@ The service is one Go package (`package main`) at the repo root:
 - `card.go`: card validation, encryption, token format, and the in-memory CVV cache.
 - `vault.go`: vault state, logging, the request guard, error bodies.
 - `tokenize.go`: session tokens and the public `POST /tokenize` with CORS.
+- `receipt.go`: the signed card receipt: the BIN rule, signing, and `verifyReceipt`, the reference verifier.
 - `scan.go`: the placeholder vocabulary and the strict JSON and form scanners.
 - `catalog.go`: the embedded `catalog.json` and its parser.
 - `policy.go`: the `/proxy` request checks.
@@ -810,6 +881,108 @@ Tests sit next to the code in matching `*_test.go` files (`boot_test.go` covers 
 
 Other files: `catalog.json` (providers and accounts, compiled in), `egress-hosts.dev.txt` / `egress-hosts.prod.txt` (egress hosts per environment, checked against the catalog), `schema.sql` (tables, functions and roles, applied by CI as `vault_owner`), `Makefile`, `Dockerfile`, `deps-baseline.txt`, `vendor/`, `CLAUDE.md` (rules for AI coding agents, including the catalog review checklist and the known limitations), `LICENSE` (MIT), `lefthook.yml` (git hooks), `.gitleaks.toml` (secret-scan allowlist), `scripts/` (the commit-message and comment checks shared by the hooks and CI), `.github/workflows/` (CI, Integration, Image, Fuzz), `docs/` (the security architecture review and the risk register).
 
+#### 11.4 Verifying a receipt
+
+Any language with Ed25519 can verify a receipt (format in [§6.2](#62-the-signed-receipt)). Split it on `.`: there must be exactly four parts, and the first two must be `rcpt` and `v1`. The last two must be non-empty unpadded base64url (only `A–Z`, `a–z`, `0–9`, `-` and `_`, no `=`). Decode the fourth part into a 64-byte signature, and check it with the vault's public key over the ASCII bytes of `rcpt.v1.` followed by the third part exactly as received. Only then decode the third part, and parse it as a single JSON object with only the receipt's keys, spelled exactly, each at most once and nothing after it, where every key except `name` is present and non-empty and `iat` is positive. Anything else makes the whole receipt invalid: never repair, re-encode or partly trust it. Then check that `token` is the token the browser sent. The Go version below follows `verifyReceipt` in `receipt.go`, which the vault's tests run against the receipts it signs:
+
+```go
+package receipt
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"io"
+	"strings"
+)
+
+// Receipt is what a vault receipt states about a card.
+type Receipt struct {
+	Token    string `json:"token"`
+	BIN      string `json:"bin"`
+	Last4    string `json:"last4"`
+	ExpMonth string `json:"exp_month"`
+	ExpYear  string `json:"exp_year"`
+	Name     string `json:"name,omitempty"`
+	IAT      int64  `json:"iat"`
+}
+
+var ErrInvalid = errors.New("invalid receipt")
+
+const b64url = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+var receiptKeys = map[string]bool{"token": true, "bin": true, "last4": true,
+	"exp_month": true, "exp_year": true, "name": true, "iat": true}
+
+// Verify returns the contents of receipt s if the vault key behind pub signed it.
+func Verify(pub ed25519.PublicKey, s string) (Receipt, error) {
+	if len(pub) != ed25519.PublicKeySize {
+		return Receipt{}, ErrInvalid
+	}
+	parts := strings.SplitN(s, ".", 5)
+	if len(parts) != 4 || parts[0] != "rcpt" || parts[1] != "v1" {
+		return Receipt{}, ErrInvalid
+	}
+	// Go's base64 decoder skips CR and LF, so check the alphabet first.
+	for _, p := range parts[2:] {
+		if p == "" || strings.Trim(p, b64url) != "" {
+			return Receipt{}, ErrInvalid
+		}
+	}
+	b64 := base64.RawURLEncoding.Strict()
+	sig, err := b64.DecodeString(parts[3])
+	if err != nil || len(sig) != ed25519.SignatureSize ||
+		!ed25519.Verify(pub, []byte("rcpt.v1."+parts[2]), sig) {
+		return Receipt{}, ErrInvalid
+	}
+	payload, err := b64.DecodeString(parts[2])
+	if err != nil || !exactKeys(payload) {
+		return Receipt{}, ErrInvalid
+	}
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	dec.DisallowUnknownFields()
+	var r Receipt
+	if err := dec.Decode(&r); err != nil {
+		return Receipt{}, ErrInvalid
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		return Receipt{}, ErrInvalid
+	}
+	if r.Token == "" || r.BIN == "" || r.Last4 == "" || r.ExpMonth == "" || r.ExpYear == "" || r.IAT <= 0 {
+		return Receipt{}, ErrInvalid
+	}
+	return r, nil
+}
+
+// exactKeys reports whether payload is one JSON object whose keys are receipt keys, spelled
+// exactly and each at most once. On its own, encoding/json matches keys case-insensitively and
+// lets a repeated key overwrite an earlier one.
+func exactKeys(payload []byte) bool {
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return false
+	}
+	seen := map[string]bool{}
+	for dec.More() {
+		t, err := dec.Token()
+		k, ok := t.(string)
+		if err != nil || !ok || !receiptKeys[k] || seen[k] {
+			return false
+		}
+		seen[k] = true
+		var v json.RawMessage
+		if err := dec.Decode(&v); err != nil {
+			return false
+		}
+	}
+	t, err := dec.Token()
+	return err == nil && t == json.Delim('}')
+}
+```
+
 ---
 
 ## 12. Glossary
@@ -819,7 +992,7 @@ Other files: `catalog.json` (providers and accounts, compiled in), `egress-hosts
 | **AoC** | Attestation of Compliance: the signed summary of a PCI assessment. |
 | **ASV** | Approved Scanning Vendor: runs the quarterly external vulnerability scans. |
 | **Catalog** | `catalog.json`: the compiled-in list of providers, allowed endpoints and our accounts that every `/proxy` request is checked against. |
-| **BIN / IIN** | The first 6–8 digits of a card number, which identify the issuing bank. |
+| **BIN / IIN** | The first 6 or 8 digits of a card number, which identify the brand and the issuing bank. Issuers are moving to 8-digit BINs. The vault's receipt carries the first 8 digits of a card number with 16 or more digits, and the first 6 of a shorter one. |
 | **CDE** | Cardholder Data Environment: the people, processes and systems that handle card data, plus anything connected to them. |
 | **CHD** | Cardholder Data: the PAN, plus the name, expiry and service code when stored with it. |
 | **CMEK** | Customer-Managed Encryption Keys: cloud storage encrypted with keys we control. |
@@ -837,6 +1010,7 @@ Other files: `catalog.json` (providers and accounts, compiled in), `egress-hosts
 | **PCI SSC** | PCI Security Standards Council: the body that publishes PCI DSS. |
 | **Placeholder** | A marker such as `{{pan}}` that the platform writes where the vault must fill in card data, a secret or a signature. |
 | **QSA** | Qualified Security Assessor: an auditor certified to assess PCI compliance. |
+| **Receipt** | The vault-signed statement `/tokenize` returns with a token: the card's BIN, last four, expiry and name (when given), and when it was issued, signed with Ed25519 so the platform can verify it with a public key. |
 | **ROC** | Report on Compliance: the full assessment report from a QSA. |
 | **SAD** | Sensitive Authentication Data: CVV, PIN, full magnetic-stripe or chip data. |
 | **SAQ** | Self-Assessment Questionnaire (A, A-EP, D, …), for organizations eligible to self-assess. |

@@ -5,6 +5,9 @@ You are implementing spec/original.md. Read it fully before writing code. These 
 ## Version overrides
 - Go 1.27.3 (not 1.23) and PostgreSQL 18 (not 16). These supersede the spec.
 - The provider-agnostic proxy design of 2026-10-30 (a local planning document; its binding rules are restated below under "Proxy and catalog rules") supersedes spec §6.2–§6.4 (the `/proxy` request and ops catalog), the "no placeholder syntax" sentence of §6.3 and the "no generic proxy mode" line of §14. Where they disagree, the proxy and catalog rules win.
+- The signed card receipt design of 2026-10-31 (a local planning document) supersedes the original spec's fixed `/tokenize` response shape. The response is `{token, last4, exp_month, exp_year, receipt}`, where `receipt` is `rcpt.v1.<base64url(payload)>.<base64url(Ed25519 signature over "rcpt.v1." + payload part)>`, both parts unpadded. The payload is compact JSON with the keys `token`, `bin`, `last4`, `exp_month`, `exp_year`, `name` (omitted when empty) and `iat` (Unix seconds), in that order. `bin` is the first 8 digits of a PAN with 16 or more digits, otherwise the first 6, never more. The BIN and the name leave the vault only inside the receipt. Receipts and their key rules are part of the vault's contract; `verifyReceipt` in `receipt.go` is the reference verifier and README §11.4 must match it.
+  - Receipt key: `VAULT_RECEIPT_KEY_SECRET` (Secret Manager resource name, prod) / `VAULT_DEV_RECEIPT_KEY_HEX` (64 hex, dev only, one of the fixed dev variables), with the session key's rules: required in prod, the dev variable refused in prod, 64-hex validation, zeroed on failure. The seed becomes the Ed25519 private key.
+  - The receipt is never logged; the seed is never logged; the public key is logged at boot (`receipt public key=<base64url>`).
 
 ## Known limitations (v1)
 - **Serialized lookups.** `vault.get_card` takes `pg_advisory_xact_lock` before it counts, so the velocity check and the `access_log` insert cannot race (no velocity TOCTOU). As a result, lookups run one at a time across all sessions. The vault also caps its pool at 16 open connections per instance (`db.SetMaxOpenConns(16)`), and each request's database call has a 5s deadline.
@@ -21,7 +24,7 @@ You are implementing spec/original.md. Read it fully before writing code. These 
 - No cloud SDKs. Google APIs are called with `net/http` as described in SPEC §8.3 and §8.6.
 
 ## Things you must never do
-- Log, print, or include in an error string: a PAN, expiry, CVV, session HMAC key, provider secret, request body, response body, or any HTTP header.
+- Log, print, or include in an error string: a PAN, expiry, CVV, session HMAC key, receipt signing seed or private key, receipt, provider secret, request body, response body, or any HTTP header.
 - Accept a query string on any endpoint.
 - Use any inbound HTTP header of a `/proxy` request in the provider request. Platform headers reach a provider only through the envelope's `request.headers`, and only the global allowlist `Accept`, `Idempotency-Key`, `X-Idempotency-Key` (plus an endpoint's header template sent verbatim, which the vault renders itself). Everything else is rejected, never dropped or forwarded.
 - Use the inbound `Authorization` header for anything on the internal listener.
