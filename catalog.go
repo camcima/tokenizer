@@ -155,7 +155,7 @@ func parseCatalog(data []byte, env string) (*catalog, error) {
 	}
 	// jsonWalk is jsonStrict's parser: one value, no duplicate keys at any depth, no trailing data,
 	// valid UTF-8. Its nodes also give every key's position for the exact-key check below.
-	nodes, err := jsonWalk(data)
+	nodes, err := jsonWalk(data, true)
 	if err != nil || nodes[0].kind != "object" {
 		return nil, errors.New("catalog: not strict JSON (one object, no duplicate keys or trailing data, valid UTF-8)")
 	}
@@ -216,8 +216,8 @@ func catExactKeys(nodes []jsonNode) error {
 		if n.kind != "key" {
 			continue
 		}
-		// n.ptr is the parent's pointer plus one escaped token; tokens contain no raw "/".
-		parentPtr := n.ptr[:strings.LastIndex(n.ptr, "/")]
+		// A key's parent is the object holding it; escaped tokens contain no raw "/".
+		parentPtr := jsonPointer(nodes, n.parent)
 		parent := strings.Split(parentPtr, "/")[1:]
 		var allowed map[string]bool
 		switch {
@@ -537,7 +537,7 @@ func validJSONPointer(p string) bool {
 // placeholder or rejected anyway), and form providers accept only string literals, since a form
 // field is always a string and any other literal could never match.
 func catLiteral(format string, raw json.RawMessage, allowNull bool) (fieldValue, bool) {
-	nodes, err := jsonWalk(raw)
+	nodes, err := jsonWalk(raw, true)
 	if err != nil || len(nodes) != 1 {
 		return fieldValue{}, false
 	}

@@ -128,11 +128,26 @@ func (c *catalog) checkProxy(e *proxyEnvelope) (*proxyPlan, *policyError) {
 	if err != nil {
 		return fail(msgBadBody, "body")
 	}
-	addrs, err := bodyAddrs(prov.format, body)
+	nodes, addrs, err := bodyAddrs(prov.format, body)
 	if err != nil {
 		return fail(msgBadBody, "body") // unreachable: scanBody accepted the body
 	}
+	// hasField reports whether the body has a field at addr; caseVariant whether it has one whose
+	// address differs from addr only in case. One of nodes (json) and addrs (form) is empty.
+	hasField := func(addr string) bool {
+		for i, n := range nodes {
+			if n.kind != "key" && jsonPointerIs(nodes, i, addr, false) {
+				return true
+			}
+		}
+		return slices.Contains(addrs, addr)
+	}
 	caseVariant := func(addr string) bool {
+		for i, n := range nodes {
+			if n.kind != "key" && jsonPointerIs(nodes, i, addr, true) && !jsonPointerIs(nodes, i, addr, false) {
+				return true
+			}
+		}
 		for _, a := range addrs {
 			if a != addr && strings.EqualFold(a, addr) {
 				return true
@@ -155,8 +170,8 @@ func (c *catalog) checkProxy(e *proxyEnvelope) (*proxyPlan, *policyError) {
 		}
 		occAt[o.addr] = true
 	}
-	for _, a := range addrs {
-		if _, isPos := ep.positions[a]; isPos && !occAt[a] {
+	for _, addr := range slices.Sorted(maps.Keys(ep.positions)) {
+		if !occAt[addr] && hasField(addr) {
 			return fail(msgPlaceholder, "placeholder")
 		}
 	}
@@ -332,31 +347,25 @@ func checkProxyHeaders(ep *catEndpoint, in map[string]string) (http.Header, bool
 	return out, true
 }
 
-// bodyAddrs returns the address of every field of a body: every value's JSON Pointer (json) or
-// every key (form). Errors are those of jsonWalk and formFields.
-func bodyAddrs(format string, body []byte) ([]string, error) {
-	var addrs []string
+// bodyAddrs returns the fields of a body: its nodes (json), each value node's address being its
+// JSON Pointer, compared in place with jsonPointerIs, or every key (form). JSON pointers are not
+// listed as strings: each would copy its ancestors' keys, so a long key over a wide array would
+// cost memory growing with the square of the body size. Errors are those of jsonWalk and formFields.
+func bodyAddrs(format string, body []byte) ([]jsonNode, []string, error) {
 	switch format {
 	case "json":
-		nodes, err := jsonWalk(body)
-		if err != nil {
-			return nil, err
-		}
-		for _, n := range nodes {
-			if n.kind != "key" {
-				addrs = append(addrs, n.ptr)
-			}
-		}
+		nodes, err := jsonWalk(body, true)
+		return nodes, nil, err
 	case "form":
 		fields, err := formFields(body)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
+		var addrs []string
 		for _, f := range fields {
 			addrs = append(addrs, f.key)
 		}
-	default:
-		return nil, errBody
+		return nil, addrs, nil
 	}
-	return addrs, nil
+	return nil, nil, errBody
 }
