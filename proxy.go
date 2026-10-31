@@ -76,7 +76,8 @@ func (v *vault) internalHandler() http.Handler {
 //  6. {{name}} with a card stored without a name: 409.
 //  7. {{cvv}}: the CVV is taken here, after every other check, and none cached is 409.
 //  8. renderRequest (account URL with the egress invariant, substitutions, headers).
-//  9. Send; read at most 4 MiB; refuse a Content-Encoding; mask the PAN.
+//  9. Send; on a 2xx drop any CVV still cached for the token; read at most 4 MiB; refuse a
+//     Content-Encoding; mask the PAN.
 //  10. Respond with the provider's status, Content-Type and masked body.
 //
 // Nothing from the request or the provider response is logged; the only log lines are ALERTs with
@@ -211,6 +212,12 @@ func (v *vault) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+	// A 2xx means the provider accepted the card, so it has left the vault: any CVV still cached
+	// for the token is dropped, whether or not this request used it and whether or not the
+	// response can be relayed below. Any other status keeps it, as the platform may retry.
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		v.cvv.drop(env.Token)
+	}
 	// A Content-Encoding still present means the transport did not decode the
 	// body; maskPAN cannot see a PAN inside compressed bytes, so the response is refused (502).
 	for _, ce := range resp.Header.Values("Content-Encoding") {

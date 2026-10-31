@@ -74,6 +74,7 @@ type vault struct {
 
 	lastSessionAlert atomic.Int64 // unix second of last session_token_invalid alert
 	lastPolicyAlert  atomic.Int64 // unix second of last proxy_policy alert
+	lastCVVAlert     atomic.Int64 // unix second of last cvv_cache_full alert
 }
 
 // logf writes one line: "<RFC3339 UTC timestamp> " + message. Callers pass only fixed format

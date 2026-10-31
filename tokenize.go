@@ -91,6 +91,17 @@ func (v *vault) alertPolicy(account, endpoint, reason string) {
 	v.logf("ALERT proxy_policy account=%s endpoint=%s reason=%s", account, endpoint, reason)
 }
 
+// alertCVVCacheFull logs "ALERT cvv_cache_full" at most once per second, on its own limiter so
+// that a full cache neither hides nor is hidden by the other alerts.
+func (v *vault) alertCVVCacheFull() {
+	sec := v.now().Unix()
+	old := v.lastCVVAlert.Load()
+	if old == sec || !v.lastCVVAlert.CompareAndSwap(old, sec) {
+		return
+	}
+	v.logf("ALERT cvv_cache_full")
+}
+
 // ---------------------------------------------------------------------------
 // Public API: POST /tokenize and CORS
 // ---------------------------------------------------------------------------
@@ -322,8 +333,10 @@ func (v *vault) handleTokenize(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, msgInternal)
 		return
 	}
-	if req.CVV != nil {
-		v.cvv.put(token, *req.CVV)
+	// A full cache does not fail the request: the card is stored, and a later {{cvv}} use for
+	// it gets the ordinary 409.
+	if req.CVV != nil && !v.cvv.put(token, *req.CVV) {
+		v.alertCVVCacheFull()
 	}
 	writeJSON(w, http.StatusOK, tokenizeResponse{Token: token, Last4: last4, ExpMonth: req.ExpMonth, ExpYear: req.ExpYear})
 }
