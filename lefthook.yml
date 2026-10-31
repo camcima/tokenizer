@@ -1,0 +1,79 @@
+# Git hooks, managed by lefthook (installed into .tools/bin by `make tools`).
+# Opt-in per clone: `make hooks` installs them into .git/hooks. CI runs the same checks
+# (gofmt in `make lint`, gitleaks in `make ci`), so skipping a hook locally does not skip the check.
+
+pre-commit:
+  parallel: true
+  jobs:
+    # The staged content of each Go file, not the working copy, must already be gofmt-formatted.
+    - name: gofmt
+      glob: "*.go"
+      run: |
+        gofmt="$(go env GOROOT)/bin/gofmt"
+        bad=""
+        for f in {staged_files}; do
+          out=$(git show ":$f" | "$gofmt" -l) || { echo "gofmt: cannot format $f"; exit 1; }
+          [ -z "$out" ] || bad="$bad $f"
+        done
+        if [ -n "$bad" ]; then
+          echo "gofmt: staged files are not formatted:$bad"
+          echo "fix with: gofmt -w$bad && git add$bad"
+          exit 1
+        fi
+
+    # Secrets in the staged changes, with the same rules and allowlist as `make gitleaks`.
+    - name: gitleaks
+      run: |
+        gl=.tools/bin/gitleaks
+        [ -x "$gl" ] || { echo "gitleaks: $gl missing, run: make tools"; exit 1; }
+        "$gl" git --pre-commit --staged --redact --no-banner --verbose --config .gitleaks.toml .
+
+    # Code comments explain behaviour and reasons; they never point at the spec, the plan or the
+    # design documents (CLAUDE.md). vendor/ is third-party code.
+    - name: comment-rule
+      glob: "*.go"
+      exclude:
+        - "vendor/**"
+      run: |
+        bad=""
+        for f in {staged_files}; do
+          if git show ":$f" | grep -qE 'SPEC-DECISION|§|design doc'; then bad="$bad $f"; fi
+        done
+        if [ -n "$bad" ]; then
+          echo "comment-rule: staged Go files reference the spec or design documents (SPEC-DECISION, §, design doc):$bad"
+          exit 1
+        fi
+
+commit-msg:
+  jobs:
+    # Conventional commits: "type(scope)!: subject" with an optional scope and "!", subject 1-72
+    # characters; a Co-Authored-By trailer, when present, is "Co-Authored-By: Name <email>".
+    # Messages git writes itself (merges, reverts, fixup!/squash!/amend!) pass unchanged.
+    - name: conventional-commit
+      run: |
+        msg={1}
+        subject=$(grep -v '^#' "$msg" | sed '/./,$!d' | head -n 1)
+        usage() {
+          echo "commit-msg: $1"
+          echo "expected: <type>[(<scope>)][!]: <subject, 1-72 characters>"
+          echo "  type:  feat fix docs test refactor chore build ci perf"
+          echo "  scope: lowercase letters, digits and hyphens"
+          echo "  e.g.   feat: add x   |   fix(scan): reject y   |   feat!: change z"
+          echo "trailer, when present: Co-Authored-By: Name <email>"
+          exit 1
+        }
+        case "$subject" in
+          "Merge "*|"Revert \""*|"fixup! "*|"squash! "*|"amend! "*) exit 0 ;;
+        esac
+        printf '%s\n' "$subject" |
+          grep -qE '^(feat|fix|docs|test|refactor|chore|build|ci|perf)(\([a-z0-9-]+\))?!?: .{1,72}$' ||
+          usage "the first line is not a conventional commit subject"
+        if grep -v '^#' "$msg" | grep -iE '^co-authored-by:' |
+          grep -qivE '^co-authored-by: [^<>]*[^<> ] <[^<>@ ]+@[^<> ]+>$'; then
+          usage "malformed Co-Authored-By trailer"
+        fi
+
+pre-push:
+  jobs:
+    - name: ci
+      run: make ci

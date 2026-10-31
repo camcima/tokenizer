@@ -1,0 +1,29 @@
+# gitleaks configuration: the default rule set, plus an allowlist of the synthetic literals the
+# test suite uses. Each entry matches one exact secret value (anchored), never a path or a file
+# type, so a real key added anywhere, test files included, is still reported.
+#
+# Run: make gitleaks (full history, part of make ci). The pre-commit hook scans staged changes.
+
+title = "pan-vault"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic test literals"
+regexTarget = "secret"
+regexes = [
+  # PayU's public sandbox credentials, published in PayU's integration documentation and used
+  # by the synthetic payu fixtures: the API key and the API login.
+  '''^4Vj8eK4rloUd272L48hsrarnUA$''',
+  '''^pRRXKOl8ikMmt9u$''',
+  # Stripe-style test keys made up for the tests: the vault's dev secret, a caller-supplied
+  # credential the policy must reject, and a value that is not a Secret Manager resource.
+  '''^sk_test_vaultsecret_x9$''',
+  '''^sk_test_attacker$''',
+  '''^sk_test_123$''',
+  # Value returned by the fake Secret Manager for the prod Adyen account in the boot tests.
+  '''^sm_adyen_br_live_v1$''',
+  # A fixed vault card token (tok_ + 32 hex) used by the policy tests; not a credential.
+  '''^tok_0123456789abcdef0123456789abcdef$''',
+]

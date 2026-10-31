@@ -1,0 +1,46 @@
+name: Fuzz
+
+# Pull requests fuzz every target briefly (make fuzz, 20s each); the nightly run fuzzes each for
+# 10 minutes (make fuzz-long). A failing input is written under testdata/fuzz/<Target>/ and uploaded
+# as an artifact: fix the code, then commit that file so it stays a regression test.
+on:
+  pull_request:
+  schedule:
+    - cron: "0 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Fuzz (pull request)
+        if: github.event_name == 'pull_request'
+        run: make fuzz
+
+      - name: Fuzz (nightly)
+        if: github.event_name == 'schedule'
+        run: make fuzz-long
+
+      - name: Upload failing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashers
+          path: testdata/fuzz
+          if-no-files-found: ignore

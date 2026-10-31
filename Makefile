@@ -1,4 +1,5 @@
-.PHONY: build test lint vuln deps-check vendor-check image image-repro ci tools itest stripe-mock-test ci-all
+.PHONY: build test lint vuln deps-check vendor-check image image-repro ci tools itest stripe-mock-test ci-all \
+        fuzz fuzz-long gitleaks hooks
 
 # Tools from the module's toolchain (go.mod `toolchain go1.27.3`), not whatever is first on PATH.
 GOFMT   = $(shell go env GOROOT)/bin/gofmt
@@ -11,6 +12,8 @@ TOOLBIN             = $(CURDIR)/.tools/bin
 TOOLCHAIN           = go1.27.3
 STATICCHECK_VERSION = v0.8.2
 GOVULNCHECK_VERSION = v1.9.0
+GITLEAKS_VERSION    = v8.30.1
+LEFTHOOK_VERSION    = v2.2.2
 
 # unpack=false: with Docker's containerd image store, rewrite-timestamp conflicts with the
 # exporter's default unpack=true. The image is unpacked on first `docker run`.
@@ -80,7 +83,35 @@ image-repro:
 	if [ "$$a" != "$$b" ]; then echo "image-repro: digests differ: $$a vs $$b"; exit 1; fi; \
 	echo "image-repro: ok $$a"
 
-ci: lint vuln deps-check vendor-check test build
+ci: lint vuln deps-check vendor-check gitleaks test build
+
+# Fuzzing: every Fuzz* target in the package, one after another (the engine fuzzes one target per
+# run). `make fuzz` runs each for 20s (pull requests); `make fuzz-long` for FUZZTIME (nightly). The
+# seeds alone also run in `make test`. A failing input is saved under testdata/fuzz/<Target>/; fix
+# the code and commit that file so it stays a regression test.
+FUZZTIME ?= 10m
+FUZZ_RUN = set -e; \
+	targets=$$(go test -list '^Fuzz' . | grep '^Fuzz'); \
+	[ -n "$$targets" ] || { echo "fuzz: no Fuzz targets found"; exit 1; }; \
+	for t in $$targets; do \
+		echo "fuzz: $$t for $(1)"; \
+		go test -run='^$$' -fuzz="^$$t\$$" -fuzztime=$(1) .; \
+	done
+
+fuzz:
+	@$(call FUZZ_RUN,20s)
+
+fuzz-long:
+	@$(call FUZZ_RUN,$(FUZZTIME))
+
+# Secret scan of the full git history (every commit, not just the tree) with the default rules plus
+# the allowlist of synthetic test literals in .gitleaks.toml.
+gitleaks: tools
+	"$(TOOLBIN)/gitleaks" git --redact --no-banner --verbose --config .gitleaks.toml .
+
+# Installs the lefthook git hooks (lefthook.yml) into this clone's .git/hooks. Opt-in per clone.
+hooks: tools
+	"$(TOOLBIN)/lefthook" install
 
 # A tool is current when `go version -m` reports the pinned toolchain and module version; any
 # other file under its name in .tools/bin (another version, a script) is removed and the pinned
@@ -102,6 +133,18 @@ tools:
 		rm -f "$(TOOLBIN)/govulncheck"; \
 		GOBIN="$(TOOLBIN)" GOTOOLCHAIN=$(TOOLCHAIN) go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION); \
 		current govulncheck golang.org/x/vuln $(GOVULNCHECK_VERSION) || { echo "tools: govulncheck not at $(GOVULNCHECK_VERSION) in $(TOOLBIN)"; exit 1; }; \
+	fi; \
+	if ! current gitleaks github.com/zricethezav/gitleaks/v8 $(GITLEAKS_VERSION); then \
+		echo "tools: installing gitleaks $(GITLEAKS_VERSION)"; \
+		rm -f "$(TOOLBIN)/gitleaks"; \
+		GOBIN="$(TOOLBIN)" GOTOOLCHAIN=$(TOOLCHAIN) go install github.com/zricethezav/gitleaks/v8@$(GITLEAKS_VERSION); \
+		current gitleaks github.com/zricethezav/gitleaks/v8 $(GITLEAKS_VERSION) || { echo "tools: gitleaks not at $(GITLEAKS_VERSION) in $(TOOLBIN)"; exit 1; }; \
+	fi; \
+	if ! current lefthook github.com/evilmartians/lefthook/v2 $(LEFTHOOK_VERSION); then \
+		echo "tools: installing lefthook $(LEFTHOOK_VERSION)"; \
+		rm -f "$(TOOLBIN)/lefthook"; \
+		GOBIN="$(TOOLBIN)" GOTOOLCHAIN=$(TOOLCHAIN) go install github.com/evilmartians/lefthook/v2@$(LEFTHOOK_VERSION); \
+		current lefthook github.com/evilmartians/lefthook/v2 $(LEFTHOOK_VERSION) || { echo "tools: lefthook not at $(LEFTHOOK_VERSION) in $(TOOLBIN)"; exit 1; }; \
 	fi
 
 # Integration tests against a throwaway postgres:18 with trust auth, published on loopback only

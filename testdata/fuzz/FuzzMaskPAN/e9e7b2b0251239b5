@@ -1,0 +1,3 @@
+go test fuzz v1
+[]byte("0")
+string("4242A242421 42A2")

@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("0={{name}}&1={{secret:0}}&2={{signature}}")
