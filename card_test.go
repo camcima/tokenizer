@@ -418,6 +418,8 @@ func TestCVVExpiry(t *testing.T) {
 	}
 }
 
+// A put below the cap does not sweep (routine expiry is the ticker's job), so an expired entry
+// stays until sweep runs. An expired entry is never returned meanwhile.
 func TestCVVSweep(t *testing.T) {
 	clk := &fakeClock{t: testNow}
 	c := newCVVCache(15*time.Minute, clk.now)
@@ -428,8 +430,21 @@ func TestCVVSweep(t *testing.T) {
 	n := len(c.m)
 	_, hasA := c.m["tok_a"]
 	c.mu.Unlock()
+	if n != 2 || !hasA {
+		t.Fatalf("after a put below the cap the cache holds %d entries (expired entry present: %v), want 2", n, hasA)
+	}
+	if removed := c.sweep(); removed != 1 {
+		t.Fatalf("sweep removed %d entries, want 1", removed)
+	}
+	c.mu.Lock()
+	n = len(c.m)
+	_, hasA = c.m["tok_a"]
+	c.mu.Unlock()
 	if n != 1 || hasA {
 		t.Fatalf("after sweep the cache holds %d entries (expired entry present: %v), want 1", n, hasA)
+	}
+	if c.take("tok_b") != testCVV {
+		t.Fatal("sweep removed a live entry")
 	}
 }
 

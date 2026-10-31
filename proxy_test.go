@@ -1224,6 +1224,59 @@ func TestProxyRefreshOnUnknownVersion(t *testing.T) {
 	}
 }
 
+// A client that disconnects while the request waits on a key refresh never consumes the
+// single-use CVV: the request stops before the CVV is taken and the provider is never called.
+func TestProxyRefreshClientGone(t *testing.T) {
+	fp := newFakeProvider(t, nil)
+	v, s := proxyVault(t, fp)
+	dek1 := dekOf(v, 1)
+	dek2 := bytes.Repeat([]byte{0x02}, 32)
+	pt, err := json.Marshal(card{PAN: testPAN, ExpMonth: "12", ExpYear: "2030"})
+	if err != nil {
+		t.Fatal("marshal card failed")
+	}
+	tok := newToken()
+	s.mu.Lock()
+	s.rows[tok] = fakeRow{ciphertext: seal(dek2, pt, cardAAD(tok)), last4: "4242", keyVersion: 2}
+	s.mu.Unlock()
+	v.cvv.put(tok, testCVV)
+	entered, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	v.refreshDEKs = func(context.Context) error {
+		calls.Add(1)
+		close(entered)
+		<-release
+		// The refresh succeeds: without the disconnect check the request would go on to use dek2.
+		v.keys.Store(&dekSet{deks: map[int][]byte{1: dek1, 2: dek2}, current: 2})
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := tokensRequest(tok, stripeTokensBody).WithContext(ctx)
+	start := testLog.Len()
+	done := make(chan *httptest.ResponseRecorder)
+	go func() { done <- serveInternal(v, r) }()
+	<-entered
+	cancel() // the client goes away while the refresh is still running
+	close(release)
+	rec := <-done
+	if rec.Body.Len() != 0 {
+		t.Fatalf("response body len %d written to a gone client, want 0", rec.Body.Len())
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("refresh ran %d times, want 1", n)
+	}
+	if hits, _, _, _, _ := fp.last(); hits != 0 {
+		t.Fatalf("provider hits %d, want 0", hits)
+	}
+	if strings.Contains(testLog.since(start), "decrypt_failed") {
+		t.Fatal("decrypt_failed logged for a request whose client went away")
+	}
+	if v.cvv.take(tok) != testCVV {
+		t.Fatal("CVV not cached after a request whose client went away during the refresh")
+	}
+}
+
 // A forged key version that never appears costs one refresh per window, however many requests
 // carry it, and every such request still fails as decrypt_failed.
 func TestProxyUnknownVersionRateLimited(t *testing.T) {

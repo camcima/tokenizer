@@ -170,6 +170,11 @@ func (v *vault) handleProxy(w http.ResponseWriter, r *http.Request) {
 	dek, ok := v.dek(keyVersion)
 	if !ok {
 		_ = v.refresh(ctx)
+		// The refresh is detached from ctx and can wait up to dekRefreshTimeout. A client gone by
+		// then gets nothing: stopping here leaves its single-use CVV cached for a retry.
+		if ctx.Err() != nil {
+			return
+		}
 		dek, _ = v.dek(keyVersion)
 	}
 	// The token is the additional data: a ciphertext copied from another token's row fails here.

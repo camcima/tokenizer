@@ -185,7 +185,7 @@ func withClientCert(r *http.Request) *http.Request {
 }
 
 // fillCVVCache inserts n entries expiring at exp under distinct tokens prefix+index. It writes the
-// map directly: going through put would sweep the whole cache on every insert.
+// map directly, under one lock, so each entry gets exactly exp whatever the cache's clock says.
 func fillCVVCache(c *cvvCache, prefix string, n int, exp time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
