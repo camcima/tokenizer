@@ -14,4 +14,4 @@ Risks the project has looked at and decided to accept for now, rather than fix. 
 | **Decision** | Accepted for v1 on 2026-10-30. |
 | **Owner** | The project owner. |
 | **Revisit trigger** | v1.1: the audit write moves outside the caller's transaction (an autonomous write, for example through `dblink`), so a rollback can no longer remove it. That is a database design change with its own privilege, failure-mode and concurrency review, applied through the migration pipeline. Revisit sooner if anything other than the vault is ever granted `vault_app`. |
-| **Links** | [README §10, Known limitations](../README.md#10-known-limitations-and-what-comes-next) · [Security architecture review, finding R4](security-architecture-review-2026-10-30.md) |
+| **Links** | [README §10, Known limitations](../README.md#10-known-limitations-and-what-comes-next) |
