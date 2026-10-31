@@ -415,11 +415,15 @@ func TestLoadSecrets(t *testing.T) {
 	// A receipt seed that fails after the HMAC key loaded zeroes the HMAC key: dev keys are
 	// handed over as the config's own slices, so the zeroing is visible here.
 	devHMAC := bytes.Clone(hmacKey)
-	if _, _, err := loadSecrets(ctx, config{env: "dev", devHMAC: devHMAC, devReceiptSeed: seed[:31]}, nil, nil); err == nil {
+	if _, _, err := loadSecrets(ctx, config{env: "dev", devHMAC: devHMAC, devReceiptSeed: bytes.Clone(seed[:31])}, nil, nil); err == nil {
 		t.Fatal("31-byte receipt seed accepted")
 	}
 	if !bytes.Equal(devHMAC, make([]byte, 32)) {
 		t.Error("the HMAC key loaded before the receipt seed failed was not zeroed")
+	}
+	// Every case above passed copies, so the fixtures the Secret Manager cases build on are intact.
+	if !bytes.Equal(hmacKey, bytes.Repeat([]byte{0x5a}, 32)) || !bytes.Equal(seed, bytes.Repeat([]byte{0x6b}, 32)) {
+		t.Fatal("a failure case zeroed the test's own key fixtures")
 	}
 
 	// Secret Manager path.
