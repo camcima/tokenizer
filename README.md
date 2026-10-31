@@ -726,7 +726,7 @@ sequenceDiagram
 - **Account secrets.** Every secret named by a catalog account of the environment must exist in Secret Manager and be readable by the vault's service account, or the vault won't boot.
 - **Platform client certificates.** The CA in `VAULT_CLIENT_CA` should issue certificates only to the platform services that are allowed to call `/proxy`.
 - **Egress firewall.** For every provider host in `egress-hosts.dev.txt` or `egress-hosts.prod.txt`, that environment's firewall must allow only that provider's published IP ranges. The prod firewall allows only prod hosts.
-- **Receipt signing key.** The receipt seed is 32 random bytes, stored in Secret Manager as exactly 64 hex characters with no trailing newline (for example `openssl rand -hex 32 | tr -d '\n' | gcloud secrets create receipt-key --data-file=-`). `VAULT_RECEIPT_KEY_SECRET` names it, and the vault's service account must be able to read it, or the vault won't boot. The platform needs only the public key, never the seed. Read the key from the boot log line `receipt public key=<base64url>`, or derive it from the seed with this Go program (`gcloud secrets versions access latest --secret=receipt-key | go run pubkey.go`):
+- **Receipt signing key.** The receipt seed is 32 random bytes, stored in Secret Manager as exactly 64 hex characters with no trailing newline (for example `openssl rand -hex 32 | tr -d '\n' | gcloud secrets create receipt-key --data-file=-`). `VAULT_RECEIPT_KEY_SECRET` names it, and the vault's service account must be able to read it, or the vault won't boot. The platform needs only the public key, never the seed. Read the key from the boot log line `receipt public key=<base64url>`, or derive it from the seed with this Go program (`gcloud secrets versions access latest --secret=receipt-key | go run pubkey.go`, or offline before the seed is stored: `openssl rand -hex 32 | tr -d '\n' > seed.hex && go run pubkey.go < seed.hex`):
 
   ```go
   package main
@@ -966,6 +966,14 @@ func Verify(pub ed25519.PublicKey, s string) (Receipt, error) {
 		return Receipt{}, ErrInvalid
 	}
 	if r.Token == "" || r.BIN == "" || r.Last4 == "" || r.ExpMonth == "" || r.ExpYear == "" || r.IAT <= 0 {
+		return Receipt{}, ErrInvalid
+	}
+	// The vault omits name when the card has none, so a name key holding "" or null is invalid.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return Receipt{}, ErrInvalid
+	}
+	if _, ok := raw["name"]; ok && r.Name == "" {
 		return Receipt{}, ErrInvalid
 	}
 	return r, nil

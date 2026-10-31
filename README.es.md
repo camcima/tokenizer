@@ -726,7 +726,7 @@ sequenceDiagram
 - **Secretos de las cuentas.** Cada secreto nombrado por una cuenta del catálogo del entorno debe existir en Secret Manager y ser legible por la service account del vault, o el vault no arranca.
 - **Certificados de cliente de la plataforma.** La CA en `VAULT_CLIENT_CA` solo debería emitir certificados para los servicios de la plataforma que tienen permitido llamar a `/proxy`.
 - **Firewall de egress.** Para cada host de proveedor en `egress-hosts.dev.txt` o `egress-hosts.prod.txt`, el firewall de ese entorno debe permitir solo los rangos de IP publicados por ese proveedor. El firewall de prod solo permite hosts de prod.
-- **Clave de firma de los recibos.** La semilla de los recibos son 32 bytes aleatorios, guardados en Secret Manager como exactamente 64 caracteres hexadecimales sin salto de línea final (por ejemplo `openssl rand -hex 32 | tr -d '\n' | gcloud secrets create receipt-key --data-file=-`). `VAULT_RECEIPT_KEY_SECRET` la nombra, y la service account del vault debe poder leerla, o el vault no arranca. La plataforma solo necesita la clave pública, nunca la semilla. La clave se lee de la línea de log de arranque `receipt public key=<base64url>`, o se deriva de la semilla con este programa en Go (`gcloud secrets versions access latest --secret=receipt-key | go run pubkey.go`):
+- **Clave de firma de los recibos.** La semilla de los recibos son 32 bytes aleatorios, guardados en Secret Manager como exactamente 64 caracteres hexadecimales sin salto de línea final (por ejemplo `openssl rand -hex 32 | tr -d '\n' | gcloud secrets create receipt-key --data-file=-`). `VAULT_RECEIPT_KEY_SECRET` la nombra, y la service account del vault debe poder leerla, o el vault no arranca. La plataforma solo necesita la clave pública, nunca la semilla. La clave se lee de la línea de log de arranque `receipt public key=<base64url>`, o se deriva de la semilla con este programa en Go (`gcloud secrets versions access latest --secret=receipt-key | go run pubkey.go`, o fuera de línea antes de guardar la semilla: `openssl rand -hex 32 | tr -d '\n' > seed.hex && go run pubkey.go < seed.hex`):
 
   ```go
   package main
@@ -966,6 +966,14 @@ func Verify(pub ed25519.PublicKey, s string) (Receipt, error) {
 		return Receipt{}, ErrInvalid
 	}
 	if r.Token == "" || r.BIN == "" || r.Last4 == "" || r.ExpMonth == "" || r.ExpYear == "" || r.IAT <= 0 {
+		return Receipt{}, ErrInvalid
+	}
+	// The vault omits name when the card has none, so a name key holding "" or null is invalid.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return Receipt{}, ErrInvalid
+	}
+	if _, ok := raw["name"]; ok && r.Name == "" {
 		return Receipt{}, ErrInvalid
 	}
 	return r, nil

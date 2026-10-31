@@ -726,7 +726,7 @@ sequenceDiagram
 - **Secrets das contas.** Todo secret indicado por uma conta do catálogo do ambiente precisa existir no Secret Manager e ser legível pela service account do vault, ou o vault não sobe.
 - **Certificados de cliente da plataforma.** A CA em `VAULT_CLIENT_CA` deve emitir certificados apenas para os serviços da plataforma que têm permissão para chamar `/proxy`.
 - **Firewall de egress.** Para cada host de provedor em `egress-hosts.dev.txt` ou `egress-hosts.prod.txt`, o firewall daquele ambiente deve permitir apenas as faixas de IP publicadas por aquele provedor. O firewall de prod permite apenas hosts de prod.
-- **Chave de assinatura dos recibos.** A semente dos recibos são 32 bytes aleatórios, guardados no Secret Manager como exatamente 64 caracteres hexadecimais sem quebra de linha no final (por exemplo `openssl rand -hex 32 | tr -d '\n' | gcloud secrets create receipt-key --data-file=-`). `VAULT_RECEIPT_KEY_SECRET` a nomeia, e a service account do vault precisa conseguir lê-la, ou o vault não sobe. A plataforma só precisa da chave pública, nunca da semente. Leia a chave da linha de log de boot `receipt public key=<base64url>`, ou derive-a da semente com este programa em Go (`gcloud secrets versions access latest --secret=receipt-key | go run pubkey.go`):
+- **Chave de assinatura dos recibos.** A semente dos recibos são 32 bytes aleatórios, guardados no Secret Manager como exatamente 64 caracteres hexadecimais sem quebra de linha no final (por exemplo `openssl rand -hex 32 | tr -d '\n' | gcloud secrets create receipt-key --data-file=-`). `VAULT_RECEIPT_KEY_SECRET` a nomeia, e a service account do vault precisa conseguir lê-la, ou o vault não sobe. A plataforma só precisa da chave pública, nunca da semente. Leia a chave da linha de log de boot `receipt public key=<base64url>`, ou derive-a da semente com este programa em Go (`gcloud secrets versions access latest --secret=receipt-key | go run pubkey.go`, ou offline antes de guardar a semente: `openssl rand -hex 32 | tr -d '\n' > seed.hex && go run pubkey.go < seed.hex`):
 
   ```go
   package main
@@ -966,6 +966,14 @@ func Verify(pub ed25519.PublicKey, s string) (Receipt, error) {
 		return Receipt{}, ErrInvalid
 	}
 	if r.Token == "" || r.BIN == "" || r.Last4 == "" || r.ExpMonth == "" || r.ExpYear == "" || r.IAT <= 0 {
+		return Receipt{}, ErrInvalid
+	}
+	// The vault omits name when the card has none, so a name key holding "" or null is invalid.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return Receipt{}, ErrInvalid
+	}
+	if _, ok := raw["name"]; ok && r.Name == "" {
 		return Receipt{}, ErrInvalid
 	}
 	return r, nil

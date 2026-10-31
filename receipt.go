@@ -140,9 +140,9 @@ func base64URLChars(s string) bool {
 }
 
 // decodeReceiptPayload parses a signed payload strictly: one JSON object, only the receipt's keys
-// spelled exactly and each at most once, nothing after it, and every key the vault always writes
-// present with a non-empty value. A payload that different JSON parsers could read differently
-// is rejected even though it is signed.
+// spelled exactly and each at most once, nothing after it, every key the vault always writes
+// present with a non-empty value, and name, when present, a non-empty string. A payload that
+// different JSON parsers could read differently is rejected even though it is signed.
 func decodeReceiptPayload(payload []byte) (receipt, error) {
 	if !exactKeys(payload, receiptFields) {
 		return receipt{}, errReceipt
@@ -158,6 +158,15 @@ func decodeReceiptPayload(payload []byte) (receipt, error) {
 		return receipt{}, errReceipt
 	}
 	if r.Token == "" || r.BIN == "" || r.Last4 == "" || r.ExpMonth == "" || r.ExpYear == "" || r.IAT <= 0 {
+		return receipt{}, errReceipt
+	}
+	// The vault omits name when the card has none, so a name key holding "" or null is invalid
+	// rather than read as a card without a name.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return receipt{}, errReceipt
+	}
+	if _, ok := raw["name"]; ok && r.Name == "" {
 		return receipt{}, errReceipt
 	}
 	return r, nil

@@ -171,6 +171,9 @@ func TestVerifyReceiptRejects(t *testing.T) {
 	if bytes.Equal(tampered, payload) {
 		t.Fatal("tamper target not found in payload")
 	}
+	if !bytes.Contains(payload, []byte(`"name":"`+in.Name+`"`)) {
+		t.Fatal("name not found in payload")
+	}
 	flippedSig := bytes.Clone(sig)
 	flippedSig[0] ^= 1
 
@@ -233,6 +236,10 @@ func TestVerifyReceiptRejects(t *testing.T) {
 			enc([]byte(`{"token":"tok_0123456789abcdef0123456789abcdef","bin":"42424242","last4":"4242","exp_month":"12","iat":1}`)))},
 		{"null value, re-signed", p, signRawReceipt(receiptPrefix,
 			enc(bytes.Replace(payload, []byte(`"exp_year":"2030"`), []byte(`"exp_year":null`), 1)))},
+		{"empty name, re-signed", p, signRawReceipt(receiptPrefix,
+			enc(bytes.Replace(payload, []byte(`"name":"`+in.Name+`"`), []byte(`"name":""`), 1)))},
+		{"null name, re-signed", p, signRawReceipt(receiptPrefix,
+			enc(bytes.Replace(payload, []byte(`"name":"`+in.Name+`"`), []byte(`"name":null`), 1)))},
 		{"wrong value type, re-signed", p, signRawReceipt(receiptPrefix,
 			enc(bytes.Replace(payload, []byte(`"iat":1793456789`), []byte(`"iat":"1793456789"`), 1)))},
 		{"json null payload, re-signed", p, signRawReceipt(receiptPrefix, enc([]byte("null")))},
