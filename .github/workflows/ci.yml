@@ -70,11 +70,14 @@ jobs:
           fi
           make commit-check COMMIT_RANGE="$range"
 
-      # The squash merge's commit message is the title, so it must pass the same rule. The title
-      # goes through env, never into the script text, and --message keeps it from being read as a
-      # file name.
+      # The squash merge's commit subject is the title plus GitHub's " (#N)" suffix, so that whole
+      # subject must pass the same rule (a title that fits 72 characters alone can overflow with
+      # the suffix). The title goes through env, never into the script text, and --message keeps
+      # it from being read as a file name. It also runs when commit-check failed, so both failures
+      # show at once.
       - name: pull request title
-        if: github.event_name == 'pull_request'
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
-        run: scripts/check-commit-msg.sh --message "$PR_TITLE"
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: scripts/check-commit-msg.sh --message "$PR_TITLE (#$PR_NUMBER)"
