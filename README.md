@@ -2,6 +2,8 @@
 
 *[Leer en español](README.es.md) · [Ler em português](README.pt-BR.md)*
 
+[![CI](https://github.com/camcima/tokenizer/actions/workflows/ci.yml/badge.svg)](https://github.com/camcima/tokenizer/actions/workflows/ci.yml) [![Integration](https://github.com/camcima/tokenizer/actions/workflows/integration.yml/badge.svg)](https://github.com/camcima/tokenizer/actions/workflows/integration.yml) [![Image](https://github.com/camcima/tokenizer/actions/workflows/image.yml/badge.svg)](https://github.com/camcima/tokenizer/actions/workflows/image.yml) [![Fuzz](https://github.com/camcima/tokenizer/actions/workflows/fuzz.yml/badge.svg)](https://github.com/camcima/tokenizer/actions/workflows/fuzz.yml) [![Go version](https://img.shields.io/github/go-mod/go-version/camcima/tokenizer)](go.mod) [![License](https://img.shields.io/github/license/camcima/tokenizer)](LICENSE)
+
 A small, single-purpose service that keeps credit card numbers out of the rest of our payment platform.
 
 The browser hands the card to the vault. The vault locks it away and gives back a meaningless **token**. From then on the platform only ever handles tokens. When a payment provider such as Stripe needs the real card, the platform writes the provider request with blanks where the card goes, and asks the vault to fill them in and make the call. The vault checks every request against a reviewed list of what is allowed, and the card number never passes through the platform at all.
@@ -109,7 +111,7 @@ Two properties make this vault different from a plain "encrypt and store" servic
 1. **It never returns a card number.** There is no "detokenize" endpoint, not even an admin or debug one.
 2. **It acts on the card instead of handing it out.** The caller builds the provider request with **placeholders** such as `{{pan}}` and supplies a token. The vault checks the request against a reviewed, compiled-in **catalog** of allowed endpoints and fields, fills in the card and its own provider credential, and sends it to a host the catalog chooses.
 
-This "proxy, don't reveal" design is what keeps the platform out of PCI scope.
+This "proxy, don't reveal" design is meant to keep the platform's back end out of PCI scope, subject to the assessor's scoping. The checkout page is a separate matter (see [§5](#5-how-the-vault-shrinks-our-scope)).
 
 ---
 
@@ -150,7 +152,7 @@ The key idea is **scope**. The rules apply in full to every system that stores, 
 - **Encrypted card data is still card data.** It stays in scope unless the system holding it has no access to the decryption keys. That's why the vault keeps its key-encryption key in a separate project, in a hardware security module.
 - **"Connected-to" systems are in scope too.** A system that can reach the CDE, or that could affect its security, is pulled in unless it's properly segmented.
 - **Tokens are not card data.** A system that only handles tokens, and cannot use them to get the card back, can fall out of scope. The PCI SSC's tokenization guidance describes this.
-- **Sensitive authentication data (the CVV) must not be stored after authorization**, even encrypted. The vault keeps it only in memory, for at most 15 minutes, and uses it at most once.
+- **Sensitive authentication data (the CVV) must not be stored after authorization**, even encrypted. The vault keeps it only in memory and uses it at most once. It expires 15 minutes after tokenization and is wiped from memory within about a minute after that, unless it was used or dropped sooner.
 
 > The final word on scope always belongs to your assessor. This document explains how the vault is designed to minimize scope; it isn't a compliance determination.
 
@@ -258,7 +260,7 @@ flowchart LR
 | Vault → KMS | The key-encryption key is in a different project and never leaves the HSM. |
 | Vault → internet | Only the hosts of this environment's catalog accounts, enforced in code and by the VPC egress firewall. |
 
-**An honest caveat about the checkout page.** The card number does pass through the customer's browser, inside a page our platform serves. Whoever controls that page's JavaScript could in theory change where the card is sent. So the page that hosts the card form, and the systems that serve it, are usually still in a reduced scope (comparable to SAQ A-EP for a merchant). PCI DSS v4.0 also adds requirements for managing and monitoring scripts on payment pages. The vault removes the back end (APIs, databases, queues, logs, workers) from scope. It does not remove the payment page itself. Serving the card form from a vault-controlled origin, for example in an iframe, would shrink this further and is a possible future step.
+**An honest caveat about the checkout page.** The card number does pass through the customer's browser, inside a page our platform serves. Whoever controls that page's JavaScript could in theory change where the card is sent. So the page that hosts the card form, and the systems that serve it, are usually still in a reduced scope (comparable to SAQ A-EP for a merchant). PCI DSS v4.0 also adds requirements for managing and monitoring scripts on payment pages. The vault is designed to take the back end (APIs, databases, queues, logs, workers) out of scope, subject to the assessor's scoping. It does not take the payment page itself out of scope. Serving the card form from a vault-controlled origin, for example in an iframe, would shrink this further and is a possible future step.
 
 ---
 
@@ -300,7 +302,7 @@ sequenceDiagram
     V-->>B: 204, only if Origin matches exactly
     B->>V: POST /tokenize {pan, exp_month, exp_year, cvv?, name?}<br/>Authorization: Bearer session-token
     Note over V: Checks in order: path, method,<br/>no query string, Origin, session token,<br/>content type, size ≤ 4 KiB, strict JSON,<br/>Luhn + length, expiry not past, CVV format, name
-    Note over V: token = tok_ + 32 random hex<br/>ciphertext = AES-256-GCM(current DEK, {pan, exp, name?})
+    Note over V: token = tok_ + 32 random hex (made first)<br/>ciphertext = AES-256-GCM(current DEK, {pan, exp, name?},<br/>additional data = pan-vault/card/1 + NUL + token)
     V->>DB: vault.put_card(token, ciphertext, last4, key_version)
     Note over DB: inserts card + audit row
     Note over V: CVV → memory only,<br/>single use, 15 min
@@ -310,7 +312,7 @@ sequenceDiagram
 
 Key details:
 
-- **The CVV is never stored.** It sits in a memory cache, is deleted when read, and expires after 15 minutes. Expired entries are swept on every write.
+- **The CVV is never stored.** It sits in a memory cache, as bytes that are overwritten when the entry is removed (best effort, like all clearing of Go memory). It is removed when a `/proxy` call reads it, when the provider accepts any `/proxy` call for that card with a 2xx (see 6.2 below), or when it expires 15 minutes after tokenization. Expired entries are swept every 60 seconds as well as on every write, so even an idle instance holds an expired CVV for at most about a minute. The cache holds at most 50,000 CVVs. When it is full, `/tokenize` still stores the card and returns 200, but doesn't cache the CVV and logs `ALERT cvv_cache_full` (at most once a second). A later `{{cvv}}` request for that card gets the usual 409. Live CVVs are never evicted to make room.
 - **The cardholder name is optional.** If given, it must be 1–100 characters of valid UTF-8 with no control characters (`"name": null` is rejected). It is encrypted together with the card and only used where a provider request has a `{{name}}` placeholder. The vault itself never returns it, but a provider's response may echo it (a Stripe token's `card.name`, for example), and that response reaches the platform as is: the vault masks only card numbers, not names. A card tokenized without a name can't fill `{{name}}`: that `/proxy` call gets `409 {"error":"name unavailable"}`.
 - **A query string is rejected outright.** This guarantees a card number can never end up in a URL, and so never in any URL-based log along the way.
 - **The browser gets the same error format whatever goes wrong**: `{"error":"invalid pan"}` and the like. That format never echoes input back.
@@ -378,9 +380,10 @@ Key details:
 - **The account chooses the destination and the credential.** The platform names an account, such as `stripe_test`. The URL is always `https://` + the account's host + its base path + the request path, and the vault re-checks the scheme and host after building it. The platform can't name a host.
 - **The credential is the vault's.** Account secrets are loaded from Secret Manager at boot. A credential header must be exactly its catalog template (for example `Authorization: Bearer {{secret:secretKey}}`). The platform may send that template string or leave the header out, and the vault renders it either way. Any other value, including a lowercase `authorization: Bearer sk_attacker`, is rejected. A credential body field likewise accepts only its vault placeholder. No HTTP header of the `/proxy` call itself is ever used.
 - **Platform headers travel in `request.headers`, and only three are allowed:** `Accept`, `Idempotency-Key` and `X-Idempotency-Key`, each 1–1024 bytes of printable ASCII. Any other header is rejected with `header not allowed`, not silently dropped, so platform bugs show up. The vault itself sets `Host`, `Content-Type` (from the provider's format), `Content-Length` and `User-Agent: pan-vault/1`. Only the status, `Content-Type` and body come back.
-- **The CVV is used at most once, and only when all checks pass.** If the body uses `{{cvv}}` and no CVV is cached (already used, expired, or tokenized on another instance), the answer is `409 {"error":"cvv unavailable"}`. The platform resends without the CVV field, for example for a card-on-file charge. The vault never edits the body to drop a field.
+- **The CVV is used at most once, and only when all checks pass.** If the body uses `{{cvv}}` and no CVV is cached (already used, expired, or tokenized on another instance), the answer is `409 {"error":"cvv unavailable"}`. The platform resends without the CVV field, for example for a card-on-file charge. The vault never edits the body to drop a field. A 2xx answer from the provider means the card has left the vault, so the vault also drops any CVV still cached for that token, whether or not the request used `{{cvv}}`, and even when it then refuses to relay the answer (a compressed response becomes a `502`). A retry that uses `{{cvv}}` then gets the 409. Any other status leaves an unused CVV cached for a retry. The drop only reaches the instance that holds the CVV. `/tokenize` and `/proxy` arrive through different load balancers, so a CVV cached on another instance stays there until it expires: 15 minutes after tokenization plus at most one sweep, about 16 minutes in the worst case.
+- **Each ciphertext opens only under its own token.** A card is encrypted with its token as AES-GCM additional data (`pan-vault/card/1`, a NUL byte, then the token). A ciphertext copied into another token's row fails to decrypt and is answered with `500` and `ALERT decrypt_failed`. Nothing is sent to the provider. If the card's key version is one this instance doesn't hold yet (a key added moments ago), the vault first refreshes its keys from the database, at most once every 10 seconds (see §9). That can hold the request for up to about 30 seconds, within the internal listener's 60-second write timeout. If a slow refresh is followed by a slow provider, that timeout can expire before the answer is written. The platform should handle that like any provider timeout and retry with the same `Idempotency-Key`.
 - **Rejections are specific and never echo input.** A policy failure is a `400` with one fixed message: `unknown account`, `endpoint not allowed`, `header not allowed`, `invalid placeholder use`, `pinned field mismatch`, `forbidden field` or `invalid request body`. Once the account is known, every rule failure also raises `ALERT proxy_policy` (see [§7.6](#76-nothing-sensitive-in-logs-by-construction)). An unknown account, a malformed token or a malformed envelope is rejected without an alert.
-- **Redirects are never followed.** The vault ignores `HTTP_PROXY`, refuses compressed responses it can't inspect, and never returns a truncated body.
+- **Redirects are never followed.** The vault ignores `HTTP_PROXY`, refuses compressed responses it can't inspect, and never returns a truncated body. Masking covers card numbers only (plain, spaced or dashed). Anything else a provider returns, such as a name or an error message, reaches the platform as is, which is why each catalog endpoint's documented responses are reviewed before it is added.
 
 #### 6.3 The life of a card
 
@@ -457,7 +460,7 @@ flowchart TB
         A1["Session token + exact Origin<br/>Strict validation, fixed error strings<br/>Catalog rules: positions, pins, forbid, header allowlist<br/>Vault-held credentials, egress invariant<br/>No redirects, no proxies, response masking"]
     end
     subgraph L4["Data"]
-        D1["DB role: EXECUTE on 4 functions, no tables<br/>Velocity limits + audit inside the DB<br/>Serialized lookups (advisory lock)"]
+        D1["DB role: EXECUTE on 3 functions, no tables<br/>Velocity limits + audit inside the DB<br/>Serialized lookups (advisory lock)"]
     end
     subgraph L5["Keys"]
         K1["AES-256-GCM per record<br/>DEKs wrapped by an HSM key in another project<br/>No service account keys anywhere"]
@@ -522,9 +525,10 @@ There is exactly one access-log line per request:
 | `ALERT proxy_policy account=… endpoint=… reason=…` | A `/proxy` request broke a catalog rule. `reason` is one of `endpoint`, `header`, `body`, `placeholder`, `pin` or `forbidden_field`, and `endpoint=-` means no endpoint matched. Possible compromised platform. At most one line per second. |
 | `ALERT velocity token=… caller=… account=…` | A lookup limit was hit. Possible bulk extraction. |
 | `ALERT pan_echo account=… endpoint=… token=…` | A provider echoed a card number. It was masked, but investigate. |
-| `ALERT decrypt_failed token=… key_version=… account=…` | Ciphertext or key corruption. This should never happen. |
+| `ALERT decrypt_failed token=… key_version=… account=…` | Ciphertext or key corruption, or a ciphertext copied into another token's row. This should never happen. |
 | `ALERT egress_invariant account=…` | A request was about to leave for an unexpected host. This should be unreachable. |
 | `ALERT session_token_invalid reason=…` | Bad, expired or forged session token. At most one line per second. |
+| `ALERT cvv_cache_full` | The CVV cache is full (50,000 entries). New cards are still stored, but their CVV isn't cached. Possible `/tokenize` flood. At most one line per second. |
 
 The test suite proves this. Every test logs into a shared buffer. After the run, the buffer is scanned for any 13–19-digit run that passes the Luhn check, including runs with spaces or dashes and runs buried inside longer digit strings. It is also scanned for the test CVV, the test provider secrets and the test cardholder name. Any match fails the build.
 
@@ -594,7 +598,7 @@ flowchart TB
     DEK2 -- "AES-256-GCM" --> C2
 ```
 
-*Why:* the database holds only ciphertext and wrapped keys. Unwrapping needs a call to KMS in a different project, with its own IAM and audit logs. A new data key is created daily, and the KMS key rotates every 90 days. Each record uses a fresh 12-byte random nonce. *Trade-off:* boot depends on KMS being available, and old data keys are kept so old cards stay readable. Re-encrypting old rows is planned for v1.1.
+*Why:* the database holds only ciphertext and wrapped keys. Unwrapping needs a call to KMS in a different project, with its own IAM and audit logs. Each record uses a fresh 12-byte random nonce and carries its token as additional authenticated data (`pan-vault/card/1`, a NUL byte, then the token), so a ciphertext decrypts only under the token it was stored with. We recommend a new data key every month. Each key then covers about a month of cards, which keeps the set of old keys every instance unwraps at boot small (about twelve a year), at the price that one exposed data key reveals up to a month of cards rather than a day's. The KMS key rotates every 90 days. KMS decrypt accepts older key versions, so wrapped DEKs stay readable after a KMS rotation, but they stay wrapped under the version that wrapped them: rewrapping existing DEKs under the newest KMS key version is v1.1 work. *Trade-off:* boot depends on KMS being available, and old data keys are kept so old cards stay readable. Re-encrypting old rows is planned for v1.1.
 
 **Two listeners, two trust models.**
 *Why:* the browser-facing listener and the platform-facing listener have completely different callers. Separate ports, TLS settings and handlers mean a bug on one side can't expose the other. *Trade-off:* two load balancers to operate.
@@ -646,23 +650,37 @@ sequenceDiagram
     J->>KMS: decrypt(wrapped), verify round trip
     J->>DB: vault.add_dek(wrapped) → version N+1
     J-->>J: print version, exit
-    Note over V: rolling restart picks up DEK N+1 as current,<br/>older DEKs still load, so old cards still decrypt
+    Note over V: each instance loads DEK N+1 within 5 minutes,<br/>or at once when a card sealed under it arrives.<br/>Older DEKs stay loaded, so old cards still decrypt
 ```
+
+**Rotation schedule and key refresh.** Run `vault -rotate-dek` monthly (the trade-off is in [§8](#8-why-it-is-built-the-way-it-is)). No restart is needed afterwards. Every instance re-reads the key list every 5 minutes, and an instance that meets a card sealed under a key version it doesn't hold refreshes at once, at most once every 10 seconds, each refresh limited to 30 seconds. New keys are added to the ones an instance holds, and none is ever dropped, so a rolling restart is no longer needed and no longer causes `decrypt_failed`. One case remains: if KMS is unreachable when an instance first needs the new key, or that instance's last refresh finished less than 10 seconds earlier, before the key existed, that one request fails with `decrypt_failed`. A retry a few seconds later succeeds.
 
 **Responding to alerts:**
 
 | Alert | Severity | First steps |
 |---|---|---|
 | `pan_echo` | Page immediately | Find out which account and endpoint echoed a card number. The vault masked it, but confirm nothing else captured it. |
-| `decrypt_failed` | Page immediately | Possible key or data corruption. Check KMS key state and the DEK versions. |
+| `decrypt_failed` | Page immediately | Possible key or data corruption, or a ciphertext copied into another token's row. Check KMS key state and the DEK versions. |
 | `egress_invariant` | Page immediately | Should be impossible. Treat it as a possible compromise of the vault binary. |
 | `proxy_policy` | Page | The platform sent a request the catalog forbids. Possible compromised platform. Match it to the `/proxy` access-log lines with `status=400` at the same time to find the client certificate (`caller=`). A burst right after a platform deploy is more likely a platform bug. |
 | `velocity` | Page | Possible bulk extraction attempt. Check which client-certificate serial (`caller=`) made the lookups. |
 | `session_token_invalid` (rate spike) | Notify | Card-testing or misconfigured checkout. Check Cloud Armor. |
+| `cvv_cache_full` | Notify | The CVV cache hit its 50,000-entry cap. Checkouts still work, but cards tokenized meanwhile have no cached CVV, so `{{cvv}}` requests for them get 409. Check Cloud Armor and the `/tokenize` traffic for a flood. |
 
 **Deployment prerequisites:**
 
 - **Database TLS.** In production, `VAULT_DB_URL` must verify the server certificate, or the vault won't boot. Use `sslmode=verify-ca&sslrootcert=/path/to/server-ca.pem` with Cloud SQL's server CA. `verify-full` usually fails against a private IP.
+- **Cloud SQL identities.** The vault and the rotation job each run as their own IAM service account, for example `pan-vault@pci-cde-<env>.iam.gserviceaccount.com` (serving) and `pan-vault-rotator@pci-cde-<env>.iam.gserviceaccount.com` (rotation). Each one is added to the Cloud SQL instance as an IAM database user, whose Postgres username is the account's email without `.gserviceaccount.com`. The migration pipeline, connected as `vault_owner`, then grants each one its role:
+
+  ```sql
+  GRANT vault_app     TO "pan-vault@pci-cde-<env>.iam";
+  GRANT vault_rotator TO "pan-vault-rotator@pci-cde-<env>.iam";
+  ```
+
+  `VAULT_DB_URL` names that IAM username, URL-encoded and without a password, for example `postgres://pan-vault%40pci-cde-<env>.iam@<private-ip>:5432/vault?sslmode=verify-ca&sslrootcert=…`. In production the vault sends its service account's access token as the password (Cloud SQL IAM database authentication).
+- **Cloud SQL smoke test.** Before the first deploy to an environment, and after any change to its IAM users or database roles, check against the real Cloud SQL instance that the serving account can log in with its IAM token and call `put_card`, `get_card` and `list_deks`, but can't read any table or call `add_dek`, and that the rotator account can call `add_dek`. This is a step in the deploy pipeline, not a test in this repository.
+- **A reviewed account for the environment.** The vault refuses to boot when the catalog has no account for its `VAULT_ENV` (`catalog has no accounts for env=prod`), because a vault that can't send a card anywhere would otherwise look healthy. The first prod deploy therefore needs a reviewed prod account in `catalog.json`, with its host in `egress-hosts.prod.txt`.
+- **Health checks.** The load balancers probe both listeners with plain TCP checks: the port accepts connections. Real readiness is checked separately, by a monitor that holds a platform client certificate and calls `GET /healthz` over mTLS, which also exercises the certificate chain and the database. There is deliberately no unauthenticated health route. The internal listener asks for a client certificate in the TLS handshake of every connection, and the vault serves nothing beyond `/tokenize`, `/proxy` and `/healthz`, so a probe path would mean either a new endpoint or weaker mTLS on the listener that serves `/proxy`.
 - **Raw card data access at each provider.** By default Stripe refuses API requests that contain full card numbers. Live-mode access requires Stripe's approval, backed by PCI evidence (typically an SAQ D or an Attestation of Compliance). Other providers have similar gates, such as Adyen's "API PCI Payments role".
 - **Account secrets.** Every secret named by a catalog account of the environment must exist in Secret Manager and be readable by the vault's service account, or the vault won't boot.
 - **Platform client certificates.** The CA in `VAULT_CLIENT_CA` should issue certificates only to the platform services that are allowed to call `/proxy`.
@@ -673,19 +691,15 @@ sequenceDiagram
 
 ## 10. Known limitations and what comes next
 
-**Rolled-back lookups aren't counted (accepted for v1).** Every lookup's audit row is written inside the caller's database transaction. Someone holding the vault's own database role (adversary B) can look a card up and then roll back. The card is returned, but the audit row and its rate-limit count disappear.
+**Rolled-back lookups aren't counted (accepted for v1, risk RR-1).** Someone holding the vault's own database role (adversary B, in practice a compromised vault process) can look a card up inside a transaction and roll it back, which erases the audit row and its rate-limit count. The platform can't do this, `pgaudit` still records every call, and an audit write outside the caller's transaction is planned for v1.1. The full entry, with the compensating controls, the decision, its owner and the revisit trigger, is in the [risk register](docs/risk-register.md).
 
-- The platform (adversary A) can't do this, because it only reaches the database through the vault's single-statement calls.
-- Postgres audit logging (`pgaudit`) still records every call in Cloud Logging, whether or not it's rolled back, so the trail survives. The rate limit does not.
-- The fix is an audit write that sits outside the caller's transaction (for example via `dblink`). It's planned for v1.1.
-
-**CVV and multiple instances.** The CVV cache lives in each instance's memory. If a `/proxy` call lands on a different instance than the `/tokenize` call, the CVV isn't available, and a request that uses `{{cvv}}` gets `409 {"error":"cvv unavailable"}`. The platform can resend it without the CVV field. This is a deliberate trade-off: sharing the CVV between instances would mean storing it somewhere.
+**CVV and multiple instances.** The CVV cache lives in each instance's memory. If a `/proxy` call lands on a different instance than the `/tokenize` call, the CVV isn't available, and a request that uses `{{cvv}}` gets `409 {"error":"cvv unavailable"}`. The platform can resend it without the CVV field. The same goes for dropping it: a provider's 2xx drops the CVV only on the instance that handled the `/proxy` call, so a CVV cached on another instance stays until it expires, about 16 minutes at most. This is a deliberate trade-off: sharing the CVV between instances would mean storing it somewhere.
 
 **Hand-off tokens can be saved by the platform.** After the vault returns a single-use token, the platform could use its own provider keys to save the card at the provider. The vault never sees that call, so this is a platform rule, not a vault control. See [§7.4](#74-what-the-vault-cannot-enforce-hand-off-tokens).
 
 **The checkout page stays partly in scope.** See [§5](#5-how-the-vault-shrinks-our-scope).
 
-**Planned for v1.1:** re-encrypting old cards under the newest key (`rewrap_card`), a retention and purge function with its own role, and Cloud Armor tuning from real traffic.
+**Planned for v1.1:** re-encrypting old cards under the newest key (`rewrap_card`), rewrapping existing DEKs under the newest KMS key version, the audit write outside the caller's transaction that closes RR-1, a retention and purge function with its own role, and Cloud Armor tuning from real traffic.
 
 **Next catalog entries:** Adyen, Mercado Pago, PayU Latam and Pagar.me, each after sandbox verification. An `xml` body format and more named signers will be added only when a real provider needs them.
 
@@ -695,7 +709,7 @@ sequenceDiagram
 
 ### The short version
 
-Everything is driven by `make`. `make ci` runs the checks every change must pass, and `make ci-all` adds the database, `stripe-mock` and reproducible-image checks. The vault reads its settings only from environment variables. The list of payment providers and accounts lives in `catalog.json`, which is built into the binary. Adding a provider or an account means editing that file, adding its secret to Secret Manager and updating the egress host list. No Go code changes.
+Everything is driven by `make`. `make ci` runs the checks every change must pass, and `make ci-all` adds the database, `stripe-mock` and reproducible-image checks. The vault reads its settings only from environment variables. The list of payment providers and accounts lives in `catalog.json`, which is built into the binary. Adding a provider or an account means editing that file, adding its secret to Secret Manager and updating the egress host list. No Go code changes. GitHub Actions runs the same checks on every pull request, and opt-in git hooks (`make hooks`) run the quick ones before each commit and push.
 
 ### The deeper dive
 
@@ -708,13 +722,23 @@ Everything is driven by `make`. `make ci` runs the checks every change must pass
 | `make lint` | gofmt, go vet, staticcheck (pinned, installed into `.tools/`) |
 | `make vuln` | govulncheck |
 | `make deps-check` / `make vendor-check` | Dependency allowlist, go.sum baseline, vendored code matches upstream |
-| `make ci` | lint + vuln + deps-check + vendor-check + test + build |
+| `make docs-check` | The three READMEs repeat none of the retired claims and have the same number of headings, table rows and Mermaid diagrams |
+| `make comment-check` | No Go file refers to the spec or the design documents (`SPEC-DECISION`, `§`, `design doc`) |
+| `make gitleaks` | Secret scan of the whole git history (gitleaks, pinned, allowlist in `.gitleaks.toml`) |
+| `make ci` | lint + vuln + deps-check + vendor-check + docs-check + comment-check + gitleaks + test + build |
 | `make itest` | Starts Postgres 18 in Docker, applies `schema.sql`, runs the DB and end-to-end tests. Override the port with `PG_PORT=…`. |
 | `make stripe-mock-test` | Sends platform-built requests through the embedded `catalog.json`'s Stripe endpoints to the official `stripe-mock`. Override the port with `STRIPE_MOCK_PORT=…`. |
 | `make image` / `make image-repro` | Builds the scratch image and prints its digest, or builds it twice and checks the digests match |
 | `make ci-all` | Everything above |
+| `make fuzz` / `make fuzz-long` | Runs each fuzz target for 20 seconds, or for `FUZZTIME` (default 10 minutes). A failing input is saved under `testdata/fuzz/`; commit it with the fix and `make test` replays it. |
+| `make commit-check` | Checks every commit message in `COMMIT_RANGE` (default `origin/main..HEAD`) against the conventional-commit rule |
+| `make hooks` | Installs the git hooks (lefthook) into this clone |
 
 `TestStripeLive` sends the same requests to the real Stripe test-mode API. It runs only when `VAULT_TEST_STRIPE_SECRET` holds a test-mode key (`sk_test_…`), which is never printed.
+
+**Continuous integration.** Four GitHub Actions workflows, each with its badge at the top of this file, are the required checks: **CI** (`make ci`, plus a job that runs `make commit-check` over the commits of the pull request or push), **Integration** (`make itest` and `make stripe-mock-test`), **Image** (`make image-repro`, then `make image`, keeping the digest as a build artifact) and **Fuzz** (`make fuzz` on pull requests, `make fuzz-long` nightly). Branch protection on `main` should require all four.
+
+**Git hooks.** `make hooks` installs [lefthook](https://github.com/evilmartians/lefthook) hooks into your clone (opt-in). Before each commit they check that the staged Go files are gofmt-formatted, scan the staged changes with gitleaks, and reject Go files that refer to the spec or the design documents. Each commit message must be a conventional commit (`feat: …`, `fix(scan): …`, with at most 72 characters after the type), and each push runs `make ci`. CI runs every one of these checks too, so skipping a hook doesn't skip the check.
 
 #### 11.1 Configuration (environment only)
 
@@ -782,9 +806,9 @@ The service is one Go package (`package main`) at the repo root:
 - `proxy.go`: the internal `POST /proxy` and `GET /healthz`.
 - `db.go`: calls to the four SQL functions.
 
-Tests sit next to the code in matching `*_test.go` files (`boot_test.go` covers `main.go` and `gcp.go`; `integration_test.go` holds the database, end-to-end and Stripe tests). Shared test helpers and the leak-scanning `TestMain` are in `helpers_test.go`.
+Tests sit next to the code in matching `*_test.go` files (`boot_test.go` covers `main.go` and `gcp.go`; `integration_test.go` holds the database, end-to-end and Stripe tests; `fuzz_test.go` holds the fuzz targets, with their saved inputs under `testdata/fuzz/`). Shared test helpers and the leak-scanning `TestMain` are in `helpers_test.go`.
 
-Other files: `catalog.json` (providers and accounts, compiled in), `egress-hosts.dev.txt` / `egress-hosts.prod.txt` (egress hosts per environment, checked against the catalog), `schema.sql` (tables, functions and roles, applied by CI as `vault_owner`), `Makefile`, `Dockerfile`, `deps-baseline.txt`, `vendor/`, `CLAUDE.md` (rules for AI coding agents, including the catalog review checklist and the known limitations), `docs/superpowers/specs/` (design documents).
+Other files: `catalog.json` (providers and accounts, compiled in), `egress-hosts.dev.txt` / `egress-hosts.prod.txt` (egress hosts per environment, checked against the catalog), `schema.sql` (tables, functions and roles, applied by CI as `vault_owner`), `Makefile`, `Dockerfile`, `deps-baseline.txt`, `vendor/`, `CLAUDE.md` (rules for AI coding agents, including the catalog review checklist and the known limitations), `LICENSE` (MIT), `lefthook.yml` (git hooks), `.gitleaks.toml` (secret-scan allowlist), `scripts/` (the commit-message and comment checks shared by the hooks and CI), `.github/workflows/` (CI, Integration, Image, Fuzz), `docs/` (the security architecture review and the risk register).
 
 ---
 

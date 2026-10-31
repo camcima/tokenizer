@@ -1,0 +1,48 @@
+name: Image
+
+# make image-repro builds the scratch image twice without cache and fails if the digests differ.
+# make image then builds it once more and prints its digest, which is kept as a build artifact so
+# a deployed image can be matched to the commit that produced it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: make image-repro
+        run: make image-repro
+
+      # The last line make image prints is the image ID (sha256:<64 hex>).
+      - name: make image
+        shell: bash
+        run: |
+          make image | tee image-build.log
+          tail -n 1 image-build.log > image-digest.txt
+          grep -qE '^sha256:[0-9a-f]{64}$' image-digest.txt || { echo "image: no digest printed"; exit 1; }
+          cat image-digest.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-digest
+          path: image-digest.txt
+          if-no-files-found: error

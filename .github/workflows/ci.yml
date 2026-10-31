@@ -1,0 +1,64 @@
+name: CI
+
+# make ci: gofmt, go vet, staticcheck, govulncheck, the dependency and vendor checks, docs-check,
+# the comment rule, gitleaks over the full history, unit tests with the race detector, and the
+# build. The commits job applies the commit-msg hook's rule to every commit the event brings, so
+# each check a git hook enforces locally also fails CI.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # gitleaks scans every commit, not just the checked-out tree
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: make ci
+        run: make ci
+
+  commits:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Pull requests: the branch's own commits (base..head, not the synthetic merge commit
+      # GitHub checks out). Pushes to main: the pushed range, or only the pushed commit when the
+      # push has no previous commit (a new branch).
+      - name: make commit-check
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          PUSH_SHA: ${{ github.sha }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            range="$BASE_SHA..$HEAD_SHA"
+          elif [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = 0000000000000000000000000000000000000000 ]; then
+            range="$PUSH_SHA^!"
+          else
+            range="$BEFORE_SHA..$PUSH_SHA"
+          fi
+          make commit-check COMMIT_RANGE="$range"

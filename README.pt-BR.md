@@ -2,6 +2,8 @@
 
 *[Read this in English](README.md) · [Leer en español](README.es.md)*
 
+[![CI](https://github.com/camcima/tokenizer/actions/workflows/ci.yml/badge.svg)](https://github.com/camcima/tokenizer/actions/workflows/ci.yml) [![Integration](https://github.com/camcima/tokenizer/actions/workflows/integration.yml/badge.svg)](https://github.com/camcima/tokenizer/actions/workflows/integration.yml) [![Image](https://github.com/camcima/tokenizer/actions/workflows/image.yml/badge.svg)](https://github.com/camcima/tokenizer/actions/workflows/image.yml) [![Fuzz](https://github.com/camcima/tokenizer/actions/workflows/fuzz.yml/badge.svg)](https://github.com/camcima/tokenizer/actions/workflows/fuzz.yml) [![Go version](https://img.shields.io/github/go-mod/go-version/camcima/tokenizer)](go.mod) [![License](https://img.shields.io/github/license/camcima/tokenizer)](LICENSE)
+
 Um serviço pequeno e de propósito único que mantém os números de cartão de crédito fora do restante da nossa plataforma de pagamentos.
 
 O navegador entrega o cartão ao vault. O vault o guarda a sete chaves e devolve um **token** sem significado. A partir daí, a plataforma só lida com tokens. Quando um provedor de pagamentos como a Stripe precisa do cartão real, a plataforma escreve a requisição para o provedor com lacunas onde vai o cartão e pede ao vault que as preencha e faça a chamada. O vault verifica cada requisição contra uma lista revisada do que é permitido, e o número do cartão nunca passa pela plataforma.
@@ -109,7 +111,7 @@ Duas propriedades diferenciam este vault de um simples serviço de "criptografar
 1. **Ele nunca retorna um número de cartão.** Não existe endpoint de "detokenize", nem mesmo um de administração ou de debug.
 2. **Ele age sobre o cartão em vez de entregá-lo.** Quem chama monta a requisição para o provedor com **placeholders** como `{{pan}}` e informa um token. O vault verifica a requisição contra um **catálogo** revisado e compilado no binário, com os endpoints e campos permitidos, preenche o cartão e sua própria credencial do provedor e a envia a um host escolhido pelo catálogo.
 
-É esse design de "fazer proxy, não revelar" que mantém a plataforma fora do escopo PCI.
+Esse design de "fazer proxy, não revelar" foi pensado para manter o back-end da plataforma fora do escopo PCI, sujeito à definição de escopo feita pelo assessor. A página de checkout é outra questão (veja [§5](#5-como-o-vault-reduz-nosso-escopo)).
 
 ---
 
@@ -150,7 +152,7 @@ A ideia central é o **escopo**. As regras se aplicam integralmente a todo siste
 - **Dado de cartão criptografado continua sendo dado de cartão.** Ele permanece em escopo, a menos que o sistema que o guarda não tenha acesso às chaves de descriptografia. É por isso que o vault mantém sua chave de criptografia de chaves em um projeto separado, em um hardware security module.
 - **Sistemas "conectados" também estão em escopo.** Um sistema que consegue alcançar o CDE, ou que poderia afetar sua segurança, é incluído, a menos que esteja devidamente segmentado.
 - **Tokens não são dados de cartão.** Um sistema que só lida com tokens, e não consegue usá-los para recuperar o cartão, pode sair do escopo. A orientação de tokenização do PCI SSC descreve isso.
-- **Dados de autenticação sensíveis (o CVV) não podem ser armazenados após a autorização**, nem mesmo criptografados. O vault os mantém apenas em memória, por no máximo 15 minutos, e os usa no máximo uma vez.
+- **Dados de autenticação sensíveis (o CVV) não podem ser armazenados após a autorização**, nem mesmo criptografados. O vault os mantém apenas em memória e os usa no máximo uma vez. Eles expiram 15 minutos após a tokenização e são apagados da memória cerca de um minuto depois, a menos que tenham sido usados ou descartados antes.
 
 > A palavra final sobre o escopo é sempre do seu assessor. Este documento explica como o vault foi projetado para minimizar o escopo; ele não é uma determinação de conformidade.
 
@@ -258,7 +260,7 @@ flowchart LR
 | Vault → KMS | A chave de criptografia de chaves fica em outro projeto e nunca sai do HSM. |
 | Vault → internet | Apenas os hosts das contas do catálogo deste ambiente, imposto no código e pelo firewall de egress da VPC. |
 
-**Uma ressalva honesta sobre a página de checkout.** O número do cartão passa, sim, pelo navegador do cliente, dentro de uma página servida pela nossa plataforma. Quem controla o JavaScript dessa página poderia, em teoria, mudar o destino do cartão. Por isso, a página que hospeda o formulário do cartão, e os sistemas que a servem, normalmente continuam em um escopo reduzido (comparável ao SAQ A-EP para um merchant). O PCI DSS v4.0 também adiciona requisitos de gestão e monitoramento de scripts em páginas de pagamento. O vault tira o back-end (APIs, bancos de dados, filas, logs, workers) do escopo. Ele não tira a própria página de pagamento. Servir o formulário do cartão a partir de uma origem controlada pelo vault, por exemplo em um iframe, reduziria isso ainda mais e é um possível passo futuro.
+**Uma ressalva honesta sobre a página de checkout.** O número do cartão passa, sim, pelo navegador do cliente, dentro de uma página servida pela nossa plataforma. Quem controla o JavaScript dessa página poderia, em teoria, mudar o destino do cartão. Por isso, a página que hospeda o formulário do cartão, e os sistemas que a servem, normalmente continuam em um escopo reduzido (comparável ao SAQ A-EP para um merchant). O PCI DSS v4.0 também adiciona requisitos de gestão e monitoramento de scripts em páginas de pagamento. O vault foi pensado para tirar o back-end (APIs, bancos de dados, filas, logs, workers) do escopo, sujeito à definição de escopo feita pelo assessor. Ele não tira a própria página de pagamento. Servir o formulário do cartão a partir de uma origem controlada pelo vault, por exemplo em um iframe, reduziria isso ainda mais e é um possível passo futuro.
 
 ---
 
@@ -300,7 +302,7 @@ sequenceDiagram
     V-->>B: 204, somente se o Origin corresponder exatamente
     B->>V: POST /tokenize {pan, exp_month, exp_year, cvv?, name?}<br/>Authorization: Bearer session-token
     Note over V: Verificações em ordem: path, método,<br/>sem query string, Origin, token de sessão,<br/>content type, tamanho ≤ 4 KiB, JSON estrito,<br/>Luhn + comprimento, validade não vencida, formato do CVV, nome
-    Note over V: token = tok_ + 32 hex aleatórios<br/>ciphertext = AES-256-GCM(DEK atual, {pan, exp, name?})
+    Note over V: token = tok_ + 32 hex aleatórios (gerado primeiro)<br/>ciphertext = AES-256-GCM(DEK atual, {pan, exp, name?},<br/>dados adicionais = pan-vault/card/1 + NUL + token)
     V->>DB: vault.put_card(token, ciphertext, last4, key_version)
     Note over DB: insere o cartão + linha de auditoria
     Note over V: CVV → somente memória,<br/>uso único, 15 min
@@ -310,7 +312,7 @@ sequenceDiagram
 
 Detalhes importantes:
 
-- **O CVV nunca é armazenado.** Ele fica em um cache em memória, é apagado quando lido e expira após 15 minutos. Entradas expiradas são removidas a cada escrita.
+- **O CVV nunca é armazenado.** Ele fica em um cache em memória, como bytes que são sobrescritos quando a entrada é removida (melhor esforço, como toda limpeza de memória em Go). Ele é removido quando uma chamada a `/proxy` o lê, quando o provedor aceita com um 2xx qualquer chamada a `/proxy` para aquele cartão (veja 6.2 abaixo), ou quando expira, 15 minutos após a tokenização. Entradas expiradas são removidas a cada 60 segundos e também a cada escrita, então mesmo uma instância ociosa guarda um CVV expirado por no máximo cerca de um minuto. O cache guarda no máximo 50.000 CVVs. Quando está cheio, `/tokenize` ainda armazena o cartão e retorna 200, mas não guarda o CVV em cache e registra `ALERT cvv_cache_full` (no máximo uma vez por segundo). Uma requisição posterior com `{{cvv}}` para esse cartão recebe o 409 de sempre. CVVs válidos nunca são descartados para abrir espaço.
 - **O nome do titular é opcional.** Se informado, deve ter de 1 a 100 caracteres de UTF-8 válido, sem caracteres de controle (`"name": null` é rejeitado). Ele é criptografado junto com o cartão e só é usado quando uma requisição ao provedor tem um placeholder `{{name}}`. O próprio vault nunca o retorna, mas a resposta de um provedor pode ecoá-lo (o `card.name` de um token da Stripe, por exemplo), e essa resposta chega à plataforma como está: o vault mascara apenas números de cartão, não nomes. Um cartão tokenizado sem nome não consegue preencher `{{name}}`: essa chamada a `/proxy` recebe `409 {"error":"name unavailable"}`.
 - **Uma query string é rejeitada de imediato.** Isso garante que um número de cartão nunca vá parar em uma URL e, portanto, nunca em nenhum log baseado em URL pelo caminho.
 - **O navegador recebe o mesmo formato de erro, seja qual for o problema**: `{"error":"invalid pan"}` e semelhantes. Esse formato nunca ecoa a entrada.
@@ -378,9 +380,10 @@ Detalhes importantes:
 - **A conta escolhe o destino e a credencial.** A plataforma informa o nome de uma conta, como `stripe_test`. A URL é sempre `https://` + o host da conta + seu base path + o path da requisição, e o vault verifica de novo o scheme e o host depois de montá-la. A plataforma não pode indicar um host.
 - **A credencial é do vault.** Os secrets das contas são carregados do Secret Manager no boot. Um header de credencial deve ser exatamente seu template do catálogo (por exemplo `Authorization: Bearer {{secret:secretKey}}`). A plataforma pode enviar essa string de template ou omitir o header, e o vault a renderiza em ambos os casos. Qualquer outro valor, incluindo um `authorization: Bearer sk_attacker` em minúsculas, é rejeitado. Da mesma forma, um campo de credencial no body aceita apenas seu placeholder do vault. Nenhum header HTTP da própria chamada a `/proxy` é usado.
 - **Os headers da plataforma vão em `request.headers`, e só três são permitidos:** `Accept`, `Idempotency-Key` e `X-Idempotency-Key`, cada um com 1 a 1024 bytes de ASCII imprimível. Qualquer outro header é rejeitado com `header not allowed`, e não descartado silenciosamente, para que bugs da plataforma apareçam. O próprio vault define `Host`, `Content-Type` (a partir do formato do provedor), `Content-Length` e `User-Agent: pan-vault/1`. Só o status, o `Content-Type` e o body voltam.
-- **O CVV é usado no máximo uma vez, e só quando todas as verificações passam.** Se o body usa `{{cvv}}` e não há CVV em cache (já usado, expirado ou tokenizado em outra instância), a resposta é `409 {"error":"cvv unavailable"}`. A plataforma reenvia sem o campo do CVV, por exemplo para uma cobrança com cartão salvo. O vault nunca edita o body para remover um campo.
+- **O CVV é usado no máximo uma vez, e só quando todas as verificações passam.** Se o body usa `{{cvv}}` e não há CVV em cache (já usado, expirado ou tokenizado em outra instância), a resposta é `409 {"error":"cvv unavailable"}`. A plataforma reenvia sem o campo do CVV, por exemplo para uma cobrança com cartão salvo. O vault nunca edita o body para remover um campo. Uma resposta 2xx do provedor significa que o cartão saiu do vault, então o vault também descarta qualquer CVV ainda em cache para aquele token, tenha a requisição usado `{{cvv}}` ou não, e mesmo quando depois se recusa a repassar a resposta (uma resposta comprimida vira um `502`). Uma nova tentativa que use `{{cvv}}` recebe então o 409. Qualquer outro status mantém em cache um CVV não usado para uma nova tentativa. O descarte só alcança a instância que guarda o CVV. `/tokenize` e `/proxy` chegam por load balancers diferentes, então um CVV em cache em outra instância fica lá até expirar: 15 minutos após a tokenização mais no máximo uma varredura, cerca de 16 minutos no pior caso.
+- **Cada ciphertext só abre com o próprio token.** Um cartão é criptografado com seu token como dados adicionais do AES-GCM (`pan-vault/card/1`, um byte NUL e depois o token). Um ciphertext copiado para a linha de outro token não é descriptografado e recebe `500` e `ALERT decrypt_failed`. Nada é enviado ao provedor. Se a versão de chave do cartão for uma que esta instância ainda não tem (uma chave adicionada há instantes), o vault primeiro atualiza suas chaves a partir do banco de dados, no máximo uma vez a cada 10 segundos (veja §9). Isso pode segurar a requisição por até cerca de 30 segundos, dentro do write timeout de 60 segundos do listener interno. Se uma atualização lenta for seguida de um provedor lento, esse timeout pode expirar antes de a resposta ser escrita. A plataforma deve tratar isso como qualquer timeout do provedor e tentar de novo com o mesmo `Idempotency-Key`.
 - **As rejeições são específicas e nunca ecoam a entrada.** Uma falha de política é um `400` com uma mensagem fixa: `unknown account`, `endpoint not allowed`, `header not allowed`, `invalid placeholder use`, `pinned field mismatch`, `forbidden field` ou `invalid request body`. Uma vez conhecida a conta, toda falha de regra também dispara `ALERT proxy_policy` (veja [§7.6](#76-nada-sensível-nos-logs-por-construção)). Uma conta desconhecida, um token malformado ou um envelope malformado é rejeitado sem alerta.
-- **Redirects nunca são seguidos.** O vault ignora `HTTP_PROXY`, recusa respostas comprimidas que não consegue inspecionar e nunca retorna um body truncado.
+- **Redirects nunca são seguidos.** O vault ignora `HTTP_PROXY`, recusa respostas comprimidas que não consegue inspecionar e nunca retorna um body truncado. O mascaramento cobre apenas números de cartão (contínuos, com espaços ou com hífens). Qualquer outra coisa que um provedor retorne, como um nome ou uma mensagem de erro, chega à plataforma como está, e é por isso que as respostas documentadas de cada endpoint do catálogo são revisadas antes de ele ser adicionado.
 
 #### 6.3 A vida de um cartão
 
@@ -457,7 +460,7 @@ flowchart TB
         A1["Token de sessão + Origin exato<br/>Validação estrita, strings de erro fixas<br/>Regras do catálogo: posições, pins, forbid, allowlist de headers<br/>Credenciais mantidas pelo vault, invariante de egress<br/>Sem redirects, sem proxies, mascaramento de respostas"]
     end
     subgraph L4["Dados"]
-        D1["Role do DB: EXECUTE em 4 funções, sem tabelas<br/>Limites de velocidade + auditoria dentro do DB<br/>Lookups serializados (advisory lock)"]
+        D1["Role do DB: EXECUTE em 3 funções, sem tabelas<br/>Limites de velocidade + auditoria dentro do DB<br/>Lookups serializados (advisory lock)"]
     end
     subgraph L5["Chaves"]
         K1["AES-256-GCM por registro<br/>DEKs encapsuladas por uma chave HSM em outro projeto<br/>Nenhuma chave de service account em lugar algum"]
@@ -522,9 +525,10 @@ Há exatamente uma linha de log de acesso por requisição:
 | `ALERT proxy_policy account=… endpoint=… reason=…` | Uma requisição a `/proxy` violou uma regra do catálogo. `reason` é um de `endpoint`, `header`, `body`, `placeholder`, `pin` ou `forbidden_field`, e `endpoint=-` significa que nenhum endpoint correspondeu. Possível plataforma comprometida. No máximo uma linha por segundo. |
 | `ALERT velocity token=… caller=… account=…` | Um limite de lookups foi atingido. Possível extração em massa. |
 | `ALERT pan_echo account=… endpoint=… token=…` | Um provedor ecoou um número de cartão. Ele foi mascarado, mas investigue. |
-| `ALERT decrypt_failed token=… key_version=… account=…` | Corrupção do ciphertext ou da chave. Isso nunca deveria acontecer. |
+| `ALERT decrypt_failed token=… key_version=… account=…` | Corrupção do ciphertext ou da chave, ou um ciphertext copiado para a linha de outro token. Isso nunca deveria acontecer. |
 | `ALERT egress_invariant account=…` | Uma requisição estava prestes a sair para um host inesperado. Isso deveria ser inalcançável. |
 | `ALERT session_token_invalid reason=…` | Token de sessão inválido, expirado ou forjado. No máximo uma linha por segundo. |
+| `ALERT cvv_cache_full` | O cache de CVV está cheio (50.000 entradas). Novos cartões continuam sendo armazenados, mas o CVV deles não vai para o cache. Possível enxurrada de `/tokenize`. No máximo uma linha por segundo. |
 
 A suíte de testes comprova isso. Todo teste registra logs em um buffer compartilhado. Ao final da execução, o buffer é varrido em busca de qualquer sequência de 13 a 19 dígitos que passe na verificação de Luhn, incluindo sequências com espaços ou hífens e sequências escondidas dentro de cadeias de dígitos mais longas. Ele também é varrido em busca do CVV de teste, dos secrets de provedor de teste e do nome de titular de teste. Qualquer ocorrência quebra o build.
 
@@ -594,7 +598,7 @@ flowchart TB
     DEK2 -- "AES-256-GCM" --> C2
 ```
 
-*Por quê:* o banco de dados guarda apenas ciphertext e chaves encapsuladas. Desencapsular exige uma chamada ao KMS em outro projeto, com seu próprio IAM e seus próprios audit logs. Uma nova chave de dados é criada diariamente, e a chave do KMS é rotacionada a cada 90 dias. Cada registro usa um nonce aleatório novo de 12 bytes. *Trade-off:* o boot depende da disponibilidade do KMS, e as chaves de dados antigas são mantidas para que os cartões antigos continuem legíveis. A recriptografia das linhas antigas está planejada para a v1.1.
+*Por quê:* o banco de dados guarda apenas ciphertext e chaves encapsuladas. Desencapsular exige uma chamada ao KMS em outro projeto, com seu próprio IAM e seus próprios audit logs. Cada registro usa um nonce aleatório novo de 12 bytes e carrega seu token como dados adicionais autenticados (`pan-vault/card/1`, um byte NUL e depois o token), então um ciphertext só é descriptografado com o token com que foi gravado. Recomendamos uma nova chave de dados por mês. Assim cada chave cobre cerca de um mês de cartões, o que mantém pequeno o conjunto de chaves antigas que cada instância desencapsula no boot (umas doze por ano), ao custo de uma chave de dados exposta revelar até um mês de cartões em vez de um dia. A chave do KMS é rotacionada a cada 90 dias. O decrypt do KMS aceita versões mais antigas da chave, então as DEKs encapsuladas continuam legíveis após uma rotação do KMS, mas continuam encapsuladas pela versão que as encapsulou: reencapsular as DEKs existentes com a versão mais recente da chave do KMS é trabalho da v1.1. *Trade-off:* o boot depende da disponibilidade do KMS, e as chaves de dados antigas são mantidas para que os cartões antigos continuem legíveis. A recriptografia das linhas antigas está planejada para a v1.1.
 
 **Dois listeners, dois modelos de confiança.**
 *Por quê:* o listener voltado para o navegador e o listener voltado para a plataforma têm chamadores completamente diferentes. Portas, configurações de TLS e handlers separados significam que um bug de um lado não consegue expor o outro. *Trade-off:* dois load balancers para operar.
@@ -646,23 +650,37 @@ sequenceDiagram
     J->>KMS: decrypt(wrapped), verifica o round trip
     J->>DB: vault.add_dek(wrapped) → versão N+1
     J-->>J: imprime a versão, encerra
-    Note over V: o restart gradual adota a DEK N+1 como atual,<br/>DEKs mais antigas continuam carregando, então cartões antigos continuam sendo descriptografados
+    Note over V: cada instância carrega a DEK N+1 em até 5 minutos,<br/>ou na hora, quando chega um cartão cifrado com ela.<br/>DEKs mais antigas continuam carregadas, então cartões antigos continuam sendo descriptografados
 ```
+
+**Cronograma de rotação e atualização de chaves.** Rode `vault -rotate-dek` uma vez por mês (o trade-off está em [§8](#8-por-que-ele-foi-construído-dessa-forma)). Depois disso, nenhum restart é necessário. Toda instância relê a lista de chaves a cada 5 minutos, e uma instância que encontra um cartão cifrado com uma versão de chave que ela não tem atualiza na hora, no máximo uma vez a cada 10 segundos, com limite de 30 segundos por atualização. Chaves novas se somam às que a instância já tem e nenhuma é removida, então um restart gradual não é mais necessário e não causa mais `decrypt_failed`. Resta um caso: se o KMS estiver inacessível quando uma instância precisar da chave nova pela primeira vez, ou se a última atualização dessa instância tiver terminado menos de 10 segundos antes, quando a chave ainda não existia, essa única requisição falha com `decrypt_failed`. Uma nova tentativa alguns segundos depois funciona.
 
 **Respondendo a alertas:**
 
 | Alerta | Severidade | Primeiros passos |
 |---|---|---|
 | `pan_echo` | Acionar o plantão imediatamente | Descobrir qual conta e qual endpoint ecoaram um número de cartão. O vault o mascarou, mas confirme que nada mais o capturou. |
-| `decrypt_failed` | Acionar o plantão imediatamente | Possível corrupção de chave ou de dados. Verifique o estado da chave no KMS e as versões de DEK. |
+| `decrypt_failed` | Acionar o plantão imediatamente | Possível corrupção de chave ou de dados, ou um ciphertext copiado para a linha de outro token. Verifique o estado da chave no KMS e as versões de DEK. |
 | `egress_invariant` | Acionar o plantão imediatamente | Deveria ser impossível. Trate como um possível comprometimento do binário do vault. |
 | `proxy_policy` | Acionar o plantão | A plataforma enviou uma requisição que o catálogo proíbe. Possível plataforma comprometida. Correlacione com as linhas de log de acesso de `/proxy` com `status=400` no mesmo horário para encontrar o certificado de cliente (`caller=`). Um pico logo após um deploy da plataforma provavelmente é um bug da plataforma. |
 | `velocity` | Acionar o plantão | Possível tentativa de extração em massa. Verifique qual serial de certificado de cliente (`caller=`) fez os lookups. |
 | `session_token_invalid` (pico de taxa) | Notificar | Card testing ou checkout mal configurado. Verifique o Cloud Armor. |
+| `cvv_cache_full` | Notificar | O cache de CVV atingiu o limite de 50.000 entradas. Os checkouts continuam funcionando, mas cartões tokenizados nesse meio-tempo não têm CVV em cache, então requisições com `{{cvv}}` para eles recebem 409. Verifique o Cloud Armor e o tráfego de `/tokenize` em busca de uma enxurrada. |
 
 **Pré-requisitos de deploy:**
 
 - **TLS do banco de dados.** Em produção, `VAULT_DB_URL` precisa verificar o certificado do servidor, ou o vault não sobe. Use `sslmode=verify-ca&sslrootcert=/path/to/server-ca.pem` com a CA de servidor do Cloud SQL. `verify-full` normalmente falha contra um IP privado.
+- **Identidades no Cloud SQL.** O vault e o job de rotação rodam cada um com sua própria service account do IAM, por exemplo `pan-vault@pci-cde-<env>.iam.gserviceaccount.com` (serviço) e `pan-vault-rotator@pci-cde-<env>.iam.gserviceaccount.com` (rotação). Cada uma é adicionada à instância do Cloud SQL como usuário de banco de dados do IAM, cujo nome de usuário no Postgres é o e-mail da conta sem `.gserviceaccount.com`. Em seguida o pipeline de migrações, conectado como `vault_owner`, concede a cada uma sua role:
+
+  ```sql
+  GRANT vault_app     TO "pan-vault@pci-cde-<env>.iam";
+  GRANT vault_rotator TO "pan-vault-rotator@pci-cde-<env>.iam";
+  ```
+
+  `VAULT_DB_URL` usa esse nome de usuário do IAM, codificado para URL e sem senha, por exemplo `postgres://pan-vault%40pci-cde-<env>.iam@<private-ip>:5432/vault?sslmode=verify-ca&sslrootcert=…`. Em produção, o vault envia como senha o access token da sua service account (autenticação de banco de dados do IAM no Cloud SQL).
+- **Smoke test no Cloud SQL.** Antes do primeiro deploy em um ambiente, e depois de qualquer mudança nos seus usuários do IAM ou roles de banco, verifique contra a instância real do Cloud SQL que a conta de serviço consegue fazer login com seu token do IAM e chamar `put_card`, `get_card` e `list_deks`, mas não consegue ler nenhuma tabela nem chamar `add_dek`, e que a conta do rotator consegue chamar `add_dek`. Isso é uma etapa do pipeline de deploy, não um teste deste repositório.
+- **Uma conta revisada para o ambiente.** O vault se recusa a subir quando o catálogo não tem nenhuma conta para o seu `VAULT_ENV` (`catalog has no accounts for env=prod`), porque um vault que não consegue enviar um cartão para lugar nenhum pareceria saudável mesmo assim. Por isso, o primeiro deploy em prod precisa de uma conta de prod revisada em `catalog.json`, com seu host em `egress-hosts.prod.txt`.
+- **Health checks.** Os load balancers verificam os dois listeners com health checks TCP simples: a porta aceita conexões. A prontidão real é verificada à parte, por um monitor que tem um certificado de cliente da plataforma e chama `GET /healthz` via mTLS, o que também testa a cadeia de certificados e o banco de dados. De propósito, não existe rota de saúde sem autenticação. O listener interno exige um certificado de cliente no handshake TLS de toda conexão, e o vault não serve nada além de `/tokenize`, `/proxy` e `/healthz`, então uma rota para as sondas significaria um endpoint novo ou um mTLS mais fraco no listener que serve `/proxy`.
 - **Acesso a dados brutos de cartão em cada provedor.** Por padrão, a Stripe recusa requisições de API que contenham números de cartão completos. O acesso em live mode exige aprovação da Stripe, respaldada por evidências PCI (normalmente um SAQ D ou um Attestation of Compliance). Outros provedores têm barreiras semelhantes, como a "API PCI Payments role" da Adyen.
 - **Secrets das contas.** Todo secret indicado por uma conta do catálogo do ambiente precisa existir no Secret Manager e ser legível pela service account do vault, ou o vault não sobe.
 - **Certificados de cliente da plataforma.** A CA em `VAULT_CLIENT_CA` deve emitir certificados apenas para os serviços da plataforma que têm permissão para chamar `/proxy`.
@@ -673,19 +691,15 @@ sequenceDiagram
 
 ## 10. Limitações conhecidas e próximos passos
 
-**Lookups com rollback não são contados (aceito para a v1).** A linha de auditoria de cada lookup é gravada dentro da transação de banco de dados de quem chama. Alguém de posse da própria role de banco do vault (adversário B) pode consultar um cartão e depois fazer rollback. O cartão é retornado, mas a linha de auditoria e sua contagem no rate limit desaparecem.
+**Lookups com rollback não são contados (aceito para a v1, risco RR-1).** Alguém de posse da própria role de banco do vault (adversário B, na prática um processo do vault comprometido) pode consultar um cartão dentro de uma transação e fazer rollback, o que apaga a linha de auditoria e sua contagem no rate limit. A plataforma não consegue fazer isso, o `pgaudit` continua registrando toda chamada, e uma escrita de auditoria fora da transação de quem chama está planejada para a v1.1. A entrada completa, com os controles compensatórios, a decisão, seu responsável e o gatilho de revisão, está no [registro de riscos](docs/risk-register.md).
 
-- A plataforma (adversário A) não consegue fazer isso, porque só alcança o banco de dados por meio das chamadas de instrução única do vault.
-- O audit logging do Postgres (`pgaudit`) continua registrando toda chamada no Cloud Logging, com ou sem rollback, então a trilha sobrevive. O rate limit, não.
-- A correção é uma escrita de auditoria que fique fora da transação de quem chama (por exemplo via `dblink`). Ela está planejada para a v1.1.
-
-**CVV e múltiplas instâncias.** O cache de CVV vive na memória de cada instância. Se uma chamada a `/proxy` cair em uma instância diferente da chamada a `/tokenize`, o CVV não estará disponível, e uma requisição que usa `{{cvv}}` recebe `409 {"error":"cvv unavailable"}`. A plataforma pode reenviá-la sem o campo do CVV. Esse é um trade-off deliberado: compartilhar o CVV entre instâncias significaria armazená-lo em algum lugar.
+**CVV e múltiplas instâncias.** O cache de CVV vive na memória de cada instância. Se uma chamada a `/proxy` cair em uma instância diferente da chamada a `/tokenize`, o CVV não estará disponível, e uma requisição que usa `{{cvv}}` recebe `409 {"error":"cvv unavailable"}`. A plataforma pode reenviá-la sem o campo do CVV. O mesmo vale para o descarte: o 2xx de um provedor descarta o CVV apenas na instância que atendeu a chamada a `/proxy`, então um CVV em cache em outra instância fica lá até expirar, cerca de 16 minutos no máximo. Esse é um trade-off deliberado: compartilhar o CVV entre instâncias significaria armazená-lo em algum lugar.
 
 **Tokens de hand-off podem ser salvos pela plataforma.** Depois que o vault retorna um token de uso único, a plataforma poderia usar suas próprias chaves do provedor para salvar o cartão no provedor. O vault nunca vê essa chamada, então isso é uma regra da plataforma, não um controle do vault. Veja [§7.4](#74-o-que-o-vault-não-consegue-impor-tokens-de-hand-off).
 
 **A página de checkout continua parcialmente em escopo.** Veja [§5](#5-como-o-vault-reduz-nosso-escopo).
 
-**Planejado para a v1.1:** recriptografar cartões antigos com a chave mais recente (`rewrap_card`), uma função de retenção e expurgo com sua própria role, e ajuste fino do Cloud Armor a partir de tráfego real.
+**Planejado para a v1.1:** recriptografar cartões antigos com a chave mais recente (`rewrap_card`), reencapsular as DEKs existentes com a versão mais recente da chave do KMS, a escrita de auditoria fora da transação de quem chama que fecha o RR-1, uma função de retenção e expurgo com sua própria role, e ajuste fino do Cloud Armor a partir de tráfego real.
 
 **Próximas entradas do catálogo:** Adyen, Mercado Pago, PayU Latam e Pagar.me, cada uma após a verificação no sandbox. Um formato de body `xml` e mais signers nomeados só serão adicionados quando um provedor real precisar deles.
 
@@ -695,7 +709,7 @@ sequenceDiagram
 
 ### A versão curta
 
-Tudo é conduzido por `make`. `make ci` executa as verificações pelas quais toda mudança precisa passar, e `make ci-all` adiciona as verificações de banco de dados, de `stripe-mock` e de imagem reproduzível. O vault lê suas configurações apenas de variáveis de ambiente. A lista de provedores de pagamento e de contas fica em `catalog.json`, que é embutido no binário. Adicionar um provedor ou uma conta significa editar esse arquivo, adicionar o secret correspondente no Secret Manager e atualizar a lista de hosts de egress. Nenhuma mudança em código Go.
+Tudo é conduzido por `make`. `make ci` executa as verificações pelas quais toda mudança precisa passar, e `make ci-all` adiciona as verificações de banco de dados, de `stripe-mock` e de imagem reproduzível. O vault lê suas configurações apenas de variáveis de ambiente. A lista de provedores de pagamento e de contas fica em `catalog.json`, que é embutido no binário. Adicionar um provedor ou uma conta significa editar esse arquivo, adicionar o secret correspondente no Secret Manager e atualizar a lista de hosts de egress. Nenhuma mudança em código Go. O GitHub Actions executa as mesmas verificações em todo pull request, e git hooks opcionais (`make hooks`) executam as rápidas antes de cada commit e de cada push.
 
 ### Em profundidade
 
@@ -708,13 +722,23 @@ Tudo é conduzido por `make`. `make ci` executa as verificações pelas quais to
 | `make lint` | gofmt, go vet, staticcheck (versão fixada, instalado em `.tools/`) |
 | `make vuln` | govulncheck |
 | `make deps-check` / `make vendor-check` | Allowlist de dependências, baseline do go.sum, código vendorizado corresponde ao upstream |
-| `make ci` | lint + vuln + deps-check + vendor-check + test + build |
+| `make docs-check` | Os três READMEs não repetem nenhuma das afirmações retiradas e têm o mesmo número de títulos, linhas de tabela e diagramas Mermaid |
+| `make comment-check` | Nenhum arquivo Go faz referência à spec ou aos documentos de design (`SPEC-DECISION`, `§`, `design doc`) |
+| `make gitleaks` | Varredura de secrets em todo o histórico do git (gitleaks, versão fixada, allowlist em `.gitleaks.toml`) |
+| `make ci` | lint + vuln + deps-check + vendor-check + docs-check + comment-check + gitleaks + test + build |
 | `make itest` | Sobe um Postgres 18 no Docker, aplica `schema.sql` e executa os testes de DB e end-to-end. Altere a porta com `PG_PORT=…`. |
 | `make stripe-mock-test` | Envia requisições montadas pela plataforma, através dos endpoints da Stripe do `catalog.json` embutido, para o `stripe-mock` oficial. Altere a porta com `STRIPE_MOCK_PORT=…`. |
 | `make image` / `make image-repro` | Gera a scratch image e imprime seu digest, ou a gera duas vezes e verifica se os digests coincidem |
 | `make ci-all` | Tudo o que está acima |
+| `make fuzz` / `make fuzz-long` | Executa cada fuzz target por 20 segundos, ou por `FUZZTIME` (padrão 10 minutos). Um input que falha é salvo em `testdata/fuzz/`; faça commit dele junto com a correção e `make test` o executa de novo. |
+| `make commit-check` | Verifica cada mensagem de commit em `COMMIT_RANGE` (padrão `origin/main..HEAD`) contra a regra de conventional commits |
+| `make hooks` | Instala os git hooks (lefthook) neste clone |
 
 `TestStripeLive` envia as mesmas requisições para a API real da Stripe em test mode. Ele só roda quando `VAULT_TEST_STRIPE_SECRET` contém uma chave de test mode (`sk_test_…`), que nunca é impressa.
+
+**Integração contínua.** Quatro workflows do GitHub Actions, cada um com seu badge no topo deste arquivo, são as verificações obrigatórias: **CI** (`make ci`, mais um job que roda `make commit-check` sobre os commits do pull request ou do push), **Integration** (`make itest` e `make stripe-mock-test`), **Image** (`make image-repro` e depois `make image`, guardando o digest como artefato do build) e **Fuzz** (`make fuzz` em pull requests, `make fuzz-long` toda noite). A proteção da branch `main` deve exigir os quatro.
+
+**Git hooks.** `make hooks` instala hooks do [lefthook](https://github.com/evilmartians/lefthook) no seu clone (opcional). Antes de cada commit, eles verificam se os arquivos Go em stage estão formatados com gofmt, varrem as mudanças em stage com o gitleaks e rejeitam arquivos Go que façam referência à spec ou aos documentos de design. Cada mensagem de commit precisa ser um conventional commit (`feat: …`, `fix(scan): …`, com no máximo 72 caracteres depois do tipo), e cada push roda `make ci`. O CI também roda todas essas verificações, então pular um hook não pula a verificação.
 
 #### 11.1 Configuração (somente ambiente)
 
@@ -782,9 +806,9 @@ O serviço é um único pacote Go (`package main`) na raiz do repositório:
 - `proxy.go`: o `POST /proxy` interno e o `GET /healthz`.
 - `db.go`: chamadas às quatro funções SQL.
 
-Os testes ficam ao lado do código, nos arquivos `*_test.go` correspondentes (`boot_test.go` cobre `main.go` e `gcp.go`; `integration_test.go` contém os testes de banco de dados, end-to-end e da Stripe). Os helpers de teste compartilhados e o `TestMain` que faz a varredura de vazamentos ficam em `helpers_test.go`.
+Os testes ficam ao lado do código, nos arquivos `*_test.go` correspondentes (`boot_test.go` cobre `main.go` e `gcp.go`; `integration_test.go` contém os testes de banco de dados, end-to-end e da Stripe; `fuzz_test.go` contém os fuzz targets, com seus inputs salvos em `testdata/fuzz/`). Os helpers de teste compartilhados e o `TestMain` que faz a varredura de vazamentos ficam em `helpers_test.go`.
 
-Outros arquivos: `catalog.json` (provedores e contas, compilado no binário), `egress-hosts.dev.txt` / `egress-hosts.prod.txt` (hosts de egress por ambiente, verificados contra o catálogo), `schema.sql` (tabelas, funções e roles, aplicado pelo CI como `vault_owner`), `Makefile`, `Dockerfile`, `deps-baseline.txt`, `vendor/`, `CLAUDE.md` (regras para agentes de IA de programação, incluindo o checklist de revisão do catálogo e as limitações conhecidas), `docs/superpowers/specs/` (documentos de design).
+Outros arquivos: `catalog.json` (provedores e contas, compilado no binário), `egress-hosts.dev.txt` / `egress-hosts.prod.txt` (hosts de egress por ambiente, verificados contra o catálogo), `schema.sql` (tabelas, funções e roles, aplicado pelo CI como `vault_owner`), `Makefile`, `Dockerfile`, `deps-baseline.txt`, `vendor/`, `CLAUDE.md` (regras para agentes de IA de programação, incluindo o checklist de revisão do catálogo e as limitações conhecidas), `LICENSE` (MIT), `lefthook.yml` (git hooks), `.gitleaks.toml` (allowlist da varredura de secrets), `scripts/` (as verificações de mensagens de commit e de comentários compartilhadas pelos hooks e pelo CI), `.github/workflows/` (CI, Integration, Image, Fuzz), `docs/` (a revisão de arquitetura de segurança e o registro de riscos).
 
 ---
 
