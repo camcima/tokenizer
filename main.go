@@ -291,20 +291,62 @@ func loadDEKs(ctx context.Context, cfg config, db *sql.DB, c *http.Client, ts *t
 	if len(wrapped) == 0 {
 		return nil, 0, errNoDEKs
 	}
-	deks := make(map[int][]byte, len(wrapped))
-	current := 0
+	return unwrapDEKs(ctx, cfg, c, ts, wrapped, nil)
+}
+
+// unwrapDEKs returns a new map holding every DEK of have plus the KMS-unwrapped DEK of each
+// wrapped version not in have, and the highest version in it. DEKs already held are shared, not
+// unwrapped again, and have itself is not modified. Any KMS failure fails the whole call; the
+// DEKs this call unwrapped are zeroed, the held ones are left alone.
+func unwrapDEKs(ctx context.Context, cfg config, c *http.Client, ts *tokenSource, wrapped map[int][]byte, have map[int][]byte) (map[int][]byte, int, error) {
+	deks := make(map[int][]byte, len(have)+len(wrapped))
+	maps.Copy(deks, have)
+	var added []int
 	for version, w := range wrapped {
+		if _, ok := have[version]; ok {
+			continue
+		}
 		dek, err := kmsDecrypt(ctx, c, ts, cfg.kmsKey, w)
 		if err != nil {
-			for _, d := range deks {
-				zero(d)
+			for _, a := range added {
+				zero(deks[a])
 			}
 			return nil, 0, fmt.Errorf("DEK version %d: %s", version, err.Error())
 		}
 		deks[version] = dek
+		added = append(added, version)
+	}
+	current := 0
+	for version := range deks {
 		current = max(current, version)
 	}
 	return deks, current, nil
+}
+
+// dekRefresher returns the refresh function main wires into v.refreshDEKs: list every wrapped
+// DEK, unwrap only the versions v's snapshot lacks and publish the union as the new snapshot, so
+// keys only ever accumulate. It runs only under v.refreshMu, so the load and the store cannot
+// interleave with another refresh. With a dev DEK there is nothing to refresh.
+func dekRefresher(v *vault, cfg config, db *sql.DB, c *http.Client, ts *tokenSource) func(ctx context.Context) error {
+	if cfg.devDEK != nil {
+		return func(context.Context) error { return nil }
+	}
+	return func(ctx context.Context) error {
+		wrapped, err := dbListDEKs(ctx, db)
+		if err != nil {
+			return err
+		}
+		var have map[int][]byte
+		if ks := v.keys.Load(); ks != nil {
+			have = ks.deks
+		}
+		deks, current, err := unwrapDEKs(ctx, cfg, c, ts, wrapped, have)
+		if err != nil {
+			return err
+		}
+		v.keys.Store(&dekSet{deks: deks, current: current})
+		return nil
+	}
 }
 
 // dekVersions lists the map's versions in ascending order, comma-separated, for the boot log.
@@ -527,7 +569,7 @@ const dbCallTimeout = 5 * time.Second
 // call runs under dbCallTimeout, derived from the request context (an earlier request deadline
 // or a client disconnect still wins).
 func newVault(cfg config, db *sql.DB, deks map[int][]byte, current int, hmacKey []byte, cat *catalog, client *http.Client, logger *log.Logger) *vault {
-	return &vault{
+	v := &vault{
 		putCard: func(ctx context.Context, token string, ciphertext []byte, last4 string, keyVersion int) error {
 			ctx, cancel := context.WithTimeout(ctx, dbCallTimeout)
 			defer cancel()
@@ -539,8 +581,6 @@ func newVault(cfg config, db *sql.DB, deks map[int][]byte, current int, hmacKey 
 			return dbGetCard(ctx, db, token, caller)
 		},
 		ping:        db.PingContext,
-		deks:        deks,
-		currentDEK:  current,
 		hmacKey:     hmacKey,
 		allowOrigin: cfg.allowOrigin,
 		cvv:         newCVVCache(cvvCacheTTL, time.Now),
@@ -549,6 +589,8 @@ func newVault(cfg config, db *sql.DB, deks map[int][]byte, current int, hmacKey 
 		catalog:     cat,
 		client:      client,
 	}
+	v.keys.Store(&dekSet{deks: deks, current: current})
+	return v
 }
 
 // newServers builds both listeners. net/http's own error lines are discarded:
@@ -704,11 +746,13 @@ func main() {
 
 	// 5. Build the vault on the catalog parsed in step 1c.
 	v := newVault(cfg, db, deks, current, hmacKey, cat, client, logger)
+	v.refreshDEKs = dekRefresher(v, cfg, db, client, ts)
 
 	// Background work runs on bgCtx, cancelled first on shutdown. newVault starts nothing itself,
 	// so tests drive these loops directly.
 	bgCtx, bgCancel := context.WithCancel(context.Background())
 	go v.cvv.run(bgCtx, cvvSweepEvery)
+	go v.refreshLoop(bgCtx, dekRefreshEvery)
 
 	// 6. Start both listeners (certificate and client CA were loaded in step 1b).
 	// Each socket is bound with net.Listen before serving (ServeTLS("", "") is what

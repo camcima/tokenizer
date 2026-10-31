@@ -612,6 +612,68 @@ func TestLoadDEKsDev(t *testing.T) {
 	if _, _, err := loadDEKs(context.Background(), config{env: "dev", devDEK: dek[:31]}, nil, nil, nil); err == nil {
 		t.Error("31-byte dev DEK accepted")
 	}
+	// With a dev DEK there is nothing to refresh: the refresher touches neither the database
+	// (nil here) nor the snapshot.
+	v, _ := newTestVault(t)
+	before := v.keys.Load()
+	if err := dekRefresher(v, config{env: "dev", devDEK: dek}, nil, nil, nil)(context.Background()); err != nil || v.keys.Load() != before {
+		t.Error("dev refresher did something")
+	}
+}
+
+// unwrapDEKs unwraps only the versions not already held, shares the held DEKs, and returns a new
+// map with the highest version.
+func TestUnwrapDEKsOnlyNew(t *testing.T) {
+	newFakeMetadata(t, nil)
+	k := newFakeKMS(t)
+	c := newOutboundClient(nil)
+	ts := &tokenSource{client: c}
+	cfg := config{env: "prod", kmsKey: testKMSKey}
+	dek := func(b byte) []byte { return bytes.Repeat([]byte{b}, 32) }
+	have := map[int][]byte{1: dek(1)}
+	wrapped := map[int][]byte{1: reversed(dek(1)), 2: reversed(dek(2)), 3: reversed(dek(3))}
+	before := k.count()
+	got, cur, err := unwrapDEKs(context.Background(), cfg, c, ts, wrapped, have)
+	if err != nil {
+		t.Fatalf("unwrapDEKs: %v", err)
+	}
+	if n := k.count() - before; n != 2 {
+		t.Errorf("KMS decrypts %d, want 2 (only the new versions)", n)
+	}
+	if len(got) != 3 || cur != 3 {
+		t.Fatalf("got %d DEKs, current %d; want 3 and 3", len(got), cur)
+	}
+	for ver := 1; ver <= 3; ver++ {
+		if !bytes.Equal(got[ver], dek(byte(ver))) {
+			t.Errorf("version %d is not its DEK", ver)
+		}
+	}
+	if &got[1][0] != &have[1][0] {
+		t.Error("the held DEK for version 1 was not shared")
+	}
+	if len(have) != 1 {
+		t.Error("unwrapDEKs modified the held map")
+	}
+
+	// A KMS failure fails the call and leaves the held DEKs intact.
+	k.setMode("500")
+	wrapped[4] = reversed(dek(4))
+	if _, _, err := unwrapDEKs(context.Background(), cfg, c, ts, wrapped, got); err == nil {
+		t.Fatal("KMS failure accepted")
+	}
+	for ver := 1; ver <= 3; ver++ {
+		if !bytes.Equal(got[ver], dek(byte(ver))) {
+			t.Errorf("a failed unwrap altered held version %d", ver)
+		}
+	}
+	// Nothing new to unwrap: no KMS call, a copy of the held set.
+	k.setMode("")
+	before = k.count()
+	delete(wrapped, 4)
+	again, cur, err := unwrapDEKs(context.Background(), cfg, c, ts, wrapped, got)
+	if err != nil || len(again) != 3 || cur != 3 || k.count() != before {
+		t.Errorf("no-op unwrap: %d DEKs, current %d, %d KMS calls, err %v", len(again), cur, k.count()-before, err)
+	}
 }
 
 func TestDEKVersionList(t *testing.T) {
@@ -828,7 +890,13 @@ func TestNewVault(t *testing.T) {
 	if v.putCard == nil || v.getCard == nil || v.ping == nil || v.cvv == nil || v.now == nil {
 		t.Fatal("function fields or CVV cache not wired")
 	}
-	if v.currentDEK != 2 || len(v.deks) != 2 || !bytes.Equal(v.hmacKey, testHMACKey) || v.allowOrigin != testOrigin ||
+	if cur, d := v.currentDEK(); cur != 2 || !bytes.Equal(d, deks[2]) || len(v.keys.Load().deks) != 2 {
+		t.Error("initial DEK snapshot not stored")
+	}
+	if v.refreshDEKs != nil {
+		t.Error("newVault wired a refresh function; main does that")
+	}
+	if !bytes.Equal(v.hmacKey, testHMACKey) || v.allowOrigin != testOrigin ||
 		v.client != c || v.log != logger {
 		t.Error("fields not wired")
 	}

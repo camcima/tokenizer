@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -62,8 +63,6 @@ type vault struct {
 	getCard func(ctx context.Context, token, caller string) (ciphertext []byte, keyVersion int, err error)
 	ping    func(ctx context.Context) error
 
-	deks        map[int][]byte // key version → 32-byte DEK
-	currentDEK  int
 	hmacKey     []byte
 	allowOrigin string
 	cvv         *cvvCache
@@ -75,6 +74,84 @@ type vault struct {
 	lastSessionAlert atomic.Int64 // unix second of last session_token_invalid alert
 	lastPolicyAlert  atomic.Int64 // unix second of last proxy_policy alert
 	lastCVVAlert     atomic.Int64 // unix second of last cvv_cache_full alert
+
+	// keys is the current DEK snapshot; readers load it without locking. refreshDEKs (wired by
+	// main, nil = nothing to refresh) publishes a new one; refresh serializes and rate-limits it.
+	keys        atomic.Pointer[dekSet]
+	refreshDEKs func(ctx context.Context) error
+	refreshMu   sync.Mutex
+	lastRefresh atomic.Int64 // unix nanos at which the last refresh attempt completed
+}
+
+// dekSet is one snapshot of the key material: every DEK by version and the version new cards are
+// sealed under. A published set is never modified; a refresh publishes a new one, which shares
+// the DEK slices it already held.
+type dekSet struct {
+	deks    map[int][]byte // key version → 32-byte DEK
+	current int
+}
+
+const (
+	// dekRefreshEvery is the period of the background refresh, so that an instance usually
+	// learns a newly rotated key before any request needs it.
+	dekRefreshEvery = 5 * time.Minute
+	// dekRefreshMinGap bounds refreshes to one per window, however many requests carry an
+	// unknown (possibly forged) key version: each costs a list_deks call and possibly KMS calls.
+	dekRefreshMinGap = 10 * time.Second
+)
+
+// dek returns the DEK for version from the current snapshot.
+func (v *vault) dek(version int) ([]byte, bool) {
+	ks := v.keys.Load()
+	if ks == nil {
+		return nil, false
+	}
+	d, ok := ks.deks[version]
+	return d, ok
+}
+
+// currentDEK returns the version new cards are sealed under and its DEK (nil if missing).
+func (v *vault) currentDEK() (version int, dek []byte) {
+	ks := v.keys.Load()
+	if ks == nil {
+		return 0, nil
+	}
+	return ks.current, ks.deks[ks.current]
+}
+
+// refresh runs refreshDEKs at most once at a time and at most once per dekRefreshMinGap,
+// counted from the end of the previous attempt, successful or not. A caller that arrives while
+// a refresh is in flight waits for it and then returns nil inside the window: the snapshot it
+// re-reads is the one that refresh published. A failed refresh keeps the current snapshot.
+func (v *vault) refresh(ctx context.Context) error {
+	if v.refreshDEKs == nil {
+		return nil
+	}
+	v.refreshMu.Lock()
+	defer v.refreshMu.Unlock()
+	// A negative gap means the wall clock stepped back; it does not suppress the refresh.
+	if gap := time.Now().UnixNano() - v.lastRefresh.Load(); gap >= 0 && gap < int64(dekRefreshMinGap) {
+		return nil
+	}
+	err := v.refreshDEKs(ctx)
+	v.lastRefresh.Store(time.Now().UnixNano())
+	return err
+}
+
+// refreshLoop refreshes the DEK snapshot every period until ctx is cancelled. Errors are not
+// logged (they could carry KMS or database detail); the snapshot simply stays as it was. A
+// refresh in flight at cancellation runs on ctx too, so it is cut short with it.
+func (v *vault) refreshLoop(ctx context.Context, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			_ = v.refresh(ctx)
+		}
+	}
 }
 
 // logf writes one line: "<RFC3339 UTC timestamp> " + message. Callers pass only fixed format

@@ -163,8 +163,16 @@ func (v *vault) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// 5. Decrypt.
 	// Authentic plaintext that is not a card record is reported as decrypt_failed
 	// as well: it can only mean key or data corruption.
+	// A version missing from the snapshot may have been rotated in after this instance last
+	// refreshed: refresh once (rate-limited) and look again. The refresh error is not logged (it
+	// could carry KMS or database detail); a version still missing fails as decrypt_failed.
 	var c card
-	plaintext, err := unseal(v.deks[keyVersion], ciphertext) // a missing DEK (nil) fails unseal
+	dek, ok := v.dek(keyVersion)
+	if !ok {
+		_ = v.refresh(ctx)
+		dek, _ = v.dek(keyVersion)
+	}
+	plaintext, err := unseal(dek, ciphertext) // a missing DEK (nil) fails unseal
 	if err == nil {
 		err = json.Unmarshal(plaintext, &c)
 	}

@@ -843,7 +843,7 @@ func TestProxyDecryptFailed(t *testing.T) {
 
 	// Authentic ciphertext whose plaintext is not a card record is a decrypt failure too.
 	tok3 := newToken()
-	s.rows[tok3] = fakeRow{ciphertext: seal(v.deks[1], []byte("not json")), last4: "0000", keyVersion: 1}
+	s.rows[tok3] = fakeRow{ciphertext: seal(dekOf(v, 1), []byte("not json")), last4: "0000", keyVersion: 1}
 	start = testLog.Len()
 	rec = serveInternal(v, tokensRequest(tok3, stripeTokensNoCVV))
 	if rec.Code != http.StatusInternalServerError || !strings.Contains(testLog.since(start), " ALERT decrypt_failed token="+tok3+" key_version=1 account=stripe_t\n") {
@@ -1146,5 +1146,75 @@ func TestProxyDropsCVVOnHandoff(t *testing.T) {
 				t.Fatal("CVV not cached after a non-2xx provider response")
 			}
 		})
+	}
+}
+
+// A card sealed under a key version this instance has not loaded yet (written by an instance
+// that saw a rotation first) is decrypted after one on-demand refresh.
+func TestProxyRefreshOnUnknownVersion(t *testing.T) {
+	fp := newFakeProvider(t, nil)
+	v, s := proxyVault(t, fp)
+	dek1 := dekOf(v, 1)
+	dek2 := bytes.Repeat([]byte{0x02}, 32)
+	pt, err := json.Marshal(card{PAN: testPAN, ExpMonth: "12", ExpYear: "2030"})
+	if err != nil {
+		t.Fatal("marshal card failed")
+	}
+	tok := newToken()
+	s.rows[tok] = fakeRow{ciphertext: seal(dek2, pt), last4: "4242", keyVersion: 2}
+	var calls atomic.Int32
+	v.refreshDEKs = func(context.Context) error {
+		calls.Add(1)
+		v.keys.Store(&dekSet{deks: map[int][]byte{1: dek1, 2: dek2}, current: 2})
+		return nil
+	}
+	start := testLog.Len()
+	rec := serveInternal(v, tokensRequest(tok, stripeTokensNoCVV))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200 (body len %d)", rec.Code, rec.Body.Len())
+	}
+	if hits, _, _, _, _ := fp.last(); hits != 1 {
+		t.Fatalf("provider hits %d, want 1", hits)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("refresh ran %d times, want 1", n)
+	}
+	if strings.Contains(testLog.since(start), "decrypt_failed") {
+		t.Fatal("decrypt_failed logged for a version a refresh supplied")
+	}
+	// A known version never triggers a refresh.
+	tok1 := seedCard(t, v, s, "")
+	v.lastRefresh.Store(0)
+	if rec := serveInternal(v, tokensRequest(tok1, stripeTokensNoCVV)); rec.Code != http.StatusOK || calls.Load() != 1 {
+		t.Fatalf("known version: status %d, refreshes %d; want 200 and no new refresh", rec.Code, calls.Load())
+	}
+}
+
+// A forged key version that never appears costs one refresh per window, however many requests
+// carry it, and every such request still fails as decrypt_failed.
+func TestProxyUnknownVersionRateLimited(t *testing.T) {
+	fp := newFakeProvider(t, nil)
+	v, s := proxyVault(t, fp)
+	tok := seedCard(t, v, s, "")
+	row := s.rows[tok]
+	row.keyVersion = 999
+	s.rows[tok] = row
+	var calls atomic.Int32
+	v.refreshDEKs = func(context.Context) error { calls.Add(1); return nil }
+	for i := range 5 {
+		start := testLog.Len()
+		rec := serveInternal(v, tokensRequest(tok, stripeTokensNoCVV))
+		if rec.Code != http.StatusInternalServerError || rec.Body.String() != wantErrBody(msgInternal) {
+			t.Fatalf("request %d: status %d, body len %d, want 500 internal", i, rec.Code, rec.Body.Len())
+		}
+		if !strings.Contains(testLog.since(start), " ALERT decrypt_failed token="+tok+" key_version=999 account=stripe_t\n") {
+			t.Fatalf("request %d: no ALERT decrypt_failed line", i)
+		}
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("refresh ran %d times for 5 requests, want 1", n)
+	}
+	if hits, _, _, _, _ := fp.last(); hits != 0 {
+		t.Fatal("an undecryptable card reached the provider")
 	}
 }

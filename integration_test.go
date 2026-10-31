@@ -567,6 +567,100 @@ func TestIntegrationRotateDEK(t *testing.T) {
 	}
 }
 
+// TestIntegrationRotationTwoInstances runs a rolling deploy after a rotation: two vaults on one
+// database and one (fake) KMS, both booted with the old key. After the rotation only A has
+// refreshed. A card tokenized on A (sealed under the new key) proxies through B, which learns the
+// key on demand; then a card tokenized on B proxies through A. No request fails to decrypt.
+func TestIntegrationRotationTwoInstances(t *testing.T) {
+	ctx := context.Background()
+	open := func(role string) *sql.DB {
+		db, err := openDB(config{env: "dev", dbURL: integrationURL(t, role)}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { db.Close() })
+		return db
+	}
+	rotDB, appDB := open("vault_rotator"), open("vault_app")
+	newFakeMetadata(t, nil)
+	newFakeKMS(t)
+	c := newOutboundClient(nil)
+	ts := &tokenSource{client: c}
+	cfg := config{env: "prod", kmsKey: testKMSKey, allowOrigin: testOrigin}
+	fp := newFakeProvider(t, nil)
+
+	vOld, err := rotateDEK(ctx, cfg, rotDB, c, ts)
+	if err != nil {
+		t.Fatalf("first rotation: %v", err)
+	}
+	instance := func() *vault {
+		deks, cur, err := loadDEKs(ctx, cfg, appDB, c, ts)
+		if err != nil || cur != vOld {
+			t.Fatalf("boot load: current=%d (want %d) err=%v", cur, vOld, err)
+		}
+		cat := testCatalog(t, testCatalogHost)
+		for _, a := range cat.accounts {
+			for name := range a.secretNames {
+				a.secrets[name] = testSecret
+			}
+		}
+		v := newVault(cfg, appDB, deks, cur, testHMACKey, cat, c, log.New(&testLog, "", 0))
+		v.refreshDEKs = dekRefresher(v, cfg, appDB, c, ts)
+		pointAccount(t, v, "stripe_t", fp.ts)
+		return v
+	}
+	a, b := instance(), instance()
+	n0 := testLog.Len()
+
+	vNew, err := rotateDEK(ctx, cfg, rotDB, c, ts)
+	if err != nil || vNew != vOld+1 {
+		t.Fatalf("second rotation: version=%d err=%v, want %d", vNew, err, vOld+1)
+	}
+	if err := a.refresh(ctx); err != nil {
+		t.Fatalf("A refresh: %v", err)
+	}
+	if cur, _ := a.currentDEK(); cur != vNew {
+		t.Fatalf("A current after refresh = %d, want %d", cur, vNew)
+	}
+	if _, ok := b.dek(vNew); ok {
+		t.Fatal("B holds the new key before any refresh")
+	}
+
+	tokenizeOn := func(v *vault) string {
+		t.Helper()
+		authz := "Bearer " + mintSession(testHMACKey, time.Now().Add(10*time.Minute))
+		rec := serveTokenize(v, tokRequest(tokCase{authz: authz, body: tokBody(map[string]any{"cvv": nil})}))
+		var tr tokenizeResponse
+		if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &tr) != nil {
+			t.Fatalf("tokenize: status %d, want 200", rec.Code)
+		}
+		if _, kv, err := dbGetCard(ctx, appDB, tr.Token, "0A1B2C"); err != nil || kv != vNew {
+			t.Fatalf("stored key_version=%d (want %d) err=%v", kv, vNew, err)
+		}
+		return tr.Token
+	}
+	proxyOn := func(v *vault, tok string) {
+		t.Helper()
+		hits, _, _, _, _ := fp.last()
+		if rec := serveInternal(v, tokensRequest(tok, stripeTokensNoCVV)); rec.Code != http.StatusOK {
+			t.Fatalf("proxy: status %d, want 200", rec.Code)
+		}
+		if h, _, _, _, _ := fp.last(); h != hits+1 {
+			t.Fatal("proxy did not reach the provider exactly once")
+		}
+	}
+
+	proxyOn(b, tokenizeOn(a))
+	if cur, _ := b.currentDEK(); cur != vNew {
+		t.Fatalf("B current after its on-demand refresh = %d, want %d", cur, vNew)
+	}
+	proxyOn(a, tokenizeOn(b))
+
+	if strings.Contains(testLog.since(n0), "decrypt_failed") {
+		t.Fatal("a request failed to decrypt during the rotation")
+	}
+}
+
 // stripeShow makes a Stripe response body printable in a failure message: PAN masked, the key,
 // the test cardholder name and its form encoding redacted, at most 2 KiB.
 func stripeShow(b []byte, secret string) string {

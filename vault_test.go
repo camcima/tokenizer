@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -407,12 +408,148 @@ func TestNewTestVaultStore(t *testing.T) {
 	if _, _, err := v.getCard(ctx, "tok_a", "0A1B2C"); !errors.Is(err, errVelocity) {
 		t.Fatal("velocity flag did not return errVelocity")
 	}
-	if !v.now().Equal(testNow) || !v.cvv.now().Equal(testNow) || len(v.deks[v.currentDEK]) != 32 {
+	if !v.now().Equal(testNow) || !v.cvv.now().Equal(testNow) || len(dekOf(v, 1)) != 32 {
 		t.Fatal("test vault clock or DEK misconfigured")
 	}
 	a := v.catalog.accounts["stripe_t"]
 	if a == nil || a.host != testCatalogHost || a.secrets["secretKey"] != testSecret ||
 		v.catalog.accounts["payu_co"].secrets["apiKey"] != payuTestAPIKey {
 		t.Fatal("test vault catalog or account secrets misconfigured")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DEK snapshot refresh
+// ---------------------------------------------------------------------------
+
+// Concurrent refreshes share one run: callers that arrive while it is in flight wait for it and
+// then fall inside the rate-limit window.
+func TestRefreshSingleFlight(t *testing.T) {
+	v, _ := newTestVault(t)
+	var calls atomic.Int32
+	release := make(chan struct{})
+	v.refreshDEKs = func(context.Context) error {
+		calls.Add(1)
+		<-release
+		return nil
+	}
+	var wg sync.WaitGroup
+	var returned atomic.Int32
+	for range 20 {
+		wg.Go(func() {
+			v.refresh(context.Background())
+			returned.Add(1)
+		})
+	}
+	// Give every goroutine time to reach the lock before the one run finishes.
+	deadline := time.Now().Add(2 * time.Second)
+	for calls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := returned.Load(); n != 0 {
+		t.Fatalf("%d callers returned while the refresh was still in flight", n)
+	}
+	close(release)
+	wg.Wait()
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("refresh ran %d times, want 1", n)
+	}
+	if n := returned.Load(); n != 20 {
+		t.Fatalf("%d callers returned, want 20", n)
+	}
+}
+
+// A refresh less than dekRefreshMinGap after the last completed one does not run.
+func TestRefreshRateLimited(t *testing.T) {
+	if dekRefreshMinGap != 10*time.Second {
+		t.Fatalf("dekRefreshMinGap = %v, want 10s", dekRefreshMinGap)
+	}
+	v, _ := newTestVault(t)
+	var calls int
+	v.refreshDEKs = func(context.Context) error { calls++; return nil }
+	if err := v.refresh(context.Background()); err != nil || calls != 1 {
+		t.Fatalf("first refresh: calls %d, err %v; want 1 run", calls, err)
+	}
+	// The previous attempt completed 1s ago.
+	v.lastRefresh.Store(time.Now().Add(-time.Second).UnixNano())
+	if err := v.refresh(context.Background()); err != nil || calls != 1 {
+		t.Fatalf("refresh 1s later: calls %d, err %v; want no new run", calls, err)
+	}
+	v.lastRefresh.Store(time.Now().Add(-11 * time.Second).UnixNano())
+	if err := v.refresh(context.Background()); err != nil || calls != 2 {
+		t.Fatalf("refresh 11s later: calls %d, err %v; want a second run", calls, err)
+	}
+	// A wall clock that stepped backwards does not suppress refreshes until it catches up.
+	v.lastRefresh.Store(time.Now().Add(time.Hour).UnixNano())
+	if err := v.refresh(context.Background()); err != nil || calls != 3 {
+		t.Fatalf("refresh after a clock step back: calls %d, err %v; want a third run", calls, err)
+	}
+}
+
+// Without a refresh function, refresh is a no-op.
+func TestRefreshNilFunc(t *testing.T) {
+	v, _ := newTestVault(t)
+	before := v.keys.Load()
+	if err := v.refresh(context.Background()); err != nil || v.keys.Load() != before {
+		t.Fatal("refresh without a refresh function changed something")
+	}
+}
+
+// Cancelling the loop's context while a refresh is in flight ends the loop once that call
+// returns: shutdown is never held up by more than the call in progress.
+func TestRefreshStopsOnCancel(t *testing.T) {
+	v, _ := newTestVault(t)
+	started := make(chan struct{}, 1)
+	v.refreshDEKs = func(context.Context) error {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		time.Sleep(200 * time.Millisecond)
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		v.refreshLoop(ctx, time.Millisecond)
+		close(done)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the loop never refreshed")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("refreshLoop did not return within 1s of cancel")
+	}
+	if dekRefreshEvery != 5*time.Minute {
+		t.Errorf("dekRefreshEvery = %v, want 5m", dekRefreshEvery)
+	}
+}
+
+// A failed refresh leaves the snapshot as it was, logs nothing, and still counts as an attempt
+// for the rate limit.
+func TestRefreshFailureKeepsSnapshot(t *testing.T) {
+	v, _ := newTestVault(t)
+	before := v.keys.Load()
+	v.refreshDEKs = func(context.Context) error {
+		return errors.New("kms decrypt: status 503 projects/p1/locations/global/keyRings/r1")
+	}
+	start := testLog.Len()
+	if err := v.refresh(context.Background()); err == nil {
+		t.Fatal("refresh error not returned")
+	}
+	if v.keys.Load() != before {
+		t.Fatal("a failed refresh replaced the snapshot")
+	}
+	if got := testLog.since(start); got != "" {
+		t.Fatalf("a failed refresh logged %d bytes", len(got))
+	}
+	if since := time.Now().UnixNano() - v.lastRefresh.Load(); since < 0 || since > int64(time.Minute) {
+		t.Fatal("a failed refresh was not recorded as an attempt")
 	}
 }
