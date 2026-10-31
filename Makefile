@@ -122,7 +122,7 @@ commit-check:
 	fail=0; n=0; \
 	for c in $$commits; do \
 		n=$$((n+1)); \
-		out=$$(scripts/check-commit-msg.sh "$$(git log -1 --format=%B $$c)") || { echo "commit-check: $$c"; echo "$$out"; fail=1; }; \
+		out=$$(scripts/check-commit-msg.sh --message "$$(git log -1 --format=%B $$c)") || { echo "commit-check: $$c"; echo "$$out"; fail=1; }; \
 	done; \
 	[ $$fail -eq 0 ] && echo "commit-check: ok ($$n commits in $(COMMIT_RANGE))"
 

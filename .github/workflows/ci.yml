@@ -3,18 +3,25 @@ name: CI
 # make ci: gofmt, go vet, staticcheck, govulncheck, the dependency and vendor checks, docs-check,
 # the comment rule, gitleaks over the full history, unit tests with the race detector, and the
 # build. The commits job applies the commit-msg hook's rule to every commit the event brings, so
-# each check a git hook enforces locally also fails CI.
+# each check a git hook enforces locally also fails CI, and on pull requests to the title as well:
+# main takes squash merges, whose commit message is the pull request's title.
 on:
   push:
     branches: [main]
+  # edited: a corrected title is checked again without a new push (a re-run would reuse the old
+  # title from the original event).
   pull_request:
+    types: [opened, synchronize, reopened, edited]
 
 permissions:
   contents: read
 
+# A newer run cancels an older one only on pull requests. Pushes to main each keep their run, so
+# every pushed commit range gets its commit-message check: each push run gets its own group,
+# because a shared group would still drop a queued run when a newer one arrives.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   ci:
@@ -62,3 +69,12 @@ jobs:
             range="$BEFORE_SHA..$PUSH_SHA"
           fi
           make commit-check COMMIT_RANGE="$range"
+
+      # The squash merge's commit message is the title, so it must pass the same rule. The title
+      # goes through env, never into the script text, and --message keeps it from being read as a
+      # file name.
+      - name: pull request title
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: scripts/check-commit-msg.sh --message "$PR_TITLE"

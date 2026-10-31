@@ -4,7 +4,7 @@ You are implementing spec/original.md. Read it fully before writing code. These 
 
 ## Version overrides
 - Go 1.27.3 (not 1.23) and PostgreSQL 18 (not 16). These supersede the spec.
-- The provider-agnostic proxy design of 2026-10-30 ("D", a local planning document; its binding rules are restated below under "Proxy and catalog rules") supersedes spec §6.2–§6.4 (the `/proxy` request and ops catalog), the "no placeholder syntax" sentence of §6.3 and the "no generic proxy mode" line of §14. Where they disagree, the proxy and catalog rules win.
+- The provider-agnostic proxy design of 2026-10-30 (a local planning document; its binding rules are restated below under "Proxy and catalog rules") supersedes spec §6.2–§6.4 (the `/proxy` request and ops catalog), the "no placeholder syntax" sentence of §6.3 and the "no generic proxy mode" line of §14. Where they disagree, the proxy and catalog rules win.
 
 ## Known limitations (v1)
 - **Serialized lookups.** `vault.get_card` takes `pg_advisory_xact_lock` before it counts, so the velocity check and the `access_log` insert cannot race (no velocity TOCTOU). As a result, lookups run one at a time across all sessions. The vault also caps its pool at 16 open connections per instance (`db.SetMaxOpenConns(16)`), and each request's database call has a 5s deadline.
@@ -29,13 +29,13 @@ You are implementing spec/original.md. Read it fully before writing code. These 
 - Add an endpoint not in SPEC §5 and §6.
 - Persist CVV anywhere, including temp files, the database, or logs.
 - Send a caller-supplied provider request that has not passed every catalog check (see "Proxy and catalog rules").
-- Add provider-specific Go code. The one exception is a named signer (D§5.7, e.g. `payu`), added only when a real provider needs it. A provider, endpoint or account is a `catalog.json` change.
+- Add provider-specific Go code. The one exception is a named signer (the code behind `{{signature}}` in the proxy and catalog rules below, e.g. `payu`), added only when a real provider needs it. A provider, endpoint or account is a `catalog.json` change.
 - Make the catalog editable at runtime (database, Secret Manager, env, files). It is compiled in with `go:embed`.
 - Skip or weaken a test to make CI pass.
 
-## Proxy and catalog rules (D§5)
+## Proxy and catalog rules
 - The platform builds the whole provider request (`{account, token, request:{method, path, headers, body}}`) with placeholders. The vault checks it against the compiled-in `catalog.json`, fills the placeholders, attaches the account's credential and sends it to the account's host. The account selects host, base path, secrets and pinned values; the platform never does.
-- Placeholder vocabulary is exactly D§5.3: `{{pan}}`, `{{cvv}}`, `{{name}}`, `{{exp_month}}`/`{{exp_month:int}}`, `{{exp_year}}`/`{{exp_year:yy}}`/`{{exp_year:int}}`, `{{exp:yyyy/mm}}`/`{{exp:mm/yy}}`, `{{secret:NAME}}`, `{{basic:NAME}}`, `{{signature}}`. Nothing else, ever sent literally or otherwise.
+- Placeholder vocabulary is exactly: `{{pan}}`, `{{cvv}}`, `{{name}}`, `{{exp_month}}`/`{{exp_month:int}}`, `{{exp_year}}`/`{{exp_year:yy}}`/`{{exp_year:int}}`, `{{exp:yyyy/mm}}`/`{{exp:mm/yy}}`, `{{secret:NAME}}`, `{{basic:NAME}}`, `{{signature}}`. Nothing else, ever sent literally or otherwise.
 - Placeholders appear only at catalog positions: a body address listed in the endpoint's `positions` (each address maps to exactly one placeholder), or an endpoint `headers` template. A placeholder fills an entire value; no concatenation. Each card placeholder appears at most once. Literal `{{` anywhere else is rejected.
 - Card placeholders (`pan`, `cvv`, `name`, expiry) are never allowed in headers, path or query.
 - Vault credentials only appear where the catalog puts them: `{{secret:NAME}}` and `{{signature}}` in an endpoint header template or at a listed body position, and `{{basic:NAME}}` only in a header template (the parser refuses it at a body position). A credential field or header accepts only its vault placeholder; a platform-supplied credential is rejected.
@@ -47,7 +47,7 @@ You are implementing spec/original.md. Read it fully before writing code. These 
 - Key refresh: a `key_version` missing from the DEK snapshot triggers one refresh (`list_deks`, KMS-unwrap only the new versions, publish a new snapshot) before decrypting again; refreshes are single-flight, at most one per 10 s, bounded by 30 s and detached from the request's cancellation, and a background refresh runs every 5 minutes. Keys only accumulate; a failed refresh keeps the current snapshot.
 - Cards are sealed with AES-256-GCM and the additional data `"pan-vault/card/1\x00" + token`, so a ciphertext only opens under its own token (otherwise 500 and `ALERT decrypt_failed`). Never seal or unseal a card without it.
 - Card placeholders (`card_data: true`) go only to endpoints that charge or create a single-use hand-off token. Never to an endpoint that stores the card at the provider or sends data to a caller-chosen URL.
-- The vault credential is only for card-carrying calls (D§2, D§5.6). Every catalog endpoint must have `"card_data": true` and a `{{pan}}` position (the parser refuses anything else), and every `/proxy` request must contain `{{pan}}` (else 400 `invalid placeholder use`, `reason=placeholder`). Calls without card data (payments with a provider token, refunds, queries) are made by the platform with its own keys.
+- The vault credential is only for card-carrying calls. Every catalog endpoint must have `"card_data": true` and a `{{pan}}` position (the parser refuses anything else), and every `/proxy` request must contain `{{pan}}` (else 400 `invalid placeholder use`, `reason=placeholder`). Calls without card data (payments with a provider token, refunds, queries) are made by the platform with its own keys.
 - Dev secrets for catalog accounts: `VAULT_DEV_SECRET_<ACCOUNT>_<NAME>`, uppercased, every character outside `[A-Z0-9]` replaced by `_` (e.g. `stripe_test`/`secretKey` → `VAULT_DEV_SECRET_STRIPE_TEST_SECRETKEY`). Used only when `VAULT_ENV=dev`. An unknown `VAULT_DEV_*` name refuses a dev boot, any `VAULT_DEV_*` refuses a prod boot, and boot fails if any secret of a loaded account is missing. There is no `VAULT_STRIPE_SECRET` or `VAULT_DEV_STRIPE_SECRET`.
 
 ## Catalog changes
@@ -59,10 +59,10 @@ Every PR that adds or changes a provider, endpoint or account in `catalog.json` 
 - [ ] Add an example request for every new endpoint to `embeddedFixtures` in `catalog_test.go` (`TestEmbeddedCatalog` fails without one).
 - [ ] Add a fixture to `testCatalogJSON` (and the tests that use it) if the change introduces a new shape: a new body format, pin kind, placeholder modifier, signer or header template form.
 - [ ] Create each new account secret in Secret Manager under the resource name the catalog gives.
-- [ ] Verify the endpoint against the provider's sandbox (D§6) and record it in the catalog review notes below, together with the endpoint's documented success and error responses. A documented response field beyond brand, last4, expiry and cardholder name needs explicit sign-off in the catalog PR.
+- [ ] Verify the endpoint against the provider's sandbox and record it in the catalog review notes below, together with the endpoint's documented success and error responses. A documented response field beyond brand, last4, expiry and cardholder name needs explicit sign-off in the catalog PR.
 
 ## Catalog review notes
-- **Stripe** (`stripe`, account `stripe_test`, dev): `POST /v1/tokens` only, verified against stripe-mock v0.206.0 (`TestStripeMock`). The vault creates a single-use `tok_…`; the platform charges it or creates a PaymentMethod from it with its own keys, and must never save, attach or reuse the card through it (platform policy, README §7.4). `customer` (Connect: a token cloned from a customer's saved card) is forbidden. `POST /v1/payment_methods` is not in the catalog: D§6 classifies a card PaymentMethod as storage (reusable, attachable). D§6's other card endpoint, `POST /v1/payment_intents` with `payment_method_data[card][…]`, is not shipped either: stripe-mock rejects raw card fields there (`payment_method_data[type]` does not accept `card`), so it cannot be verified in CI.
+- **Stripe** (`stripe`, account `stripe_test`, dev): `POST /v1/tokens` only, verified against stripe-mock v0.206.0 (`TestStripeMock`). The vault creates a single-use `tok_…`; the platform charges it or creates a PaymentMethod from it with its own keys, and must never save, attach or reuse the card through it (platform policy, README §7.4). `customer` (Connect: a token cloned from a customer's saved card) is forbidden. `POST /v1/payment_methods` is not in the catalog: the proxy design classifies a card PaymentMethod as storage (reusable, attachable). The design's other card endpoint, `POST /v1/payment_intents` with `payment_method_data[card][…]`, is not shipped either: stripe-mock rejects raw card fields there (`payment_method_data[type]` does not accept `card`), so it cannot be verified in CI.
 - Adyen, Mercado Pago, PayU and Pagar.me are modelled only in the synthetic `testCatalogJSON`. Each lands in `catalog.json` as its own data-only PR after sandbox verification.
 
 ## When unsure

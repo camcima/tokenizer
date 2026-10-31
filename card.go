@@ -221,7 +221,7 @@ func zero(b []byte) {
 }
 
 // ---------------------------------------------------------------------------
-// CVV cache: in memory only, single use, TTL, capped, swept on every write and on a ticker
+// CVV cache: in memory only, single use, TTL, capped, swept on a ticker and when full
 // ---------------------------------------------------------------------------
 
 const (
@@ -270,16 +270,19 @@ func (c *cvvCache) sweepLocked(now time.Time) int {
 	return n
 }
 
-// put caches cvv for token until now+ttl, first removing every expired entry so that only live
-// entries count against cvvCacheMax. It returns false, caching nothing, when the cache is still
-// full after that sweep.
+// put caches cvv for token until now+ttl. Only live entries count against cvvCacheMax: when the
+// map is full, put first removes every expired entry. Below the cap it does not sweep, so a put
+// stays cheap however many entries are pending; the ticker in run handles routine expiry. It
+// returns false, caching nothing, when the cache is still full after that sweep.
 func (c *cvvCache) put(token, cvv string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.now()
-	c.sweepLocked(now)
 	if e, ok := c.m[token]; ok {
 		c.removeLocked(token, e)
+	}
+	if len(c.m) >= cvvCacheMax {
+		c.sweepLocked(now)
 	}
 	if len(c.m) >= cvvCacheMax {
 		return false
@@ -321,8 +324,8 @@ func (c *cvvCache) sweep() int {
 	return c.sweepLocked(c.now())
 }
 
-// run calls sweep every interval until ctx is done. Without it an idle instance would keep
-// expired CVVs until the next put.
+// run calls sweep every interval until ctx is done. It is the routine expiry path: put sweeps
+// only when the cache is full, so without run expired CVVs would stay until then.
 func (c *cvvCache) run(ctx context.Context, every time.Duration) {
 	t := time.NewTicker(every)
 	defer t.Stop()
