@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
 	"errors"
@@ -55,6 +57,7 @@ func testDevEnv() map[string]string {
 		"VAULT_DB_URL":               "postgres://vault_app:pw-x9q@db.internal/vault",
 		"VAULT_DEV_DEK_HEX":          strings.Repeat("ab", 32),
 		"VAULT_DEV_SESSION_HMAC_HEX": strings.Repeat("cd", 32),
+		"VAULT_DEV_RECEIPT_KEY_HEX":  strings.Repeat("ef", 32),
 		// The embedded catalog's one dev account secret (stripe_test/secretKey).
 		"VAULT_DEV_SECRET_STRIPE_TEST_SECRETKEY": testSecret,
 	}
@@ -70,6 +73,7 @@ func testProdEnv() map[string]string {
 		"VAULT_DB_URL":              "postgres://vault_app@10.1.2.3/vault?sslmode=verify-full",
 		"VAULT_KMS_KEY":             testKMSKey,
 		"VAULT_SESSION_HMAC_SECRET": testHMACName,
+		"VAULT_RECEIPT_KEY_SECRET":  testReceiptName,
 	}
 }
 
@@ -98,7 +102,8 @@ func TestLoadConfig(t *testing.T) {
 		{"dev custom addrs", envWith(testDevEnv(), map[string]string{"VAULT_PUBLIC_ADDR": "127.0.0.1:1", "VAULT_INTERNAL_ADDR": "127.0.0.1:2"}), false, ""},
 		{"dev http localhost origin", envWith(testDevEnv(), map[string]string{"VAULT_ALLOW_ORIGIN": "http://localhost:3000"}), false, ""},
 		{"dev KMS instead of dev DEK", envWith(testDevEnv(), map[string]string{"VAULT_DEV_DEK_HEX": omit, "VAULT_KMS_KEY": testKMSKey}), false, ""},
-		{"dev SM instead of dev secrets", envWith(testDevEnv(), map[string]string{"VAULT_DEV_SESSION_HMAC_HEX": omit, "VAULT_SESSION_HMAC_SECRET": testHMACName, "VAULT_DEV_SECRET_STRIPE_TEST_SECRETKEY": omit}), false, ""},
+		{"dev SM instead of dev secrets", envWith(testDevEnv(), map[string]string{"VAULT_DEV_SESSION_HMAC_HEX": omit, "VAULT_SESSION_HMAC_SECRET": testHMACName,
+			"VAULT_DEV_RECEIPT_KEY_HEX": omit, "VAULT_RECEIPT_KEY_SECRET": testReceiptName, "VAULT_DEV_SECRET_STRIPE_TEST_SECRETKEY": omit}), false, ""},
 		{"prod", testProdEnv(), false, ""},
 		{"missing VAULT_ENV", envWith(testDevEnv(), map[string]string{"VAULT_ENV": omit}), false, "VAULT_ENV"},
 		{"VAULT_ENV staging", envWith(testDevEnv(), map[string]string{"VAULT_ENV": "staging"}), false, "VAULT_ENV"},
@@ -119,17 +124,26 @@ func TestLoadConfig(t *testing.T) {
 		{"prod http origin", envWith(testProdEnv(), map[string]string{"VAULT_ALLOW_ORIGIN": "http://checkout.example.com"}), false, "VAULT_ALLOW_ORIGIN"},
 		{"prod missing VAULT_KMS_KEY", envWith(testProdEnv(), map[string]string{"VAULT_KMS_KEY": omit}), false, "VAULT_KMS_KEY"},
 		{"prod missing VAULT_SESSION_HMAC_SECRET", envWith(testProdEnv(), map[string]string{"VAULT_SESSION_HMAC_SECRET": omit}), false, "VAULT_SESSION_HMAC_SECRET"},
+		{"prod missing VAULT_RECEIPT_KEY_SECRET", envWith(testProdEnv(), map[string]string{"VAULT_RECEIPT_KEY_SECRET": omit}), false, "VAULT_RECEIPT_KEY_SECRET"},
 		{"prod + VAULT_DEV_DEK_HEX", envWith(testProdEnv(), map[string]string{"VAULT_DEV_DEK_HEX": strings.Repeat("ab", 32)}), false, "VAULT_DEV_DEK_HEX"},
 		{"prod + VAULT_DEV_SESSION_HMAC_HEX", envWith(testProdEnv(), map[string]string{"VAULT_DEV_SESSION_HMAC_HEX": strings.Repeat("cd", 32)}), false, "VAULT_DEV_SESSION_HMAC_HEX"},
+		{"prod + VAULT_DEV_RECEIPT_KEY_HEX", envWith(testProdEnv(), map[string]string{"VAULT_DEV_RECEIPT_KEY_HEX": strings.Repeat("ef", 32)}), false, "VAULT_DEV_RECEIPT_KEY_HEX"},
 		{"dev DEK 63 hex", envWith(testDevEnv(), map[string]string{"VAULT_DEV_DEK_HEX": strings.Repeat("ab", 31) + "a"}), false, "VAULT_DEV_DEK_HEX"},
 		{"dev DEK 66 hex", envWith(testDevEnv(), map[string]string{"VAULT_DEV_DEK_HEX": strings.Repeat("ab", 33)}), false, "VAULT_DEV_DEK_HEX"},
 		{"dev DEK not hex", envWith(testDevEnv(), map[string]string{"VAULT_DEV_DEK_HEX": strings.Repeat("zq", 32)}), false, "VAULT_DEV_DEK_HEX"},
 		{"dev HMAC 63 hex", envWith(testDevEnv(), map[string]string{"VAULT_DEV_SESSION_HMAC_HEX": strings.Repeat("cd", 31) + "c"}), false, "VAULT_DEV_SESSION_HMAC_HEX"},
+		{"dev receipt key 63 hex", envWith(testDevEnv(), map[string]string{"VAULT_DEV_RECEIPT_KEY_HEX": strings.Repeat("ef", 31) + "e"}), false, "VAULT_DEV_RECEIPT_KEY_HEX"},
+		{"dev receipt key 66 hex", envWith(testDevEnv(), map[string]string{"VAULT_DEV_RECEIPT_KEY_HEX": strings.Repeat("ef", 33)}), false, "VAULT_DEV_RECEIPT_KEY_HEX"},
+		{"dev receipt key not hex", envWith(testDevEnv(), map[string]string{"VAULT_DEV_RECEIPT_KEY_HEX": strings.Repeat("zq", 32)}), false, "VAULT_DEV_RECEIPT_KEY_HEX"},
 		{"dev no DEK source", envWith(testDevEnv(), map[string]string{"VAULT_DEV_DEK_HEX": omit}), false, "VAULT_KMS_KEY"},
 		{"dev no HMAC source", envWith(testDevEnv(), map[string]string{"VAULT_DEV_SESSION_HMAC_HEX": omit}), false, "VAULT_SESSION_HMAC_SECRET"},
+		{"dev no receipt key source", envWith(testDevEnv(), map[string]string{"VAULT_DEV_RECEIPT_KEY_HEX": omit}), false, "VAULT_RECEIPT_KEY_SECRET"},
 		{"KMS key bad shape", envWith(testProdEnv(), map[string]string{"VAULT_KMS_KEY": "projects/p1/locations/global/keyRings/r1/cryptoKeys/../k1"}), false, "VAULT_KMS_KEY"},
 		{"KMS key with query", envWith(testProdEnv(), map[string]string{"VAULT_KMS_KEY": testKMSKey + "?x=1"}), false, "VAULT_KMS_KEY"},
 		{"HMAC secret bad shape", envWith(testProdEnv(), map[string]string{"VAULT_SESSION_HMAC_SECRET": "projects/p1/secrets/s/versions/3"}), false, "VAULT_SESSION_HMAC_SECRET"},
+		{"receipt secret bad shape", envWith(testProdEnv(), map[string]string{"VAULT_RECEIPT_KEY_SECRET": "projects/p1/secrets/../s"}), false, "VAULT_RECEIPT_KEY_SECRET"},
+		{"rotate prod + VAULT_DEV_RECEIPT_KEY_HEX", envWith(map[string]string{"VAULT_ENV": "prod", "VAULT_DB_URL": "postgres://vault_rotator@10.1.2.3/vault?sslmode=verify-full", "VAULT_KMS_KEY": testKMSKey},
+			map[string]string{"VAULT_DEV_RECEIPT_KEY_HEX": strings.Repeat("ef", 32)}), true, "VAULT_DEV_RECEIPT_KEY_HEX"},
 		{"rotate prod only ENV/DB/KMS", rotEnv, true, ""},
 		{"rotate dev only ENV/DB/KMS", envWith(rotEnv, map[string]string{"VAULT_ENV": "dev"}), true, ""},
 		{"rotate missing KMS", envWith(rotEnv, map[string]string{"VAULT_KMS_KEY": omit}), true, "VAULT_KMS_KEY"},
@@ -173,7 +187,8 @@ func TestLoadConfig(t *testing.T) {
 		cfg.dbURL != testDevEnv()["VAULT_DB_URL"] || cfg.kmsKey != "" {
 		t.Error("dev config fields or defaults wrong")
 	}
-	if !bytes.Equal(cfg.devDEK, bytes.Repeat([]byte{0xab}, 32)) || !bytes.Equal(cfg.devHMAC, bytes.Repeat([]byte{0xcd}, 32)) {
+	if !bytes.Equal(cfg.devDEK, bytes.Repeat([]byte{0xab}, 32)) || !bytes.Equal(cfg.devHMAC, bytes.Repeat([]byte{0xcd}, 32)) ||
+		!bytes.Equal(cfg.devReceiptSeed, bytes.Repeat([]byte{0xef}, 32)) || cfg.receiptSecretName != "" {
 		t.Error("dev secrets not decoded")
 	}
 	cfg, err = loadConfig(func(k string) string { return testProdEnv()[k] }, false)
@@ -181,7 +196,7 @@ func TestLoadConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.env != "prod" || cfg.kmsKey != testKMSKey || cfg.hmacSecretName != testHMACName ||
-		cfg.devDEK != nil || cfg.devHMAC != nil {
+		cfg.receiptSecretName != testReceiptName || cfg.devDEK != nil || cfg.devHMAC != nil || cfg.devReceiptSeed != nil {
 		t.Error("prod config fields wrong")
 	}
 	cfg, err = loadConfig(func(k string) string { return rotEnv[k] }, true)
@@ -362,43 +377,100 @@ func TestAccessSecret(t *testing.T) {
 func TestLoadSecrets(t *testing.T) {
 	ctx := context.Background()
 	hmacKey := bytes.Repeat([]byte{0x5a}, 32)
+	seed := bytes.Repeat([]byte{0x6b}, 32)
+	material := []string{hex.EncodeToString(hmacKey), hex.EncodeToString(seed)}
+	// noMaterial reports a failure whose error carries either key's hex.
+	noMaterial := func(name string, err error) {
+		t.Helper()
+		for _, m := range material {
+			if strings.Contains(err.Error(), m) || strings.Contains(strings.ToLower(err.Error()), m) {
+				t.Errorf("%s: error contains key material", name)
+			}
+		}
+	}
 
-	// Dev value: no network at all (nil client and token source).
-	k, err := loadSecrets(ctx, config{env: "dev", devHMAC: hmacKey}, nil, nil)
-	if err != nil || !bytes.Equal(k, hmacKey) {
-		t.Fatalf("dev secret wrong: %v", err)
+	// Dev values: no network at all (nil client and token source).
+	k, rs, err := loadSecrets(ctx, config{env: "dev", devHMAC: bytes.Clone(hmacKey), devReceiptSeed: bytes.Clone(seed)}, nil, nil)
+	if err != nil || !bytes.Equal(k, hmacKey) || !bytes.Equal(rs, seed) {
+		t.Fatalf("dev secrets wrong: %v", err)
 	}
 	for name, cfg := range map[string]config{
-		"HMAC 31 bytes":      {env: "dev", devHMAC: hmacKey[:31]},
-		"prod with dev HMAC": {env: "prod", devHMAC: hmacKey, hmacSecretName: testHMACName},
+		"HMAC 31 bytes":              {env: "dev", devHMAC: bytes.Clone(hmacKey[:31]), devReceiptSeed: bytes.Clone(seed)},
+		"receipt seed 31 bytes":      {env: "dev", devHMAC: bytes.Clone(hmacKey), devReceiptSeed: bytes.Clone(seed[:31])},
+		"receipt seed 33 bytes":      {env: "dev", devHMAC: bytes.Clone(hmacKey), devReceiptSeed: append(bytes.Clone(seed), 1)},
+		"prod with dev HMAC":         {env: "prod", devHMAC: bytes.Clone(hmacKey), hmacSecretName: testHMACName, receiptSecretName: testReceiptName},
+		"prod with dev receipt seed": {env: "prod", devReceiptSeed: bytes.Clone(seed), hmacSecretName: testHMACName, receiptSecretName: testReceiptName},
 	} {
-		if _, err := loadSecrets(ctx, cfg, nil, nil); err == nil {
+		k, rs, err := loadSecrets(ctx, cfg, nil, nil)
+		if err == nil {
 			t.Errorf("%s: accepted", name)
-		} else if strings.Contains(err.Error(), hex.EncodeToString(hmacKey)) {
-			t.Errorf("%s: error contains the key", name)
+			continue
 		}
+		if k != nil || rs != nil {
+			t.Errorf("%s: a key was returned with the error", name)
+		}
+		noMaterial(name, err)
+	}
+
+	// A receipt seed that fails after the HMAC key loaded zeroes the HMAC key: dev keys are
+	// handed over as the config's own slices, so the zeroing is visible here.
+	devHMAC := bytes.Clone(hmacKey)
+	if _, _, err := loadSecrets(ctx, config{env: "dev", devHMAC: devHMAC, devReceiptSeed: bytes.Clone(seed[:31])}, nil, nil); err == nil {
+		t.Fatal("31-byte receipt seed accepted")
+	}
+	if !bytes.Equal(devHMAC, make([]byte, 32)) {
+		t.Error("the HMAC key loaded before the receipt seed failed was not zeroed")
+	}
+	// Every case above passed copies, so the fixtures the Secret Manager cases build on are intact.
+	if !bytes.Equal(hmacKey, bytes.Repeat([]byte{0x5a}, 32)) || !bytes.Equal(seed, bytes.Repeat([]byte{0x6b}, 32)) {
+		t.Fatal("a failure case zeroed the test's own key fixtures")
 	}
 
 	// Secret Manager path.
 	newFakeMetadata(t, nil)
 	c := newOutboundClient(nil)
-	prod := config{env: "prod", hmacSecretName: testHMACName}
-	newFakeSecretManager(t, map[string]string{testHMACName: hex.EncodeToString(hmacKey)}, false)
-	k, err = loadSecrets(ctx, prod, c, &tokenSource{client: c})
-	if err != nil || !bytes.Equal(k, hmacKey) {
-		t.Fatalf("Secret Manager secret wrong: %v", err)
+	prod := config{env: "prod", hmacSecretName: testHMACName, receiptSecretName: testReceiptName}
+	good := map[string]string{testHMACName: hex.EncodeToString(hmacKey), testReceiptName: hex.EncodeToString(seed)}
+	newFakeSecretManager(t, good, false)
+	k, rs, err = loadSecrets(ctx, prod, c, &tokenSource{client: c})
+	if err != nil || !bytes.Equal(k, hmacKey) || !bytes.Equal(rs, seed) {
+		t.Fatalf("Secret Manager secrets wrong: %v", err)
 	}
-	for name, sm := range map[string]map[string]string{
-		"HMAC trailing newline": {testHMACName: hex.EncodeToString(hmacKey) + "\n"},
-		"HMAC 62 hex":           {testHMACName: hex.EncodeToString(hmacKey[:31])},
-		"HMAC not hex":          {testHMACName: strings.Repeat("zz", 32)},
-		"HMAC missing":          {},
+	// Dev mode without dev variables reads Secret Manager as well.
+	k, rs, err = loadSecrets(ctx, config{env: "dev", hmacSecretName: testHMACName, receiptSecretName: testReceiptName}, c, &tokenSource{client: c})
+	if err != nil || !bytes.Equal(k, hmacKey) || !bytes.Equal(rs, seed) {
+		t.Fatalf("dev Secret Manager secrets wrong: %v", err)
+	}
+	for _, f := range []struct{ name, env string }{
+		{testHMACName, "VAULT_SESSION_HMAC_SECRET"},
+		{testReceiptName, "VAULT_RECEIPT_KEY_SECRET"},
 	} {
-		newFakeSecretManager(t, sm, false)
-		if _, err := loadSecrets(ctx, prod, c, &tokenSource{client: c}); err == nil {
-			t.Errorf("%s: accepted", name)
-		} else if strings.Contains(err.Error(), hex.EncodeToString(hmacKey)) {
-			t.Errorf("%s: error contains secret material", name)
+		for name, payload := range map[string]string{
+			"trailing newline": good[f.name] + "\n",
+			"62 hex":           good[f.name][:62],
+			"66 hex":           good[f.name] + "ab",
+			"not hex":          strings.Repeat("zz", 32),
+			"missing":          "",
+		} {
+			sm := maps.Clone(good)
+			if payload == "" {
+				delete(sm, f.name)
+			} else {
+				sm[f.name] = payload
+			}
+			newFakeSecretManager(t, sm, false)
+			k, rs, err := loadSecrets(ctx, prod, c, &tokenSource{client: c})
+			if err == nil {
+				t.Errorf("%s %s: accepted", f.env, name)
+				continue
+			}
+			if k != nil || rs != nil {
+				t.Errorf("%s %s: a key was returned with the error", f.env, name)
+			}
+			if !strings.Contains(err.Error(), f.env) {
+				t.Errorf("%s %s: error does not name the variable", f.env, name)
+			}
+			noMaterial(f.env+" "+name, err)
 		}
 	}
 }
@@ -574,7 +646,7 @@ func TestCheckDevSecretVars(t *testing.T) {
 		mention string // "" = accepted
 	}{
 		{"no dev variables", devCat, "dev", []string{"PATH=/bin"}, ""},
-		{"fixed dev variables", devCat, "dev", []string{"VAULT_DEV_DEK_HEX=x", "VAULT_DEV_SESSION_HMAC_HEX=y"}, ""},
+		{"fixed dev variables", devCat, "dev", []string{"VAULT_DEV_DEK_HEX=x", "VAULT_DEV_SESSION_HMAC_HEX=y", "VAULT_DEV_RECEIPT_KEY_HEX=z"}, ""},
 		{"account secret variables", devCat, "dev", []string{"VAULT_DEV_SECRET_STRIPE_T_SECRETKEY=sk_env_x9", "VAULT_DEV_SECRET_PAYU_CO_APIKEY=sk_env_x9"}, ""},
 		{"account secret variable empty", devCat, "dev", []string{"VAULT_DEV_SECRET_STRIPE_T_SECRETKEY="}, ""},
 		{"misspelt account secret variable", devCat, "dev", []string{"VAULT_DEV_SECRET_STRIPE_T_SECRET_KEY=sk_env_x9"}, "VAULT_DEV_SECRET_STRIPE_T_SECRET_KEY"},
@@ -886,7 +958,7 @@ func TestNewVault(t *testing.T) {
 	c := newOutboundClient(nil)
 	logger := log.New(&testLog, "", 0)
 	cat := testCatalog(t, testCatalogHost)
-	v := newVault(config{env: "dev", allowOrigin: testOrigin}, db, deks, 2, testHMACKey, cat, c, logger)
+	v := newVault(config{env: "dev", allowOrigin: testOrigin}, db, deks, 2, testHMACKey, bytes.Clone(testReceiptSeed), cat, c, logger)
 	if v.putCard == nil || v.getCard == nil || v.ping == nil || v.cvv == nil || v.now == nil {
 		t.Fatal("function fields or CVV cache not wired")
 	}
@@ -913,6 +985,74 @@ func TestNewVault(t *testing.T) {
 	defer cancel()
 	if v.ping(ctx) == nil {
 		t.Error("ping is not wired to the database")
+	}
+}
+
+// newVault derives the receipt key pair from the seed and zeroes the seed it was given.
+func TestNewVaultReceiptKeys(t *testing.T) {
+	db, err := openDB(config{env: "dev", dbURL: "postgres://vault_app@127.0.0.1:1/vault?sslmode=disable&connect_timeout=2"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	seed := bytes.Clone(testReceiptSeed)
+	v := newVault(config{env: "dev", allowOrigin: testOrigin}, db, map[int][]byte{1: bytes.Repeat([]byte{1}, 32)}, 1,
+		testHMACKey, seed, testCatalog(t, testCatalogHost), newOutboundClient(nil), log.New(&testLog, "", 0))
+	want := ed25519.NewKeyFromSeed(testReceiptSeed)
+	if !want.Public().(ed25519.PublicKey).Equal(v.receiptPub) {
+		t.Error("receiptPub is not the public key of the seed")
+	}
+	if !want.Equal(v.receiptPriv) {
+		t.Error("receiptPriv is not the private key of the seed")
+	}
+	if !bytes.Equal(seed, make([]byte, 32)) {
+		t.Error("the seed passed to newVault was not zeroed")
+	}
+	if !bytes.Equal(v.receiptPriv.Seed(), testReceiptSeed) {
+		t.Error("zeroing the seed changed the derived private key")
+	}
+	if _, ok := verifyReceipt(v.receiptPub, signReceipt(v.receiptPriv, testReceipt())); !ok {
+		t.Error("a receipt signed by the vault does not verify with its public key")
+	}
+}
+
+// The boot line carries the receipt public key as unpadded base64url and never the seed or the
+// private key, in any encoding.
+func TestBootLogsReceiptPublicKey(t *testing.T) {
+	db, err := openDB(config{env: "dev", dbURL: "postgres://vault_app@127.0.0.1:1/vault?sslmode=disable&connect_timeout=2"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	seedHex := testDevEnv()["VAULT_DEV_RECEIPT_KEY_HEX"]
+	seed, ok := decodeKey64(seedHex)
+	if !ok {
+		t.Fatal("dev receipt seed does not decode")
+	}
+	priv := ed25519.NewKeyFromSeed(seed)
+	wantPub := base64.RawURLEncoding.EncodeToString(priv.Public().(ed25519.PublicKey))
+	v := newVault(config{env: "dev", allowOrigin: testOrigin}, db, map[int][]byte{1: bytes.Repeat([]byte{1}, 32)}, 1,
+		testHMACKey, seed, testCatalog(t, testCatalogHost), newOutboundClient(nil), log.New(&testLog, "", 0))
+	n := testLog.Len()
+	v.logReceiptPublicKey()
+	out := testLog.since(n)
+	if strings.Count(out, "\n") != 1 || !strings.HasSuffix(out, " receipt public key="+wantPub+"\n") {
+		t.Errorf("boot line (len %d) is not exactly one 'receipt public key=<b64url>' line", len(out))
+	}
+	if strings.Contains(out, "=\n") || strings.ContainsAny(out, "+/") {
+		t.Error("public key is padded or not base64url")
+	}
+	for name, s := range map[string]string{
+		"seed hex":              seedHex,
+		"seed hex upper":        strings.ToUpper(seedHex),
+		"seed base64url":        base64.RawURLEncoding.EncodeToString(priv.Seed()),
+		"seed base64":           base64.StdEncoding.EncodeToString(priv.Seed()),
+		"private key hex":       hex.EncodeToString(priv),
+		"private key base64url": base64.RawURLEncoding.EncodeToString(priv),
+	} {
+		if strings.Contains(out, s) {
+			t.Errorf("boot line contains the %s", name)
+		}
 	}
 }
 
@@ -968,7 +1108,7 @@ func TestNewVaultDBDeadline(t *testing.T) {
 	}))
 	defer db.Close()
 	v := newVault(config{env: "dev", allowOrigin: testOrigin}, db, map[int][]byte{1: bytes.Repeat([]byte{1}, 32)}, 1,
-		testHMACKey, testCatalog(t, testCatalogHost), newOutboundClient(nil), log.New(&testLog, "", 0))
+		testHMACKey, bytes.Clone(testReceiptSeed), testCatalog(t, testCatalogHost), newOutboundClient(nil), log.New(&testLog, "", 0))
 
 	reqCtx := context.WithValue(context.Background(), ctxKey{}, true)
 	short, cancel := context.WithTimeout(reqCtx, time.Second)
@@ -1020,7 +1160,7 @@ func TestNewVaultDBDeadline(t *testing.T) {
 	}
 	defer stalled.Close()
 	v = newVault(config{env: "dev", allowOrigin: testOrigin}, stalled, map[int][]byte{1: bytes.Repeat([]byte{1}, 32)}, 1,
-		testHMACKey, testCatalog(t, testCatalogHost), newOutboundClient(nil), log.New(&testLog, "", 0))
+		testHMACKey, bytes.Clone(testReceiptSeed), testCatalog(t, testCatalogHost), newOutboundClient(nil), log.New(&testLog, "", 0))
 	var wg sync.WaitGroup
 	for name, call := range calls {
 		wg.Go(func() {

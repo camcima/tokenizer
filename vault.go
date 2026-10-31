@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -64,6 +65,8 @@ type vault struct {
 	ping    func(ctx context.Context) error
 
 	hmacKey     []byte
+	receiptPriv ed25519.PrivateKey // signs /tokenize receipts; derived from the receipt seed at boot
+	receiptPub  ed25519.PublicKey  // logged at boot; the platform verifies receipts with it
 	allowOrigin string
 	cvv         *cvvCache
 	now         func() time.Time

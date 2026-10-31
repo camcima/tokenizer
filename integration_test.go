@@ -364,7 +364,7 @@ func TestIntegrationEndToEnd(t *testing.T) {
 	if err := loadAccountSecrets(ctx, cat, cfg, devSecrets, nil, nil); err != nil {
 		t.Fatalf("loadAccountSecrets: %s", safeErr(err, testSecret))
 	}
-	v := newVault(cfg, db, deks, current, testHMACKey, cat, newOutboundClient(nil), log.New(&testLog, "", 0))
+	v := newVault(cfg, db, deks, current, testHMACKey, bytes.Clone(testReceiptSeed), cat, newOutboundClient(nil), log.New(&testLog, "", 0))
 	pointAccount(t, v, "stripe_t", fp.ts)
 
 	_, caPool, serverCert, clientCert := testPKI(t)
@@ -403,6 +403,22 @@ func TestIntegrationEndToEnd(t *testing.T) {
 	if !tokenRe.MatchString(tr.Token) || tr.Last4 != "4242" || tr.ExpMonth != "12" || tr.ExpYear != "2030" ||
 		h.Get("Access-Control-Allow-Origin") != testOrigin {
 		t.Fatal("tokenize: response fields or CORS header wrong")
+	}
+	// The platform verifies the receipt string from the HTTP response with the public key the
+	// vault logs at boot, before storing anything from it.
+	if !v.receiptPub.Equal(testReceiptPub()) {
+		t.Fatal("vault receipt public key is not the test seed's")
+	}
+	rc, ok := verifyReceipt(v.receiptPub, tr.Receipt)
+	if !ok {
+		t.Fatalf("tokenize: receipt (len %d) does not verify", len(tr.Receipt))
+	}
+	if rc.Token != tr.Token || rc.BIN != "42424242" || rc.Last4 != "4242" || rc.ExpMonth != "12" || rc.ExpYear != "2030" ||
+		rc.Name != testName {
+		t.Fatal("tokenize: receipt fields are not the tokenized card's")
+	}
+	if d := time.Since(time.Unix(rc.IAT, 0)); d < -time.Minute || d > time.Minute {
+		t.Errorf("tokenize: receipt iat is %v away from now", d)
 	}
 
 	// Platform without a client certificate: the TLS handshake is refused, no handler runs.
@@ -604,7 +620,7 @@ func TestIntegrationRotationTwoInstances(t *testing.T) {
 				a.secrets[name] = testSecret
 			}
 		}
-		v := newVault(cfg, appDB, deks, cur, testHMACKey, cat, c, log.New(&testLog, "", 0))
+		v := newVault(cfg, appDB, deks, cur, testHMACKey, bytes.Clone(testReceiptSeed), cat, c, log.New(&testLog, "", 0))
 		v.refreshDEKs = dekRefresher(v, cfg, appDB, c, ts)
 		pointAccount(t, v, "stripe_t", fp.ts)
 		return v

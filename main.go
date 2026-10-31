@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
 	"errors"
@@ -40,13 +42,13 @@ import (
 // config is the parsed environment. Secret values held here (dev mode only) are never logged.
 type config struct {
 	env, publicAddr, internalAddr, certFile, keyFile, clientCAFile, allowOrigin, dbURL string
-	kmsKey, hmacSecretName                                                             string
-	devDEK, devHMAC                                                                    []byte
+	kmsKey, hmacSecretName, receiptSecretName                                          string
+	devDEK, devHMAC, devReceiptSeed                                                    []byte
 }
 
 // devVars are the fixed dev-mode secret variables; each is refused when VAULT_ENV=prod. Account
 // secrets have one dev variable each (devSecretVar), refused in prod by devVarSet's prefix check.
-var devVars = []string{"VAULT_DEV_DEK_HEX", "VAULT_DEV_SESSION_HMAC_HEX"}
+var devVars = []string{"VAULT_DEV_DEK_HEX", "VAULT_DEV_SESSION_HMAC_HEX", "VAULT_DEV_RECEIPT_KEY_HEX"}
 
 // KMS key and Secret Manager names must have exactly the documented shape, with
 // segments of [A-Za-z0-9_-] only. They are concatenated into request URLs, so "..", "?", "#",
@@ -119,6 +121,10 @@ func loadConfig(getenv func(string) string, rotate bool) (config, error) {
 	if cfg.hmacSecretName != "" && !secretNameRe.MatchString(cfg.hmacSecretName) {
 		return config{}, errors.New("VAULT_SESSION_HMAC_SECRET must be projects/P/secrets/S")
 	}
+	cfg.receiptSecretName = getenv("VAULT_RECEIPT_KEY_SECRET")
+	if cfg.receiptSecretName != "" && !secretNameRe.MatchString(cfg.receiptSecretName) {
+		return config{}, errors.New("VAULT_RECEIPT_KEY_SECRET must be projects/P/secrets/S")
+	}
 
 	// In prod every secret comes from KMS / Secret Manager (dev vars were refused above); in dev
 	// each comes from its VAULT_DEV_* variable when set, otherwise from KMS / Secret Manager.
@@ -140,6 +146,15 @@ func loadConfig(getenv func(string) string, rotate bool) (config, error) {
 		cfg.devHMAC = b
 	} else if cfg.hmacSecretName == "" {
 		return config{}, errors.New("VAULT_SESSION_HMAC_SECRET is required (or VAULT_DEV_SESSION_HMAC_HEX in dev)")
+	}
+	if s := getenv("VAULT_DEV_RECEIPT_KEY_HEX"); s != "" {
+		b, ok := decodeKey64(s)
+		if !ok {
+			return config{}, errors.New("VAULT_DEV_RECEIPT_KEY_HEX must be exactly 64 hex chars")
+		}
+		cfg.devReceiptSeed = b
+	} else if cfg.receiptSecretName == "" {
+		return config{}, errors.New("VAULT_RECEIPT_KEY_SECRET is required (or VAULT_DEV_RECEIPT_KEY_HEX in dev)")
 	}
 	return cfg, nil
 }
@@ -380,32 +395,51 @@ func validSecretValue(s string) bool {
 	return true
 }
 
-// loadSecrets returns the session HMAC key (32 bytes): from VAULT_DEV_SESSION_HMAC_HEX in
-// dev when set, otherwise from Secret Manager. The payload must be exactly 64 hex chars. Errors
-// name the variable, never the value. Provider account secrets are loadAccountSecrets'.
-func loadSecrets(ctx context.Context, cfg config, c *http.Client, ts *tokenSource) (hmacKey []byte, err error) {
-	if cfg.env != "dev" && cfg.devHMAC != nil {
-		return nil, errors.New("dev secrets are refused when VAULT_ENV=prod")
+// loadSecrets returns the session HMAC key and the receipt signing seed, 32 bytes each: in dev
+// from VAULT_DEV_SESSION_HMAC_HEX / VAULT_DEV_RECEIPT_KEY_HEX when set, otherwise from Secret
+// Manager. A Secret Manager payload must be exactly 64 hex chars. Errors name the variable,
+// never the value. On any failure every key already loaded is zeroed and neither is returned.
+// Dev keys are handed over as the config's own slices rather than copies, so zeroing a returned
+// key (here on failure, in main on a later boot failure, or the seed in newVault) also clears
+// the config's copy. Provider account secrets are loadAccountSecrets'.
+func loadSecrets(ctx context.Context, cfg config, c *http.Client, ts *tokenSource) (hmacKey, receiptSeed []byte, err error) {
+	if cfg.env != "dev" && (cfg.devHMAC != nil || cfg.devReceiptSeed != nil) {
+		return nil, nil, errors.New("dev secrets are refused when VAULT_ENV=prod")
 	}
-	if cfg.devHMAC != nil {
-		hmacKey = bytes.Clone(cfg.devHMAC)
-	} else {
-		raw, err := accessSecret(ctx, c, ts, cfg.hmacSecretName)
+	hmacKey, err = loadKey32(ctx, c, ts, cfg.devHMAC, cfg.hmacSecretName, "VAULT_SESSION_HMAC_SECRET", "session HMAC key")
+	if err != nil {
+		return nil, nil, err
+	}
+	receiptSeed, err = loadKey32(ctx, c, ts, cfg.devReceiptSeed, cfg.receiptSecretName, "VAULT_RECEIPT_KEY_SECRET", "receipt key seed")
+	if err != nil {
+		zero(hmacKey)
+		return nil, nil, err
+	}
+	return hmacKey, receiptSeed, nil
+}
+
+// loadKey32 returns dev when it is set, otherwise the Secret Manager secret secretName decoded
+// from exactly 64 hex chars. The result must be 32 bytes; anything else is zeroed and refused.
+// envName (the secret's variable) and what (the key's description) name it in errors.
+func loadKey32(ctx context.Context, c *http.Client, ts *tokenSource, dev []byte, secretName, envName, what string) ([]byte, error) {
+	key := dev
+	if key == nil {
+		raw, err := accessSecret(ctx, c, ts, secretName)
 		if err != nil {
-			return nil, errors.New("VAULT_SESSION_HMAC_SECRET: " + err.Error())
+			return nil, errors.New(envName + ": " + err.Error())
 		}
 		var ok bool
-		hmacKey, ok = decodeKey64(string(raw))
+		key, ok = decodeKey64(string(raw))
 		zero(raw)
 		if !ok {
-			return nil, errors.New("VAULT_SESSION_HMAC_SECRET: payload must be exactly 64 hex chars")
+			return nil, errors.New(envName + ": payload must be exactly 64 hex chars")
 		}
 	}
-	if len(hmacKey) != 32 {
-		zero(hmacKey)
-		return nil, errors.New("session HMAC key must be 32 bytes")
+	if len(key) != 32 {
+		zero(key)
+		return nil, errors.New(what + " must be 32 bytes")
 	}
-	return hmacKey, nil
+	return key, nil
 }
 
 // devSecretVar is the dev variable of an account secret: VAULT_DEV_SECRET_<ACCOUNT>_<NAME>,
@@ -569,8 +603,11 @@ const dbCallTimeout = 5 * time.Second
 
 // newVault wires the vault to the database and the loaded key material. Each putCard/getCard
 // call runs under dbCallTimeout, derived from the request context (an earlier request deadline
-// or a client disconnect still wins).
-func newVault(cfg config, db *sql.DB, deks map[int][]byte, current int, hmacKey []byte, cat *catalog, client *http.Client, logger *log.Logger) *vault {
+// or a client disconnect still wins). The receipt key pair is derived from receiptSeed (32
+// bytes, a boot invariant), which is then zeroed: the private key holds its own copy.
+func newVault(cfg config, db *sql.DB, deks map[int][]byte, current int, hmacKey, receiptSeed []byte, cat *catalog, client *http.Client, logger *log.Logger) *vault {
+	receiptPriv := ed25519.NewKeyFromSeed(receiptSeed)
+	zero(receiptSeed)
 	v := &vault{
 		putCard: func(ctx context.Context, token string, ciphertext []byte, last4 string, keyVersion int) error {
 			ctx, cancel := context.WithTimeout(ctx, dbCallTimeout)
@@ -584,6 +621,8 @@ func newVault(cfg config, db *sql.DB, deks map[int][]byte, current int, hmacKey 
 		},
 		ping:        db.PingContext,
 		hmacKey:     hmacKey,
+		receiptPriv: receiptPriv,
+		receiptPub:  receiptPriv.Public().(ed25519.PublicKey),
 		allowOrigin: cfg.allowOrigin,
 		cvv:         newCVVCache(cvvCacheTTL, time.Now),
 		now:         time.Now,
@@ -593,6 +632,12 @@ func newVault(cfg config, db *sql.DB, deks map[int][]byte, current int, hmacKey 
 	}
 	v.keys.Store(&dekSet{deks: deks, current: current})
 	return v
+}
+
+// logReceiptPublicKey logs the receipt public key as unpadded base64url, the form the platform
+// configures to verify receipts. It is public; the seed and private key are never logged.
+func (v *vault) logReceiptPublicKey() {
+	v.logf("receipt public key=%s", base64.RawURLEncoding.EncodeToString(v.receiptPub))
 }
 
 // newServers builds both listeners. net/http's own error lines are discarded:
@@ -734,10 +779,10 @@ func main() {
 	}
 	boot.logf("deks loaded versions=%s current=%d", dekVersions(deks), current)
 
-	// 4. Load secrets: the session HMAC key, then every secret of every loaded catalog account
-	// (all or nothing: a missing or invalid one fails the boot).
+	// 4. Load secrets: the session HMAC key and the receipt signing seed, then every secret of
+	// every loaded catalog account (all or nothing: a missing or invalid one fails the boot).
 	ctx, cancel = context.WithTimeout(context.Background(), bootGCPTimeout)
-	hmacKey, err := loadSecrets(ctx, cfg, client, ts)
+	hmacKey, receiptSeed, err := loadSecrets(ctx, cfg, client, ts)
 	cancel()
 	if err != nil {
 		fail(err.Error())
@@ -747,12 +792,15 @@ func main() {
 	cancel()
 	if err != nil {
 		zero(hmacKey)
+		zero(receiptSeed)
 		fail(err.Error())
 	}
 	boot.logf("catalog loaded env=%s accounts=%d", cfg.env, len(cat.accounts))
 
-	// 5. Build the vault on the catalog parsed in step 1c.
-	v := newVault(cfg, db, deks, current, hmacKey, cat, client, logger)
+	// 5. Build the vault on the catalog parsed in step 1c (this zeroes receiptSeed) and publish
+	// the receipt public key for the platform.
+	v := newVault(cfg, db, deks, current, hmacKey, receiptSeed, cat, client, logger)
+	v.logReceiptPublicKey()
 	v.refreshDEKs = dekRefresher(v, cfg, db, client, ts)
 
 	// Background work runs on bgCtx, cancelled first on shutdown. newVault starts nothing itself,
