@@ -487,7 +487,7 @@ func TestTokenizeReturnsReceipt(t *testing.T) {
 		{"16 digits with name", "4242 4242 4242 4242", "José Ñúñez", "42424242", "4242"},
 		{"16 digits without name", "4242-4242-4242-4242", "", "42424242", "4242"},
 		{"13 digits", "4222222222222", "J", "422222", "2222"},
-		{"19 digits", "4000000000000000006", "", "40000000", "0006"},
+		{"19 digits", "4000000000000000006", "", "400000", "0006"},
 	}
 	for _, c := range cases {
 		v, _ := newTestVault(t)

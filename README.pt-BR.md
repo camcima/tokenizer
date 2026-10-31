@@ -335,7 +335,7 @@ O payload é um JSON compacto com estas chaves, nesta ordem:
 ```
 
 - `token`: o token emitido para este cartão.
-- `bin`: o **BIN** do cartão, seus primeiros 8 dígitos quando o número do cartão tem 16 dígitos ou mais, e caso contrário seus primeiros 6. Junto com `last4`, isso fica dentro dos limites de truncamento do PCI DSS (no máximo os primeiros 8 e os últimos 4 dígitos de um número de cartão com 16 dígitos ou mais, e os primeiros 6 e os últimos 4 de um mais curto), então até um cartão de 13 dígitos mantém 3 dígitos ocultos.
+- `bin`: o **BIN** do cartão: 8 dígitos para um cartão de 16 dígitos, 6 nos demais casos. A forma de 8 dígitos segue a tabela de truncamento do PCI SSC para números de 16 dígitos (no máximo os primeiros 8 e os últimos 4 dígitos); os demais comprimentos usam 6 até que a orientação das bandeiras diga outra coisa. Junto com `last4` sempre restam dígitos ocultos: até um cartão de 13 dígitos mantém 3.
 - `last4`, `exp_month`, `exp_year`: os mesmos valores da resposta.
 - `name`: o nome do titular exatamente como informado. É omitido quando o cartão foi tokenizado sem nome.
 - `iat`: quando o vault emitiu o recibo, em segundos Unix.
@@ -348,7 +348,7 @@ O payload é um JSON compacto com estas chaves, nesta ordem:
 2. A plataforma verifica o recibo com a chave pública do vault, e confere que o `token` dele é o token que ela recebeu, antes de guardar qualquer coisa dele. Um recibo inválido é rejeitado por inteiro, nunca aceito em parte.
 3. A plataforma guarda o BIN, os últimos quatro, a validade e o nome junto ao token.
 
-**Por que a plataforma pode guardar esses dados.** Um número de cartão truncado ao BIN e aos últimos quatro, mesmo com a validade e o nome, não é dado do portador do cartão (CHD). O back end da plataforma continua fora do CDE enquanto guardar apenas esses dados e seguir três regras:
+**Por que a plataforma pode guardar esses dados.** Um número de cartão truncado ao BIN (8 dígitos para um cartão de 16 dígitos, 6 nos demais casos) e aos últimos quatro, mesmo com a validade e o nome, não é dado do portador do cartão (CHD). Por isso guardar esses dados não coloca o back end da plataforma no CDE; se o back end fica fora do escopo depende também da sua segmentação em relação ao CDE e da definição de escopo feita pelo assessor (veja [§5](#5-como-o-vault-reduz-nosso-escopo)). A plataforma também precisa seguir três regras:
 
 - **Clientes veem apenas os últimos quatro.** O BIN junto com os últimos quatro só pode ser exibido para funcionários com necessidade de negócio (requisito 3.4.1 do PCI DSS).
 - **Nenhum hash do número do cartão.** Nunca guardar um hash do número do cartão junto ao número truncado: juntos eles estreitam uma busca por força bruta, e o PCI trata esse par como uma falha de controle. O vault nunca produz um hash assim.
@@ -755,7 +755,7 @@ sequenceDiagram
   }
   ```
 
-  O programa lê a entrada padrão do mesmo jeito que o vault lê o segredo: recusa tudo que não sejam exatamente 64 caracteres hexadecimais, incluindo uma quebra de linha no final, então uma semente que ele aceita é uma com a qual o vault sobe.
+  O programa lê a entrada padrão do mesmo jeito que o vault lê o segredo: recusa tudo que não sejam exatamente 64 caracteres hexadecimais, incluindo uma quebra de linha no final, então uma semente que ele aceita é uma com a qual o vault sobe. Apague `seed.hex` assim que a semente estiver guardada (`shred -u seed.hex` ou equivalente); nunca a commite nem a deixe na estação de trabalho.
 
   **Rotacionar** significa uma semente nova e, portanto, uma chave pública nova. Siga esta ordem: uma instância do vault pode subir a qualquer momento (autohealing, scale-out, uma queda), e uma que sobe com uma semente cuja chave pública a plataforma ainda não aceita emite recibos que a plataforma rejeita.
 
@@ -891,11 +891,11 @@ O serviço é um único pacote Go (`package main`) na raiz do repositório:
 
 Os testes ficam ao lado do código, nos arquivos `*_test.go` correspondentes (`boot_test.go` cobre `main.go` e `gcp.go`; `integration_test.go` contém os testes de banco de dados, end-to-end e da Stripe; `fuzz_test.go` contém os fuzz targets, com seus inputs salvos em `testdata/fuzz/`). Os helpers de teste compartilhados e o `TestMain` que faz a varredura de vazamentos ficam em `helpers_test.go`.
 
-Outros arquivos: `catalog.json` (provedores e contas, compilado no binário), `egress-hosts.dev.txt` / `egress-hosts.prod.txt` (hosts de egress por ambiente, verificados contra o catálogo), `schema.sql` (tabelas, funções e roles, aplicado pelo CI como `vault_owner`), `Makefile`, `Dockerfile`, `deps-baseline.txt`, `vendor/`, `CLAUDE.md` (regras para agentes de IA de programação, incluindo o checklist de revisão do catálogo e as limitações conhecidas), `LICENSE` (MIT), `lefthook.yml` (git hooks), `.gitleaks.toml` (allowlist da varredura de secrets), `scripts/` (as verificações de mensagens de commit e de comentários compartilhadas pelos hooks e pelo CI), `.github/workflows/` (CI, Integration, Image, Fuzz), `docs/` (a revisão de arquitetura de segurança e o registro de riscos).
+Outros arquivos: `catalog.json` (provedores e contas, compilado no binário), `egress-hosts.dev.txt` / `egress-hosts.prod.txt` (hosts de egress por ambiente, verificados contra o catálogo), `schema.sql` (tabelas, funções e roles, aplicado pelo CI como `vault_owner`), `Makefile`, `Dockerfile`, `deps-baseline.txt`, `vendor/`, `CLAUDE.md` (regras para agentes de IA de programação, incluindo o checklist de revisão do catálogo e as limitações conhecidas), `LICENSE` (MIT), `lefthook.yml` (git hooks), `.gitleaks.toml` (allowlist da varredura de secrets), `scripts/` (as verificações de mensagens de commit e de comentários compartilhadas pelos hooks e pelo CI), `.github/workflows/` (CI, Integration, Image, Fuzz), `docs/` (o registro de riscos).
 
 #### 11.4 Verificando um recibo
 
-Qualquer linguagem com Ed25519 consegue verificar um recibo (formato na [§6.2](#62-o-recibo-assinado)). Divida-o em `.`: devem existir exatamente quatro partes, e as duas primeiras devem ser `rcpt` e `v1`. As duas últimas devem ser base64url sem padding e não vazias (apenas `A–Z`, `a–z`, `0–9`, `-` e `_`, sem `=`) e canônicas: os bits baixos não usados do último caractere devem ser zero (o decodificador `Strict()` do Go rejeita qualquer outra coisa; em outras linguagens, recodifique os bytes decodificados e exija que sejam iguais à parte recebida). Decodifique a quarta parte em uma assinatura de 64 bytes, e verifique-a com a chave pública do vault sobre os bytes ASCII de `rcpt.v1.` seguidos da terceira parte exatamente como recebida. Só então decodifique a terceira parte, e interprete-a como um único objeto JSON com apenas as chaves do recibo, escritas exatamente, cada uma no máximo uma vez e sem nada depois, em que toda chave exceto `name` está presente, `iat` é um inteiro JSON maior que 0 e todo outro valor é uma string JSON não vazia. Qualquer outra coisa invalida o recibo inteiro: nunca o conserte nem o aceite em parte. Depois confira que `token` é o token que o navegador enviou. A versão em Go abaixo segue `verifyReceipt` em `receipt.go`, que os testes do vault executam contra os recibos que ele assina:
+Qualquer linguagem com Ed25519 consegue verificar um recibo (formato na [§6.2](#62-o-recibo-assinado)). Rejeite qualquer coisa com mais de 2048 bytes antes de examiná-la (o recibo mais longo que o vault emite tem 1097 bytes), e limite o tamanho da requisição que o traz. Divida-o em `.`: devem existir exatamente quatro partes, e as duas primeiras devem ser `rcpt` e `v1`. As duas últimas devem ser base64url sem padding e não vazias (apenas `A–Z`, `a–z`, `0–9`, `-` e `_`, sem `=`) e canônicas: os bits baixos não usados do último caractere devem ser zero (o decodificador `Strict()` do Go rejeita qualquer outra coisa; em outras linguagens, recodifique os bytes decodificados e exija que sejam iguais à parte recebida). A quarta parte deve ter exatamente 86 caracteres, verificado antes de percorrê-la ou decodificá-la. Decodifique-a em uma assinatura de 64 bytes, e verifique-a com a chave pública do vault sobre os bytes ASCII de `rcpt.v1.` seguidos da terceira parte exatamente como recebida. Só então decodifique a terceira parte, e interprete-a como um único objeto JSON com apenas as chaves do recibo, escritas exatamente, cada uma no máximo uma vez e sem nada depois, em que toda chave exceto `name` está presente, `iat` é um inteiro JSON maior que 0 e todo outro valor é uma string JSON não vazia. Qualquer outra coisa invalida o recibo inteiro: nunca o conserte nem o aceite em parte. Depois confira que `token` é o token que o navegador enviou. A versão em Go abaixo segue `verifyReceipt` em `receipt.go`, que os testes do vault executam contra os recibos que ele assina:
 
 ```go
 package receipt
@@ -923,6 +923,10 @@ type Receipt struct {
 
 var ErrInvalid = errors.New("invalid receipt")
 
+// maxReceiptLen is well above the longest receipt the vault issues (1097 bytes); longer input is
+// rejected before any work is done on it.
+const maxReceiptLen = 2048
+
 const b64url = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 
 var receiptKeys = map[string]bool{"token": true, "bin": true, "last4": true,
@@ -932,11 +936,15 @@ var receiptKeys = map[string]bool{"token": true, "bin": true, "last4": true,
 // The caller must also check that r.Token equals the token it received with the receipt; during a
 // key rotation, call Verify once per accepted public key.
 func Verify(pub ed25519.PublicKey, s string) (Receipt, error) {
-	if len(pub) != ed25519.PublicKeySize {
+	if len(s) > maxReceiptLen || len(pub) != ed25519.PublicKeySize {
 		return Receipt{}, ErrInvalid
 	}
 	parts := strings.SplitN(s, ".", 5)
 	if len(parts) != 4 || parts[0] != "rcpt" || parts[1] != "v1" {
+		return Receipt{}, ErrInvalid
+	}
+	// 86 is the unpadded base64url length of a 64-byte signature.
+	if len(parts[3]) != 86 {
 		return Receipt{}, ErrInvalid
 	}
 	// Go's base64 decoder skips CR and LF, so check the alphabet first.
@@ -1014,7 +1022,7 @@ func exactKeys(payload []byte) bool {
 | **AoC** | Attestation of Compliance: o resumo assinado de uma avaliação PCI. |
 | **ASV** | Approved Scanning Vendor: executa as varreduras externas trimestrais de vulnerabilidades. |
 | **Catálogo** | `catalog.json`: a lista, compilada no binário, de provedores, endpoints permitidos e nossas contas, contra a qual toda requisição a `/proxy` é verificada. |
-| **BIN / IIN** | Os primeiros 6 ou 8 dígitos de um número de cartão, que identificam a bandeira e o banco emissor. Os emissores estão migrando para BINs de 8 dígitos. O recibo do vault carrega os primeiros 8 dígitos de um número de cartão com 16 dígitos ou mais, e os primeiros 6 de um mais curto. |
+| **BIN / IIN** | Os primeiros 6 ou 8 dígitos de um número de cartão, que identificam a bandeira e o banco emissor. Os emissores estão migrando para BINs de 8 dígitos. O recibo do vault carrega 8 dígitos para um cartão de 16 dígitos, 6 nos demais casos. |
 | **CDE** | Cardholder Data Environment: as pessoas, processos e sistemas que lidam com dados de cartão, mais tudo o que estiver conectado a eles. |
 | **CHD** | Cardholder Data: o PAN, mais o nome, a validade e o código de serviço quando armazenados junto com ele. |
 | **CMEK** | Customer-Managed Encryption Keys: armazenamento em nuvem criptografado com chaves que nós controlamos. |

@@ -335,7 +335,7 @@ The payload is compact JSON with these keys, in this order:
 ```
 
 - `token`: the token issued for this card.
-- `bin`: the card's **BIN**, its first 8 digits when the card number has 16 or more digits, otherwise its first 6. With `last4` this stays within the PCI DSS truncation limits (at most the first 8 and last 4 digits of a card number with 16 or more digits, the first 6 and last 4 of a shorter one), so even a 13-digit card keeps 3 digits hidden.
+- `bin`: the card's **BIN**: 8 digits for a 16-digit card, 6 otherwise. The 8-digit form follows the PCI SSC truncation table for 16-digit numbers (at most the first 8 and last 4 digits); other lengths use 6 until the card brands' guidance says otherwise. With `last4` this always leaves digits hidden: even a 13-digit card keeps 3.
 - `last4`, `exp_month`, `exp_year`: the same values as in the response.
 - `name`: the cardholder name exactly as given. It is omitted when the card was tokenized without one.
 - `iat`: when the vault issued the receipt, in Unix seconds.
@@ -348,7 +348,7 @@ The payload is compact JSON with these keys, in this order:
 2. The platform verifies the receipt with the vault's public key, and checks that its `token` is the token it received, before storing anything from it. An invalid receipt is rejected as a whole, never partly trusted.
 3. The platform stores the BIN, last four, expiry and name next to the token.
 
-**Why the platform may keep these facts.** A card number truncated to the BIN and the last four, even with the expiry and the name, is not cardholder data. The platform's back end stays outside the CDE as long as it holds only these facts and follows three rules:
+**Why the platform may keep these facts.** A card number truncated to the BIN (8 digits for a 16-digit card, 6 otherwise) and the last four, even with the expiry and the name, is not cardholder data. Holding these facts therefore doesn't bring the platform's back end into the CDE; whether the back end is out of scope also depends on its segmentation from the CDE and on the assessor's scoping (see [§5](#5-how-the-vault-shrinks-our-scope)). The platform must also follow three rules:
 
 - **Customers see only the last four.** The BIN together with the last four may be shown only to staff with a business need (PCI DSS requirement 3.4.1).
 - **No hash of the card number.** Never store a hash of the card number next to the truncated number: together they narrow a brute-force search, and PCI treats the pair as a control gap. The vault never produces such a hash.
@@ -755,7 +755,7 @@ sequenceDiagram
   }
   ```
 
-  The program reads standard input exactly as the vault reads the secret: anything other than exactly 64 hex characters, a trailing newline included, is refused, so a seed it accepts is one the vault boots with.
+  The program reads standard input exactly as the vault reads the secret: anything other than exactly 64 hex characters, a trailing newline included, is refused, so a seed it accepts is one the vault boots with. Delete `seed.hex` once the seed is stored (`shred -u seed.hex` or equivalent); never commit it or leave it on the workstation.
 
   **Rotation** means a new seed, and so a new public key. Follow this order: a vault instance can boot at any moment (autohealing, scale-out, a crash), and one that boots with a seed whose public key the platform doesn't accept yet issues receipts the platform rejects.
 
@@ -891,11 +891,11 @@ The service is one Go package (`package main`) at the repo root:
 
 Tests sit next to the code in matching `*_test.go` files (`boot_test.go` covers `main.go` and `gcp.go`; `integration_test.go` holds the database, end-to-end and Stripe tests; `fuzz_test.go` holds the fuzz targets, with their saved inputs under `testdata/fuzz/`). Shared test helpers and the leak-scanning `TestMain` are in `helpers_test.go`.
 
-Other files: `catalog.json` (providers and accounts, compiled in), `egress-hosts.dev.txt` / `egress-hosts.prod.txt` (egress hosts per environment, checked against the catalog), `schema.sql` (tables, functions and roles, applied by CI as `vault_owner`), `Makefile`, `Dockerfile`, `deps-baseline.txt`, `vendor/`, `CLAUDE.md` (rules for AI coding agents, including the catalog review checklist and the known limitations), `LICENSE` (MIT), `lefthook.yml` (git hooks), `.gitleaks.toml` (secret-scan allowlist), `scripts/` (the commit-message and comment checks shared by the hooks and CI), `.github/workflows/` (CI, Integration, Image, Fuzz), `docs/` (the security architecture review and the risk register).
+Other files: `catalog.json` (providers and accounts, compiled in), `egress-hosts.dev.txt` / `egress-hosts.prod.txt` (egress hosts per environment, checked against the catalog), `schema.sql` (tables, functions and roles, applied by CI as `vault_owner`), `Makefile`, `Dockerfile`, `deps-baseline.txt`, `vendor/`, `CLAUDE.md` (rules for AI coding agents, including the catalog review checklist and the known limitations), `LICENSE` (MIT), `lefthook.yml` (git hooks), `.gitleaks.toml` (secret-scan allowlist), `scripts/` (the commit-message and comment checks shared by the hooks and CI), `.github/workflows/` (CI, Integration, Image, Fuzz), `docs/` (the risk register).
 
 #### 11.4 Verifying a receipt
 
-Any language with Ed25519 can verify a receipt (format in [§6.2](#62-the-signed-receipt)). Split it on `.`: there must be exactly four parts, and the first two must be `rcpt` and `v1`. The last two must be non-empty unpadded base64url (only `A–Z`, `a–z`, `0–9`, `-` and `_`, no `=`) and canonical: the last character's unused low bits must be zero (Go's `Strict()` decoder rejects anything else; in other languages, re-encode the decoded bytes and require them to equal the part received). Decode the fourth part into a 64-byte signature, and check it with the vault's public key over the ASCII bytes of `rcpt.v1.` followed by the third part exactly as received. Only then decode the third part, and parse it as a single JSON object with only the receipt's keys, spelled exactly, each at most once and nothing after it, where every key except `name` is present, `iat` is a JSON integer greater than 0 and every other value is a non-empty JSON string. Anything else makes the whole receipt invalid: never repair or partly trust it. Then check that `token` is the token the browser sent. The Go version below follows `verifyReceipt` in `receipt.go`, which the vault's tests run against the receipts it signs:
+Any language with Ed25519 can verify a receipt (format in [§6.2](#62-the-signed-receipt)). Reject anything longer than 2048 bytes before looking at it (the longest receipt the vault issues is 1097 bytes), and cap the size of the request that carries it. Split it on `.`: there must be exactly four parts, and the first two must be `rcpt` and `v1`. The last two must be non-empty unpadded base64url (only `A–Z`, `a–z`, `0–9`, `-` and `_`, no `=`) and canonical: the last character's unused low bits must be zero (Go's `Strict()` decoder rejects anything else; in other languages, re-encode the decoded bytes and require them to equal the part received). The fourth part must be exactly 86 characters, checked before it is scanned or decoded. Decode it into a 64-byte signature, and check it with the vault's public key over the ASCII bytes of `rcpt.v1.` followed by the third part exactly as received. Only then decode the third part, and parse it as a single JSON object with only the receipt's keys, spelled exactly, each at most once and nothing after it, where every key except `name` is present, `iat` is a JSON integer greater than 0 and every other value is a non-empty JSON string. Anything else makes the whole receipt invalid: never repair or partly trust it. Then check that `token` is the token the browser sent. The Go version below follows `verifyReceipt` in `receipt.go`, which the vault's tests run against the receipts it signs:
 
 ```go
 package receipt
@@ -923,6 +923,10 @@ type Receipt struct {
 
 var ErrInvalid = errors.New("invalid receipt")
 
+// maxReceiptLen is well above the longest receipt the vault issues (1097 bytes); longer input is
+// rejected before any work is done on it.
+const maxReceiptLen = 2048
+
 const b64url = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 
 var receiptKeys = map[string]bool{"token": true, "bin": true, "last4": true,
@@ -932,11 +936,15 @@ var receiptKeys = map[string]bool{"token": true, "bin": true, "last4": true,
 // The caller must also check that r.Token equals the token it received with the receipt; during a
 // key rotation, call Verify once per accepted public key.
 func Verify(pub ed25519.PublicKey, s string) (Receipt, error) {
-	if len(pub) != ed25519.PublicKeySize {
+	if len(s) > maxReceiptLen || len(pub) != ed25519.PublicKeySize {
 		return Receipt{}, ErrInvalid
 	}
 	parts := strings.SplitN(s, ".", 5)
 	if len(parts) != 4 || parts[0] != "rcpt" || parts[1] != "v1" {
+		return Receipt{}, ErrInvalid
+	}
+	// 86 is the unpadded base64url length of a 64-byte signature.
+	if len(parts[3]) != 86 {
 		return Receipt{}, ErrInvalid
 	}
 	// Go's base64 decoder skips CR and LF, so check the alphabet first.
@@ -1014,7 +1022,7 @@ func exactKeys(payload []byte) bool {
 | **AoC** | Attestation of Compliance: the signed summary of a PCI assessment. |
 | **ASV** | Approved Scanning Vendor: runs the quarterly external vulnerability scans. |
 | **Catalog** | `catalog.json`: the compiled-in list of providers, allowed endpoints and our accounts that every `/proxy` request is checked against. |
-| **BIN / IIN** | The first 6 or 8 digits of a card number, which identify the brand and the issuing bank. Issuers are moving to 8-digit BINs. The vault's receipt carries the first 8 digits of a card number with 16 or more digits, and the first 6 of a shorter one. |
+| **BIN / IIN** | The first 6 or 8 digits of a card number, which identify the brand and the issuing bank. Issuers are moving to 8-digit BINs. The vault's receipt carries 8 digits for a 16-digit card, 6 otherwise. |
 | **CDE** | Cardholder Data Environment: the people, processes and systems that handle card data, plus anything connected to them. |
 | **CHD** | Cardholder Data: the PAN, plus the name, expiry and service code when stored with it. |
 | **CMEK** | Customer-Managed Encryption Keys: cloud storage encrypted with keys we control. |

@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
+	"math"
 	"os"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -50,10 +52,13 @@ func receiptPayload(t *testing.T, s string) []byte {
 
 func TestReceiptBIN(t *testing.T) {
 	cases := []struct{ pan, want string }{
-		{"4242424242424242", "42424242"},    // 16 digits
-		{"378282246310005", "378282"},       // 15 digits
-		{"4222222222222", "422222"},         // 13 digits
-		{"4000000000000000006", "40000000"}, // 19 digits
+		{"4242424242424242", "42424242"},  // 16 digits
+		{"4222222222222", "422222"},       // 13 digits
+		{"30569309025904", "305693"},      // 14 digits
+		{"378282246310005", "378282"},     // 15 digits
+		{"62000000000000017", "620000"},   // 17 digits
+		{"620000000000000017", "620000"},  // 18 digits
+		{"4000000000000000006", "400000"}, // 19 digits
 	}
 	for i, c := range cases {
 		got := cardBIN(c.pan)
@@ -265,6 +270,88 @@ func TestVerifyReceiptRejects(t *testing.T) {
 	}
 }
 
+// maxNameReceipt returns the longest receipt the vault can issue: a 100-rune name whose every rune
+// JSON-escapes to six bytes (U+2028 is written as \u2028) and the largest iat.
+func maxNameReceipt() receipt {
+	r := testReceipt()
+	r.Name = strings.Repeat("\u2028", 100)
+	r.IAT = math.MaxInt64
+	return r
+}
+
+func TestVerifyReceiptLengthCap(t *testing.T) {
+	if n := base64.RawURLEncoding.EncodedLen(ed25519.SignatureSize); n != 86 {
+		t.Fatalf("a signature encodes to %d characters, want 86", n)
+	}
+	if !validName(maxNameReceipt().Name) {
+		t.Fatal("the longest-encoding name is not a name the vault accepts")
+	}
+	longest := signReceipt(testReceiptKey, maxNameReceipt())
+	if len(longest) > maxReceiptLen {
+		t.Fatalf("the longest receipt the vault issues is %d bytes, over the %d-byte cap", len(longest), maxReceiptLen)
+	}
+	// receipt.go and the READMEs quote this figure.
+	if len(longest) != 1097 {
+		t.Fatalf("the longest receipt the vault issues is %d bytes, want the documented 1097", len(longest))
+	}
+	if got, ok := verifyReceipt(testReceiptPub(), longest); !ok || got != maxNameReceipt() {
+		t.Fatal("the longest receipt the vault issues did not verify")
+	}
+
+	// A correctly signed receipt is accepted at the longest length up to the cap and rejected at
+	// the shortest length over it (unpadded base64url never has a length of 4k+1, so not every
+	// length occurs). The vault never issues one this long; the name is just a way to reach it.
+	var under, over string
+	for n := 1; over == ""; n++ {
+		r := testReceipt()
+		r.Name = strings.Repeat("a", n)
+		if s := signReceipt(testReceiptKey, r); len(s) <= maxReceiptLen {
+			under = s
+		} else {
+			over = s
+		}
+	}
+	if len(under) < maxReceiptLen-1 || len(over) > maxReceiptLen+2 {
+		t.Fatalf("receipts of %d and %d bytes do not bracket the %d-byte cap", len(under), len(over), maxReceiptLen)
+	}
+	if _, ok := verifyReceipt(testReceiptPub(), under); !ok {
+		t.Errorf("a correctly signed receipt of %d bytes was rejected", len(under))
+	}
+	if _, ok := verifyReceipt(testReceiptPub(), over); ok {
+		t.Errorf("a correctly signed receipt of %d bytes was accepted", len(over))
+	}
+}
+
+// An oversized or wrongly sized signature part is rejected before it is scanned or decoded, so
+// hostile input costs no allocation proportional to its size.
+func TestVerifyReceiptSignatureBounds(t *testing.T) {
+	good := signReceipt(testReceiptKey, testReceipt())
+	parts := strings.Split(good, ".")
+	payloadPart, sigPart := parts[2], parts[3]
+	huge := receiptPrefix + payloadPart + "." + strings.Repeat("A", 8<<20)
+	cases := []struct{ name, s string }{
+		{"8 MiB signature part", huge},
+		{"signature part of 87 characters", receiptPrefix + payloadPart + "." + sigPart + "A"},
+		{"signature part of 85 characters", receiptPrefix + payloadPart + "." + sigPart[:85]},
+	}
+	for _, c := range cases {
+		if _, ok := verifyReceipt(testReceiptPub(), c.s); ok {
+			t.Errorf("%s: accepted", c.name)
+		}
+	}
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for range 4 {
+		verifyReceipt(testReceiptPub(), huge)
+	}
+	runtime.ReadMemStats(&after)
+	if n := after.TotalAlloc - before.TotalAlloc; n > 1<<20 {
+		t.Errorf("rejecting an 8 MiB signature part allocated %d bytes", n)
+	}
+}
+
 func TestReceiptSignatureCoversPrefix(t *testing.T) {
 	s := signReceipt(testReceiptKey, testReceipt())
 	payloadPart := strings.Split(s, ".")[2]
@@ -314,14 +401,18 @@ func readmeReceiptVerifier(doc string) (code string, blocks int) {
 }
 
 // The receipt verifier published in the three READMEs is one piece of code: it must be the same
-// in every language and keep the checks verifyReceipt relies on (bounded split, canonical
-// base64url, signature over the prefixed payload part, no unknown keys).
+// in every language and keep the checks verifyReceipt relies on (length cap, bounded split, exact
+// signature length, canonical base64url, signature over the prefixed payload part, no unknown
+// keys).
 func TestReadmeReceiptVerifier(t *testing.T) {
 	want := []string{
 		`strings.SplitN(s, ".", 5)`,
 		`base64.RawURLEncoding.Strict()`,
 		`ed25519.Verify(pub, []byte("rcpt.v1."+parts[2])`,
 		`DisallowUnknownFields()`,
+		`const maxReceiptLen = 2048`,
+		`len(s) > maxReceiptLen`,
+		`len(parts[3]) != 86`,
 	}
 	var first string
 	for i, f := range []string{"README.md", "README.es.md", "README.pt-BR.md"} {
