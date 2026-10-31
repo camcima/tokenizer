@@ -253,7 +253,7 @@ func TestGuardRecoversPanic(t *testing.T) {
 
 	// A wrong-length DEK makes seal panic; guard turns that into a 500 too.
 	rec, _ := serveGuard(v, "public", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		seal(make([]byte, 7), []byte(testPAN))
+		seal(make([]byte, 7), []byte(testPAN), nil)
 	}), httptest.NewRequest("POST", "/tokenize", nil))
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("seal panic: status %d, want 500", rec.Code)

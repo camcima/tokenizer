@@ -720,7 +720,7 @@ func seedCardNamed(t *testing.T, v *vault, s *fakeStore, cvv, name string) strin
 	}
 	tok := newToken()
 	s.mu.Lock()
-	s.rows[tok] = fakeRow{ciphertext: seal(dekOf(v, 1), pt), last4: "4242", keyVersion: 1}
+	s.rows[tok] = fakeRow{ciphertext: seal(dekOf(v, 1), pt, cardAAD(tok)), last4: "4242", keyVersion: 1}
 	s.mu.Unlock()
 	if cvv != "" {
 		v.cvv.put(tok, cvv)

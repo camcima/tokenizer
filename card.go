@@ -168,22 +168,35 @@ func newGCM(dek []byte) (cipher.AEAD, error) {
 	return gcm, nil
 }
 
-// seal encrypts plaintext under dek with AES-256-GCM and a fresh random 12-byte nonce, no
-// additional data, returning nonce || ciphertext || tag.
+// cardAADPrefix versions the additional data a card is sealed with, so a future change to the
+// binding cannot be confused with this one. The NUL separates it from the token.
+const cardAADPrefix = "pan-vault/card/1\x00"
+
+// cardAAD is the additional data a stored card is sealed with: it binds the ciphertext to its
+// token, so a ciphertext copied into another token's row fails authentication instead of
+// decrypting as that token's card.
+func cardAAD(token string) []byte {
+	return []byte(cardAADPrefix + token)
+}
+
+// seal encrypts plaintext under dek with AES-256-GCM and a fresh random 12-byte nonce,
+// authenticating aad (which is not stored in the output), and returns nonce || ciphertext || tag.
+// A nil aad means no additional data.
 // A DEK that is not 32 bytes is a programming error (DEKs are length-checked at load) and panics.
-func seal(dek, plaintext []byte) []byte {
+func seal(dek, plaintext, aad []byte) []byte {
 	gcm, err := newGCM(dek)
 	if err != nil {
 		panic("seal: invalid DEK")
 	}
 	out := make([]byte, gcmNonceSize, gcmNonceSize+len(plaintext)+gcmTagSize)
 	rand.Read(out) // never fails; see newToken
-	return gcm.Seal(out, out, plaintext, nil)
+	return gcm.Seal(out, out, plaintext, aad)
 }
 
-// unseal reverses seal. Any failure (bad key length, short blob, authentication failure)
-// returns the same static error, never key or data material.
-func unseal(dek, blob []byte) ([]byte, error) {
+// unseal reverses seal; aad must equal what the blob was sealed with. Any failure (bad key
+// length, short blob, wrong aad, authentication failure) returns the same static error, never
+// key or data material.
+func unseal(dek, blob, aad []byte) ([]byte, error) {
 	gcm, err := newGCM(dek)
 	if err != nil {
 		return nil, errUnseal
@@ -191,7 +204,7 @@ func unseal(dek, blob []byte) ([]byte, error) {
 	if len(blob) < gcmNonceSize+gcmTagSize {
 		return nil, errUnseal
 	}
-	pt, err := gcm.Open(nil, blob[:gcmNonceSize], blob[gcmNonceSize:], nil)
+	pt, err := gcm.Open(nil, blob[:gcmNonceSize], blob[gcmNonceSize:], aad)
 	if err != nil {
 		return nil, errUnseal
 	}

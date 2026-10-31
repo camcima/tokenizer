@@ -346,9 +346,15 @@ func TestTokenizeStoresDecryptableCard(t *testing.T) {
 	if bytes.Contains(row.ciphertext, []byte(testPAN)) || bytes.Contains(row.ciphertext, []byte(testCVV)) {
 		t.Fatal("ciphertext contains plaintext card data")
 	}
-	pt, err := unseal(dekOf(v, 1), row.ciphertext)
+	pt, err := unseal(dekOf(v, 1), row.ciphertext, cardAAD(resp.Token))
 	if err != nil {
-		t.Fatal("stored ciphertext does not unseal with DEK v1")
+		t.Fatal("stored ciphertext does not unseal with DEK v1 and its token's AAD")
+	}
+	if _, err := unseal(dekOf(v, 1), row.ciphertext, cardAAD(newToken())); err == nil {
+		t.Fatal("stored ciphertext unseals with another token's AAD")
+	}
+	if _, err := unseal(dekOf(v, 1), row.ciphertext, nil); err == nil {
+		t.Fatal("stored ciphertext unseals without AAD")
 	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(pt, &fields); err != nil || len(fields) != 3 {
@@ -380,7 +386,7 @@ func TestTokenizeStoresDecryptableCard(t *testing.T) {
 	}
 	if row := s.rows[resp.Token]; row.keyVersion != 2 {
 		t.Fatalf("keyVersion %d, want current DEK 2", row.keyVersion)
-	} else if _, err := unseal(dekOf(v, 2), row.ciphertext); err != nil {
+	} else if _, err := unseal(dekOf(v, 2), row.ciphertext, cardAAD(resp.Token)); err != nil {
 		t.Fatal("ciphertext does not unseal with DEK v2")
 	}
 
@@ -422,7 +428,7 @@ func TestTokenizeStoresName(t *testing.T) {
 	if bytes.Contains(row.ciphertext, []byte(name)) {
 		t.Fatal("ciphertext contains the plaintext name")
 	}
-	pt, err := unseal(dekOf(v, row.keyVersion), row.ciphertext)
+	pt, err := unseal(dekOf(v, row.keyVersion), row.ciphertext, cardAAD(resp.Token))
 	if err != nil {
 		t.Fatal("stored ciphertext does not unseal")
 	}
@@ -444,7 +450,7 @@ func TestTokenizeStoresName(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal("no-name response does not decode")
 	}
-	pt, err = unseal(dekOf(v, s.rows[resp.Token].keyVersion), s.rows[resp.Token].ciphertext)
+	pt, err = unseal(dekOf(v, s.rows[resp.Token].keyVersion), s.rows[resp.Token].ciphertext, cardAAD(resp.Token))
 	if err != nil {
 		t.Fatal("no-name ciphertext does not unseal")
 	}

@@ -323,10 +323,11 @@ func (v *vault) handleTokenize(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, msgInternal)
 		return
 	}
-	ciphertext := seal(dek, plaintext)
+	// The token is drawn first because it is sealed into the ciphertext as additional data.
+	token := newToken()
+	ciphertext := seal(dek, plaintext, cardAAD(token))
 	zero(plaintext) // best effort
 
-	token := newToken()
 	last4 := pan[len(pan)-4:]
 	if err := v.putCard(r.Context(), token, ciphertext, last4, keyVersion); err != nil {
 		// The error is never logged or returned: it could carry driver or query detail.
