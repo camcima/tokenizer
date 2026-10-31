@@ -277,8 +277,8 @@ func parseCatProvider(name string, rp rawProvider) (*catProvider, error) {
 // parseCatEndpoint validates one endpoint rule of a provider with body format format.
 // Additional rules: (1) {{basic:}} is header-only, (2) the payu signer needs a json
 // provider (it reads body fields by JSON Pointer), (3) the whole-document address "" and empty JSON
-// Pointer tokens are rejected, and (4) form positions and pins may not use a repeatable "[]" key (it
-// names no single value).
+// Pointer tokens are rejected, (4) form positions and pins may not use a repeatable "[]" key (it
+// names no single value), and (5) at most maxOccurrences positions (scanBody's cap).
 // Every endpoint must have "card_data": true and list a {{pan}} position. The account credential
 // is only for card-carrying calls; calls without card data (payments with a provider token,
 // refunds, queries) are the platform's to make, with its own keys. A non-card endpoint would let
@@ -335,6 +335,9 @@ func parseCatEndpoint(format string, i int, re rawEndpoint) (*catEndpoint, error
 		e.headers[name] = re.Headers[k]
 	}
 
+	if len(re.Positions) > maxOccurrences {
+		return nil, fmt.Errorf("endpoint %q: more than %d positions", id, maxOccurrences)
+	}
 	hasPAN := false
 	for _, addr := range slices.Sorted(maps.Keys(re.Positions)) {
 		if !validCatAddress(format, addr) || (format == "form" && strings.HasSuffix(addr, "[]")) {

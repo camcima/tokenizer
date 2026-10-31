@@ -112,6 +112,12 @@ var (
 	errPlaceholder = errors.New("invalid placeholder use") // placeholder-looking text where it is not allowed
 )
 
+// maxOccurrences caps the placeholder occurrences scanBody returns, and parseCatEndpoint refuses
+// an endpoint listing more positions, so the cap never refuses a request the catalog would accept:
+// every accepted occurrence sits at a listed position, and no two share an address (JSON objects
+// have no duplicate keys, and form placeholders are never under a repeatable "[]" key).
+const maxOccurrences = 64
+
 // JSON nesting deeper than 64 objects/arrays is rejected. Provider bodies nest a
 // handful of levels; the cap bounds work on pathological input well below encoding/json's own.
 const maxJSONDepth = 64
@@ -136,18 +142,25 @@ type jsonNode struct {
 // jsonPointerEscaper escapes one RFC 6901 reference token ("~" first, then "/").
 var jsonPointerEscaper = strings.NewReplacer("~", "~0", "/", "~1")
 
-// jsonPointer returns the JSON Pointer of nodes[i], assembled from its own and its ancestors' segs.
+// jsonPointer returns the JSON Pointer of nodes[i], assembled from its own and its ancestors' segs
+// in one allocation. Segs are written root first by walking up to each ancestor in turn, which is
+// quadratic in the depth, at most maxJSONDepth+1.
 func jsonPointer(nodes []jsonNode, i int) string {
-	n := 0
+	n, depth := 0, 0
 	for j := i; j >= 0; j = nodes[j].parent {
 		n += len(nodes[j].seg)
+		depth++
 	}
-	buf := make([]byte, n)
-	for j := i; j >= 0; j = nodes[j].parent {
-		n -= len(nodes[j].seg)
-		copy(buf[n:], nodes[j].seg)
+	var b strings.Builder
+	b.Grow(n)
+	for d := depth - 1; d >= 0; d-- {
+		j := i
+		for range d {
+			j = nodes[j].parent
+		}
+		b.WriteString(nodes[j].seg)
 	}
-	return string(buf)
+	return b.String()
 }
 
 // jsonPointerIs reports whether jsonPointer(nodes, i) equals addr, or with fold set whether the two
@@ -421,6 +434,10 @@ func validFormKey(k string) bool {
 //     placeholder, and never under a "[]" key (repeatable, so not a unique position); a key
 //     containing "{{" is always an error.
 //
+// More than maxOccurrences occurrences is errPlaceholder. No request a catalog endpoint accepts
+// has more (see maxOccurrences), and each occurrence's address is a copy of its ancestors' keys, so
+// an unbounded count under a long key would cost memory growing with the square of the body size.
+//
 // Strictness failures (errBody) take precedence over placeholder failures.
 func scanBody(format string, body []byte) ([]occurrence, error) {
 	var occs []occurrence
@@ -430,6 +447,8 @@ func scanBody(format string, body []byte) ([]occurrence, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Addresses are built only once the count is known to be within the cap.
+		var at []int // node index of each occurrence
 		for i, n := range nodes {
 			if !strings.Contains(n.text, "{{") || (n.kind != "key" && n.kind != "string") {
 				continue
@@ -439,10 +458,14 @@ func scanBody(format string, body []byte) ([]occurrence, error) {
 			}
 			raw := string(body[n.start+1 : n.end-1])
 			ph, ok := parsePlaceholder(raw)
-			if !ok || raw != n.text {
+			if !ok || raw != n.text || len(occs) == maxOccurrences {
 				return nil, errPlaceholder
 			}
-			occs = append(occs, occurrence{addr: jsonPointer(nodes, i), ph: ph, start: n.start, end: n.end})
+			occs = append(occs, occurrence{ph: ph, start: n.start, end: n.end})
+			at = append(at, i)
+		}
+		for k, i := range at {
+			occs[k].addr = jsonPointer(nodes, i)
 		}
 	case "form":
 		fields, err := formFields(body)
@@ -458,7 +481,7 @@ func scanBody(format string, body []byte) ([]occurrence, error) {
 			}
 			raw := string(body[f.start:f.end])
 			ph, ok := parsePlaceholder(raw)
-			if !ok || raw != f.value || strings.HasSuffix(f.key, "[]") {
+			if !ok || raw != f.value || strings.HasSuffix(f.key, "[]") || len(occs) == maxOccurrences {
 				return nil, errPlaceholder
 			}
 			occs = append(occs, occurrence{addr: f.key, ph: ph, start: f.start, end: f.end})

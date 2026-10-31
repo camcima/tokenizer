@@ -4,6 +4,7 @@ import (
 	"maps"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -314,6 +315,36 @@ func TestParseCatalogRejects(t *testing.T) {
 	for _, env := range []string{"", "staging", "Dev", "PROD"} {
 		if _, err := parseCatalog([]byte(testCatalogJSON), env); err == nil {
 			t.Errorf("env %q accepted", env)
+		}
+	}
+}
+
+// TestParseCatEndpointPositionCap: an endpoint may list up to maxOccurrences positions, the most
+// placeholder occurrences scanBody returns, so the cap never refuses a request the catalog accepts.
+func TestParseCatEndpointPositionCap(t *testing.T) {
+	for _, format := range []string{"json", "form"} {
+		endpoint := func(n int) rawEndpoint {
+			re := rawEndpoint{ID: "payments", Method: "POST", Path: "/v1/payments", CardData: true,
+				Positions: map[string]string{}}
+			for i := range n {
+				addr := "/s/" + strconv.Itoa(i)
+				if format == "form" {
+					addr = "s" + strconv.Itoa(i)
+				}
+				re.Positions[addr] = "{{secret:apiKey}}"
+				if i == 0 {
+					re.Positions[addr] = "{{pan}}"
+				}
+			}
+			return re
+		}
+		e, err := parseCatEndpoint(format, 0, endpoint(maxOccurrences))
+		if err != nil || len(e.positions) != maxOccurrences {
+			t.Errorf("%s: %d positions refused: %v", format, maxOccurrences, err)
+		}
+		if _, err := parseCatEndpoint(format, 0, endpoint(maxOccurrences+1)); err == nil ||
+			!strings.Contains(err.Error(), "more than 64 positions") {
+			t.Errorf("%s: %d positions: %v", format, maxOccurrences+1, err)
 		}
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/url"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -215,60 +216,104 @@ func TestJSONPointer(t *testing.T) {
 	}
 }
 
-// TestJSONWalkMemoryBound: walking a body costs memory linear in its size. Two shapes would cost
-// memory growing with the square of the input if the walker copied per node: a long key over a
-// wide array (each element's JSON Pointer would copy the key) and deep nesting around a long string
-// (each container's text would copy the string).
+// allocated returns the bytes f allocates.
+func allocated(f func()) int {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	f()
+	runtime.ReadMemStats(&after)
+	return int(after.TotalAlloc - before.TotalAlloc)
+}
+
+// TestJSONWalkMemoryBound: walking a body costs memory linear in its size. Three shapes would cost
+// memory growing with the square of the input if the walker or scanner copied per node: a long key
+// over a wide array (each element's JSON Pointer would copy the key), deep nesting around a long
+// string (each container's text would copy the string), and many placeholders under a long key
+// (each occurrence's address would copy the key). Each bound is the cost one feature adds over a
+// twin body without it, so encoding/json's own cost per token (its Token loop alone allocates about
+// 6x the wide body) cancels out.
 func TestJSONWalkMemoryBound(t *testing.T) {
 	wide := func(key string) []byte {
-		var b strings.Builder
-		b.WriteString(`{"` + key + `":[`)
-		for i := range 4000 {
-			if i > 0 {
-				b.WriteByte(',')
+		return []byte(`{"` + key + `":[` + strings.TrimSuffix(strings.Repeat("1,", 4000), ",") + `]}`)
+	}
+	many := func(key string) []byte {
+		return []byte(`{"` + key + `":[` + strings.TrimSuffix(strings.Repeat(`"{{pan}}",`, 2600), ",") + `]}`)
+	}
+	key, str, manyKey := strings.Repeat("k", 8000), strings.Repeat("s", 16000), strings.Repeat("k", 32000)
+	cases := []struct {
+		name          string
+		with, without []byte
+		limit         int
+	}{
+		{"an 8000-byte key over 4000 elements", wide(key), wide("k"), 8 * len(key)},
+		{"64 levels of nesting around a 16000-byte string",
+			[]byte(strings.Repeat("[", maxJSONDepth) + `"` + str + `"` + strings.Repeat("]", maxJSONDepth)),
+			[]byte(`"` + str + `"`), 2 * len(str)},
+	}
+	for _, c := range cases {
+		for _, b := range [][]byte{c.with, c.without} {
+			if err := jsonStrict(b); err != nil {
+				t.Fatalf("%s: jsonStrict: %v", c.name, err)
 			}
-			b.WriteByte('1')
+			if occs, err := scanBody("json", b); err != nil || len(occs) != 0 {
+				t.Fatalf("%s: scanBody: %d occurrences, err %v", c.name, len(occs), err)
+			}
 		}
-		b.WriteString(`]}`)
-		return []byte(b.String())
-	}
-	key := strings.Repeat("k", 8000)
-	long, short := wide(key), wide("k")
-	deep := []byte(strings.Repeat("[", maxJSONDepth) + `"` + strings.Repeat("s", 16000) + `"` + strings.Repeat("]", maxJSONDepth))
-	for i, b := range [][]byte{long, short, deep} {
-		if err := jsonStrict(b); err != nil {
-			t.Fatalf("body %d: jsonStrict: %v", i, err)
+		strict := allocated(func() { _ = jsonStrict(c.with) }) - allocated(func() { _ = jsonStrict(c.without) })
+		if strict >= c.limit {
+			t.Errorf("%s added %d bytes to jsonStrict, want < %d", c.name, strict, c.limit)
 		}
-		if occs, err := scanBody("json", b); err != nil || len(occs) != 0 {
-			t.Fatalf("body %d: scanBody: %d occurrences, err %v", i, len(occs), err)
+		scan := allocated(func() { _, _ = scanBody("json", c.with) }) - allocated(func() { _, _ = scanBody("json", c.without) })
+		if scan >= c.limit {
+			t.Errorf("%s added %d bytes to scanBody, want < %d", c.name, scan, c.limit)
 		}
-	}
-	allocated := func(f func()) int {
-		var before, after runtime.MemStats
-		runtime.GC()
-		runtime.ReadMemStats(&before)
-		f()
-		runtime.ReadMemStats(&after)
-		return int(after.TotalAlloc - before.TotalAlloc)
 	}
 
-	// jsonStrict keeps no nodes; what remains is encoding/json's own cost per token (its Token
-	// loop alone allocates about 6x the wide body) and the key sets.
-	for i, b := range [][]byte{long, deep} {
-		if n := allocated(func() { _ = jsonStrict(b) }); n >= 8*len(b) {
-			t.Errorf("body %d: jsonStrict of %d bytes allocated %d bytes, want < %d", i, len(b), n, 8*len(b))
+	// 2600 placeholders (58 KB) are refused, and under a 32000-byte key cost no more than under a
+	// one-byte key: the cap is reached before any address is built.
+	manyLong, manyShort := many(manyKey), many("k")
+	for _, b := range [][]byte{manyLong, manyShort} {
+		if _, err := scanBody("json", b); !errors.Is(err, errPlaceholder) {
+			t.Fatalf("2600 placeholders: %v", err)
 		}
 	}
-	// scanBody keeps one node per token, so its cost follows the token count. The long key may
-	// cost its own size a few times over (decoded, as a pointer token, in the decoder's buffer) but
-	// never once per element beneath it, and a container's text is never copied.
-	scanLong := allocated(func() { _, _ = scanBody("json", long) })
-	scanShort := allocated(func() { _, _ = scanBody("json", short) })
-	if n := scanLong - scanShort; n >= 8*len(key) {
-		t.Errorf("a %d-byte key over %d elements added %d bytes to scanBody, want < %d", len(key), 4000, n, 8*len(key))
+	scan := allocated(func() { _, _ = scanBody("json", manyLong) }) - allocated(func() { _, _ = scanBody("json", manyShort) })
+	if scan >= 8*len(manyKey) {
+		t.Errorf("a %d-byte key over 2600 placeholders added %d bytes to scanBody, want < %d", len(manyKey), scan, 8*len(manyKey))
 	}
-	if n := allocated(func() { _, _ = scanBody("json", deep) }); n >= 8*len(deep) {
-		t.Errorf("scanBody of %d nested bytes allocated %d bytes, want < %d", len(deep), n, 8*len(deep))
+}
+
+// TestScanOccurrenceCap: up to maxOccurrences placeholder occurrences are returned; one more is
+// errPlaceholder, unless the body also fails the strict parse.
+func TestScanOccurrenceCap(t *testing.T) {
+	jsonBody := func(n int) string {
+		return `[` + strings.TrimSuffix(strings.Repeat(`"{{signature}}",`, n), ",") + `]`
+	}
+	formBody := func(n int) string {
+		var parts []string
+		for i := range n {
+			parts = append(parts, "a"+strconv.Itoa(i)+"={{signature}}")
+		}
+		return strings.Join(parts, "&")
+	}
+	for format, mk := range map[string]func(int) string{"json": jsonBody, "form": formBody} {
+		occs, err := scanBody(format, []byte(mk(maxOccurrences)))
+		if err != nil || len(occs) != maxOccurrences {
+			t.Errorf("%s: %d placeholders: %d occurrences, err %v", format, maxOccurrences, len(occs), err)
+		}
+		if format == "json" && (occs[0].addr != "/0" || occs[maxOccurrences-1].addr != "/63") {
+			t.Errorf("json: addresses %q .. %q", occs[0].addr, occs[maxOccurrences-1].addr)
+		}
+		if _, err := scanBody(format, []byte(mk(maxOccurrences+1))); !errors.Is(err, errPlaceholder) {
+			t.Errorf("%s: %d placeholders: %v", format, maxOccurrences+1, err)
+		}
+	}
+	if _, err := scanBody("json", []byte(jsonBody(maxOccurrences+1)+" {}")); !errors.Is(err, errBody) {
+		t.Errorf("json: too many placeholders and trailing data: %v", err)
+	}
+	if _, err := scanBody("form", []byte(formBody(maxOccurrences+1)+"&a0=x")); !errors.Is(err, errBody) {
+		t.Errorf("form: too many placeholders and a duplicate key: %v", err)
 	}
 }
 
