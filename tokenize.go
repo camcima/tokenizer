@@ -313,8 +313,8 @@ func (v *vault) handleTokenize(w http.ResponseWriter, r *http.Request) {
 		name = *req.Name
 	}
 
-	dek, ok := v.deks[v.currentDEK]
-	if !ok {
+	keyVersion, dek := v.currentDEK()
+	if dek == nil {
 		writeError(w, http.StatusInternalServerError, msgInternal)
 		return
 	}
@@ -328,7 +328,7 @@ func (v *vault) handleTokenize(w http.ResponseWriter, r *http.Request) {
 
 	token := newToken()
 	last4 := pan[len(pan)-4:]
-	if err := v.putCard(r.Context(), token, ciphertext, last4, v.currentDEK); err != nil {
+	if err := v.putCard(r.Context(), token, ciphertext, last4, keyVersion); err != nil {
 		// The error is never logged or returned: it could carry driver or query detail.
 		writeError(w, http.StatusInternalServerError, msgInternal)
 		return

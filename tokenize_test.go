@@ -346,7 +346,7 @@ func TestTokenizeStoresDecryptableCard(t *testing.T) {
 	if bytes.Contains(row.ciphertext, []byte(testPAN)) || bytes.Contains(row.ciphertext, []byte(testCVV)) {
 		t.Fatal("ciphertext contains plaintext card data")
 	}
-	pt, err := unseal(v.deks[1], row.ciphertext)
+	pt, err := unseal(dekOf(v, 1), row.ciphertext)
 	if err != nil {
 		t.Fatal("stored ciphertext does not unseal with DEK v1")
 	}
@@ -367,8 +367,7 @@ func TestTokenizeStoresDecryptableCard(t *testing.T) {
 	}
 
 	// Without a CVV nothing is cached; with the current DEK at v2, v2 is used.
-	v.deks[2] = bytes.Repeat([]byte{0x02}, 32)
-	v.currentDEK = 2
+	v.keys.Store(&dekSet{deks: map[int][]byte{1: dekOf(v, 1), 2: bytes.Repeat([]byte{0x02}, 32)}, current: 2})
 	rec = serveTokenize(v, tokRequest(tokCase{body: tokBody(map[string]any{"cvv": nil})}))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("no-cvv status %d, want 200", rec.Code)
@@ -381,7 +380,7 @@ func TestTokenizeStoresDecryptableCard(t *testing.T) {
 	}
 	if row := s.rows[resp.Token]; row.keyVersion != 2 {
 		t.Fatalf("keyVersion %d, want current DEK 2", row.keyVersion)
-	} else if _, err := unseal(v.deks[2], row.ciphertext); err != nil {
+	} else if _, err := unseal(dekOf(v, 2), row.ciphertext); err != nil {
 		t.Fatal("ciphertext does not unseal with DEK v2")
 	}
 
@@ -423,7 +422,7 @@ func TestTokenizeStoresName(t *testing.T) {
 	if bytes.Contains(row.ciphertext, []byte(name)) {
 		t.Fatal("ciphertext contains the plaintext name")
 	}
-	pt, err := unseal(v.deks[row.keyVersion], row.ciphertext)
+	pt, err := unseal(dekOf(v, row.keyVersion), row.ciphertext)
 	if err != nil {
 		t.Fatal("stored ciphertext does not unseal")
 	}
@@ -445,7 +444,7 @@ func TestTokenizeStoresName(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal("no-name response does not decode")
 	}
-	pt, err = unseal(v.deks[s.rows[resp.Token].keyVersion], s.rows[resp.Token].ciphertext)
+	pt, err = unseal(dekOf(v, s.rows[resp.Token].keyVersion), s.rows[resp.Token].ciphertext)
 	if err != nil {
 		t.Fatal("no-name ciphertext does not unseal")
 	}
@@ -469,7 +468,7 @@ func TestTokenizeStoresName(t *testing.T) {
 // A missing current DEK is an internal error, never a panic or a stored row.
 func TestTokenizeMissingDEK(t *testing.T) {
 	v, s := newTestVault(t)
-	v.currentDEK = 9
+	v.keys.Store(&dekSet{deks: v.keys.Load().deks, current: 9})
 	rec := serveTokenize(v, tokRequest(tokCase{}))
 	if rec.Code != http.StatusInternalServerError || rec.Body.String() != `{"error":"internal error"}`+"\n" {
 		t.Fatalf("status %d, body len %d, want 500 internal error", rec.Code, rec.Body.Len())

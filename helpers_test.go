@@ -151,8 +151,6 @@ func newTestVault(t *testing.T) (*vault, *fakeStore) {
 		putCard:     s.putCard,
 		getCard:     s.getCard,
 		ping:        func(context.Context) error { return nil },
-		deks:        map[int][]byte{1: bytes.Repeat([]byte{0x01}, 32)},
-		currentDEK:  1,
 		hmacKey:     testHMACKey,
 		allowOrigin: testOrigin,
 		now:         now,
@@ -165,6 +163,7 @@ func newTestVault(t *testing.T) (*vault, *fakeStore) {
 		}
 	}
 	v.catalog.accounts["payu_co"].secrets["apiKey"] = payuTestAPIKey
+	v.keys.Store(&dekSet{deks: map[int][]byte{1: bytes.Repeat([]byte{0x01}, 32)}, current: 1})
 	v.cvv = newCVVCache(cvvCacheTTL, func() time.Time { return v.now() })
 	return v, s
 }
@@ -721,7 +720,7 @@ func seedCardNamed(t *testing.T, v *vault, s *fakeStore, cvv, name string) strin
 	}
 	tok := newToken()
 	s.mu.Lock()
-	s.rows[tok] = fakeRow{ciphertext: seal(v.deks[1], pt), last4: "4242", keyVersion: 1}
+	s.rows[tok] = fakeRow{ciphertext: seal(dekOf(v, 1), pt), last4: "4242", keyVersion: 1}
 	s.mu.Unlock()
 	if cvv != "" {
 		v.cvv.put(tok, cvv)
@@ -1018,4 +1017,10 @@ func stripeProxyRequest(tok, path string, headers map[string]string, body string
 	e := newEnvelope("stripe_test", "POST", path, headers, body)
 	e.Token = tok
 	return newProxyRequest(envelopeJSON(e))
+}
+
+// dekOf returns DEK version ver from the vault's current snapshot, or nil.
+func dekOf(v *vault, ver int) []byte {
+	d, _ := v.dek(ver)
+	return d
 }
