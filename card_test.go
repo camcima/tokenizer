@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"strings"
@@ -403,5 +404,198 @@ func TestCVVConcurrentTake(t *testing.T) {
 	wg.Wait()
 	if hits != 1 {
 		t.Fatalf("%d concurrent takes received the CVV, want exactly 1", hits)
+	}
+}
+
+func TestCVVSweepRemovesExpiredWithoutTraffic(t *testing.T) {
+	clk := &fakeClock{t: testNow}
+	c := newCVVCache(cvvCacheTTL, clk.now)
+	c.put("tok_a", testCVV)
+	ref := storedCVV(c, "tok_a")
+	if len(ref) == 0 {
+		t.Fatal("put stored no CVV bytes")
+	}
+	clk.advance(cvvCacheTTL + time.Second)
+	if n := c.sweep(); n != 1 {
+		t.Fatalf("sweep removed %d entries, want 1", n)
+	}
+	if n := cvvCacheLen(c); n != 0 {
+		t.Fatalf("after sweep the cache holds %d entries, want 0", n)
+	}
+	if !allZero(ref) {
+		t.Fatal("sweep left the removed CVV bytes in memory")
+	}
+	if n := c.sweep(); n != 0 {
+		t.Fatalf("second sweep removed %d entries, want 0", n)
+	}
+}
+
+func TestCVVRunStopsOnCancel(t *testing.T) {
+	clk := &fakeClock{t: testNow}
+	c := newCVVCache(cvvCacheTTL, clk.now)
+	c.put("tok_a", testCVV)
+	clk.advance(cvvCacheTTL + time.Second)
+
+	// run sweeps on its ticker with no other traffic.
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		c.run(ctx, time.Millisecond)
+		close(done)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for cvvCacheLen(c) != 0 {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("run did not sweep the expired entry within 2s")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run did not return within 2s of cancellation")
+	}
+
+	// An already-cancelled context returns promptly too.
+	done = make(chan struct{})
+	go func() {
+		c.run(ctx, time.Millisecond)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run with a cancelled context did not return within 2s")
+	}
+}
+
+func TestCVVDrop(t *testing.T) {
+	c := newCVVCache(cvvCacheTTL, func() time.Time { return testNow })
+	c.put("tok_a", testCVV)
+	ref := storedCVV(c, "tok_a")
+	c.drop("tok_a")
+	if !allZero(ref) {
+		t.Fatal("drop left the removed CVV bytes in memory")
+	}
+	if c.take("tok_a") != "" {
+		t.Fatal("take after drop returned a CVV")
+	}
+	c.drop("tok_a")      // absent: no-op
+	c.drop("tok_absent") // never cached: no-op
+	if n := cvvCacheLen(c); n != 0 {
+		t.Fatalf("cache holds %d entries after drops, want 0", n)
+	}
+}
+
+func TestCVVDropConcurrentTake(t *testing.T) {
+	c := newCVVCache(cvvCacheTTL, func() time.Time { return testNow })
+	c.put("tok_a", testCVV)
+	var (
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		hits int
+		bad  int
+	)
+	start := make(chan struct{})
+	for i := 0; i < 25; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			if got := c.take("tok_a"); got != "" {
+				mu.Lock()
+				hits++
+				if got != testCVV {
+					bad++
+				}
+				mu.Unlock()
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			c.drop("tok_a")
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if hits > 1 || bad != 0 {
+		t.Fatalf("%d takes received a CVV (%d corrupted), want at most 1 intact", hits, bad)
+	}
+	if n := cvvCacheLen(c); n != 0 {
+		t.Fatalf("cache holds %d entries, want 0", n)
+	}
+}
+
+func TestCVVCap(t *testing.T) {
+	c := newCVVCache(cvvCacheTTL, func() time.Time { return testNow })
+	fillCVVCache(c, "tok_fill_", cvvCacheMax, testNow.Add(time.Hour))
+	if c.put("tok_new", testCVV) {
+		t.Fatal("put into a full cache reported success")
+	}
+	if n := cvvCacheLen(c); n != cvvCacheMax {
+		t.Fatalf("cache holds %d entries, want %d", n, cvvCacheMax)
+	}
+	if c.take("tok_new") != "" {
+		t.Fatal("take returned a CVV refused by a full cache")
+	}
+	// Freeing one slot lets the next put in.
+	c.drop("tok_fill_0")
+	if !c.put("tok_new", testCVV) {
+		t.Fatal("put with a free slot reported failure")
+	}
+	if c.take("tok_new") != testCVV {
+		t.Fatal("take did not return the CVV cached into the freed slot")
+	}
+}
+
+func TestCVVCapAfterSweep(t *testing.T) {
+	clk := &fakeClock{t: testNow}
+	c := newCVVCache(cvvCacheTTL, clk.now)
+	fillCVVCache(c, "tok_fill_", cvvCacheMax-1, testNow.Add(time.Hour))
+	fillCVVCache(c, "tok_old_", 1, testNow.Add(time.Minute))
+	if n := cvvCacheLen(c); n != cvvCacheMax {
+		t.Fatalf("cache holds %d entries, want %d", n, cvvCacheMax)
+	}
+	// The new put arrives at the instant the old entry expires.
+	clk.advance(time.Minute)
+	if !c.put("tok_new", testCVV) {
+		t.Fatal("put refused although an expired entry could be swept")
+	}
+	if n := cvvCacheLen(c); n != cvvCacheMax {
+		t.Fatalf("cache holds %d entries, want %d", n, cvvCacheMax)
+	}
+	if c.take("tok_new") != testCVV {
+		t.Fatal("take did not return the CVV cached after the sweep")
+	}
+}
+
+func TestCVVTakeZeroes(t *testing.T) {
+	c := newCVVCache(cvvCacheTTL, func() time.Time { return testNow })
+	c.put("tok_a", testCVV)
+	ref := storedCVV(c, "tok_a")
+	if len(ref) == 0 {
+		t.Fatal("put stored no CVV bytes")
+	}
+	if c.take("tok_a") != testCVV {
+		t.Fatal("take did not return the cached CVV")
+	}
+	if !allZero(ref) {
+		t.Fatal("take left the removed CVV bytes in memory")
+	}
+
+	// An expired entry removed by take is zeroed as well.
+	clk := &fakeClock{t: testNow}
+	c = newCVVCache(cvvCacheTTL, clk.now)
+	c.put("tok_b", testCVV)
+	ref = storedCVV(c, "tok_b")
+	clk.advance(cvvCacheTTL)
+	if c.take("tok_b") != "" {
+		t.Fatal("take returned an expired CVV")
+	}
+	if !allZero(ref) {
+		t.Fatal("take left an expired CVV's bytes in memory")
 	}
 }

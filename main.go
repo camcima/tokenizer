@@ -543,7 +543,7 @@ func newVault(cfg config, db *sql.DB, deks map[int][]byte, current int, hmacKey 
 		currentDEK:  current,
 		hmacKey:     hmacKey,
 		allowOrigin: cfg.allowOrigin,
-		cvv:         newCVVCache(15*time.Minute, time.Now),
+		cvv:         newCVVCache(cvvCacheTTL, time.Now),
 		now:         time.Now,
 		log:         logger,
 		catalog:     cat,
@@ -705,6 +705,11 @@ func main() {
 	// 5. Build the vault on the catalog parsed in step 1c.
 	v := newVault(cfg, db, deks, current, hmacKey, cat, client, logger)
 
+	// Background work runs on bgCtx, cancelled first on shutdown. newVault starts nothing itself,
+	// so tests drive these loops directly.
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	go v.cvv.run(bgCtx, cvvSweepEvery)
+
 	// 6. Start both listeners (certificate and client CA were loaded in step 1b).
 	// Each socket is bound with net.Listen before serving (ServeTLS("", "") is what
 	// ListenAndServeTLS("", "") does after binding), so a bind failure exits 1 before "ready".
@@ -737,6 +742,7 @@ func main() {
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
 	select {
 	case <-sig:
+		bgCancel()
 		// Stop accepting and drain both listeners concurrently within one 20s budget.
 		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		var wg sync.WaitGroup

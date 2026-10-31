@@ -347,7 +347,7 @@ func TestProxySuccess(t *testing.T) {
 		t.Error("adyen: outbound credential, Idempotency-Key or Content-Type wrong")
 	}
 
-	// A wildcard path with an allowed query and no {{cvv}}; no CVV is taken.
+	// A wildcard path with an allowed query and no {{cvv}}; the CVV is not sent.
 	tok3 := seedCard(t, v, s, testCVV)
 	e = validEnvelope("stripe_confirm")
 	e.Token = tok3
@@ -365,8 +365,10 @@ func TestProxySuccess(t *testing.T) {
 	if _, ok := hdr["Idempotency-Key"]; ok || hdr.Get("X-Idempotency-Key") != "" {
 		t.Error("confirm: an idempotency header was sent although the platform supplied none")
 	}
-	if v.cvv.take(tok3) != testCVV {
-		t.Error("a request without {{cvv}} consumed the CVV")
+	// The provider answered 2xx, so the CVV the request did not use is dropped on hand-off.
+	// TestProxyDropsCVVOnHandoff shows a request without {{cvv}} leaves it cached on any other status.
+	if v.cvv.take(tok3) != "" {
+		t.Error("CVV still cached after a 2xx hand-off")
 	}
 }
 
@@ -1106,5 +1108,43 @@ func TestHealthz(t *testing.T) {
 	}
 	if out := testLog.since(start); strings.Contains(out, marker) || !strings.Contains(out, " path=/healthz status=503 ") {
 		t.Fatalf("unhealthy log unexpected (len %d)", len(out))
+	}
+}
+
+// A 2xx from the provider means the card has left the vault, so the CVV still cached for the token
+// is dropped even when the request did not use {{cvv}}. Any other status keeps it for a retry.
+func TestProxyDropsCVVOnHandoff(t *testing.T) {
+	for _, c := range []struct {
+		status  int
+		dropped bool
+	}{
+		{http.StatusOK, true},
+		{http.StatusCreated, true},
+		{http.StatusFound, false},
+		{http.StatusInternalServerError, false},
+	} {
+		t.Run(fmt.Sprint(c.status), func(t *testing.T) {
+			fp := newFakeProvider(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(c.status)
+				w.Write([]byte(`{}`))
+			})
+			v, s := proxyVault(t, fp)
+			tok := seedCard(t, v, s, testCVV)
+			rec := serveInternal(v, tokensRequest(tok, stripeTokensNoCVV))
+			if rec.Code != c.status {
+				t.Fatalf("status %d, want %d", rec.Code, c.status)
+			}
+			if hits, _, _, _, _ := fp.last(); hits != 1 {
+				t.Fatalf("provider hits %d, want 1", hits)
+			}
+			got := v.cvv.take(tok)
+			if c.dropped && got != "" {
+				t.Fatal("CVV still cached after a 2xx hand-off")
+			}
+			if !c.dropped && got != testCVV {
+				t.Fatal("CVV not cached after a non-2xx provider response")
+			}
+		})
 	}
 }

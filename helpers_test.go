@@ -165,7 +165,7 @@ func newTestVault(t *testing.T) (*vault, *fakeStore) {
 		}
 	}
 	v.catalog.accounts["payu_co"].secrets["apiKey"] = payuTestAPIKey
-	v.cvv = newCVVCache(15*time.Minute, func() time.Time { return v.now() })
+	v.cvv = newCVVCache(cvvCacheTTL, func() time.Time { return v.now() })
 	return v, s
 }
 
@@ -183,6 +183,41 @@ func withClientCert(r *http.Request) *http.Request {
 		PeerCertificates: []*x509.Certificate{{SerialNumber: big.NewInt(0x0A1B2C)}},
 	}
 	return r
+}
+
+// fillCVVCache inserts n entries expiring at exp under distinct tokens prefix+index. It writes the
+// map directly: going through put would sweep the whole cache on every insert.
+func fillCVVCache(c *cvvCache, prefix string, n int, exp time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := 0; i < n; i++ {
+		c.m[prefix+strconv.Itoa(i)] = cvvEntry{cvv: []byte("000"), exp: exp}
+	}
+}
+
+// storedCVV returns the slice cached for token (nil if absent), so a test can check that the
+// cache zeroes it on removal.
+func storedCVV(c *cvvCache, token string) []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.m[token].cvv
+}
+
+// cvvCacheLen returns the number of entries in c, expired ones included.
+func cvvCacheLen(c *cvvCache) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.m)
+}
+
+// allZero reports whether every byte of b is zero.
+func allZero(b []byte) bool {
+	for _, x := range b {
+		if x != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // fakeClock is a mutable clock owned by a single test.

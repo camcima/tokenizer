@@ -563,3 +563,36 @@ func TestTokenizeDuplicateContentType(t *testing.T) {
 		t.Fatalf("status %d, body len %d", rec.Code, rec.Body.Len())
 	}
 }
+
+// A full CVV cache does not fail /tokenize: the card is stored, its CVV is not cached, and the
+// vault raises ALERT cvv_cache_full at most once per second.
+func TestTokenizeCVVCacheFull(t *testing.T) {
+	v, s := newTestVault(t)
+	fillCVVCache(v.cvv, "tok_fill_", cvvCacheMax, testNow.Add(time.Hour))
+	start := testLog.Len()
+	for i := 0; i < 5; i++ {
+		rec := serveTokenize(v, tokRequest(tokCase{}))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d: status %d, want 200", i, rec.Code)
+		}
+		var resp tokenizeResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil || !tokenRe.MatchString(resp.Token) {
+			t.Fatalf("request %d: response is not a token response", i)
+		}
+		s.mu.Lock()
+		_, stored := s.rows[resp.Token]
+		s.mu.Unlock()
+		if !stored {
+			t.Fatalf("request %d: card not stored", i)
+		}
+		if v.cvv.take(resp.Token) != "" {
+			t.Fatalf("request %d: CVV cached beyond the cap", i)
+		}
+	}
+	if n := cvvCacheLen(v.cvv); n != cvvCacheMax {
+		t.Fatalf("cache holds %d entries, want %d", n, cvvCacheMax)
+	}
+	if n := strings.Count(testLog.since(start), "ALERT cvv_cache_full\n"); n != 1 {
+		t.Fatalf("%d cvv_cache_full alerts within one second, want 1", n)
+	}
+}

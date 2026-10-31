@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -207,11 +208,21 @@ func zero(b []byte) {
 }
 
 // ---------------------------------------------------------------------------
-// CVV cache: in memory only, single use, TTL, swept on every write
+// CVV cache: in memory only, single use, TTL, capped, swept on every write and on a ticker
 // ---------------------------------------------------------------------------
 
+const (
+	cvvCacheTTL   = 15 * time.Minute
+	cvvSweepEvery = 60 * time.Second
+	// cvvCacheMax bounds the memory a flood of /tokenize calls can pin. A full cache refuses new
+	// CVVs rather than evicting live ones: the card is still stored, and a later {{cvv}} use gets
+	// the ordinary 409.
+	cvvCacheMax = 50_000
+)
+
+// cvvEntry holds the CVV as bytes so it can be overwritten when the entry is removed.
 type cvvEntry struct {
-	cvv string
+	cvv []byte
 	exp time.Time
 }
 
@@ -226,22 +237,46 @@ func newCVVCache(ttl time.Duration, now func() time.Time) *cvvCache {
 	return &cvvCache{m: make(map[string]cvvEntry), ttl: ttl, now: now}
 }
 
-// put caches cvv for token until now+ttl, first deleting every expired entry.
-// An entry is expired from exactly put+ttl onward.
-func (c *cvvCache) put(token, cvv string) {
+// removeLocked zeroes token's CVV bytes and deletes the entry. The caller holds c.mu, so a
+// concurrent take or drop for the same token finds it either intact or gone, never half-zeroed.
+func (c *cvvCache) removeLocked(token string, e cvvEntry) {
+	zero(e.cvv) // best effort
+	delete(c.m, token)
+}
+
+// sweepLocked removes every entry expired at now and returns how many it removed. The caller
+// holds c.mu. An entry is expired from exactly put+ttl onward.
+func (c *cvvCache) sweepLocked(now time.Time) int {
+	n := 0
+	for k, e := range c.m {
+		if !now.Before(e.exp) {
+			c.removeLocked(k, e)
+			n++
+		}
+	}
+	return n
+}
+
+// put caches cvv for token until now+ttl, first removing every expired entry so that only live
+// entries count against cvvCacheMax. It returns false, caching nothing, when the cache is still
+// full after that sweep.
+func (c *cvvCache) put(token, cvv string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.now()
-	for k, e := range c.m {
-		if !now.Before(e.exp) {
-			delete(c.m, k)
-		}
+	c.sweepLocked(now)
+	if e, ok := c.m[token]; ok {
+		c.removeLocked(token, e)
 	}
-	c.m[token] = cvvEntry{cvv: cvv, exp: now.Add(c.ttl)}
+	if len(c.m) >= cvvCacheMax {
+		return false
+	}
+	c.m[token] = cvvEntry{cvv: []byte(cvv), exp: now.Add(c.ttl)}
+	return true
 }
 
 // take removes and returns token's CVV; "" if absent or expired. Single use: concurrent
-// callers for the same token get it at most once.
+// callers for the same token get it at most once. The cached bytes are zeroed on removal.
 func (c *cvvCache) take(token string) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -249,9 +284,41 @@ func (c *cvvCache) take(token string) string {
 	if !ok {
 		return ""
 	}
-	delete(c.m, token)
-	if !c.now().Before(e.exp) {
-		return ""
+	cvv := ""
+	if c.now().Before(e.exp) {
+		cvv = string(e.cvv)
 	}
-	return e.cvv
+	c.removeLocked(token, e)
+	return cvv
+}
+
+// drop removes token's CVV, zeroing it, if one is cached; otherwise it does nothing.
+func (c *cvvCache) drop(token string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.m[token]; ok {
+		c.removeLocked(token, e)
+	}
+}
+
+// sweep removes every expired entry, zeroing it, and returns how many it removed.
+func (c *cvvCache) sweep() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sweepLocked(c.now())
+}
+
+// run calls sweep every interval until ctx is done. Without it an idle instance would keep
+// expired CVVs until the next put.
+func (c *cvvCache) run(ctx context.Context, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			c.sweep()
+		}
+	}
 }
