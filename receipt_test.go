@@ -290,6 +290,10 @@ func TestVerifyReceiptLengthCap(t *testing.T) {
 	if len(longest) > maxReceiptLen {
 		t.Fatalf("the longest receipt the vault issues is %d bytes, over the %d-byte cap", len(longest), maxReceiptLen)
 	}
+	// receipt.go and the READMEs quote this figure.
+	if len(longest) != 1097 {
+		t.Fatalf("the longest receipt the vault issues is %d bytes, want the documented 1097", len(longest))
+	}
 	if got, ok := verifyReceipt(testReceiptPub(), longest); !ok || got != maxNameReceipt() {
 		t.Fatal("the longest receipt the vault issues did not verify")
 	}
