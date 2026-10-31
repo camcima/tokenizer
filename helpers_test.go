@@ -54,6 +54,9 @@ const (
 var (
 	testNow     = time.Date(2026, 10, 30, 15, 4, 5, 0, time.UTC)
 	testHMACKey = bytes.Repeat([]byte{0x42}, 32)
+	// testReceiptSeed is the receipt signing seed of every test vault. newVault zeroes the seed it
+	// is given, so callers pass bytes.Clone(testReceiptSeed).
+	testReceiptSeed = bytes.Repeat([]byte{0x51}, 32)
 )
 
 // testLog is shared by every test vault and scanned for leaks in TestMain. Tests that assert
@@ -152,6 +155,8 @@ func newTestVault(t *testing.T) (*vault, *fakeStore) {
 		getCard:     s.getCard,
 		ping:        func(context.Context) error { return nil },
 		hmacKey:     testHMACKey,
+		receiptPriv: testReceiptKey,
+		receiptPub:  testReceiptPub(),
 		allowOrigin: testOrigin,
 		now:         now,
 		log:         log.New(&testLog, "", 0),
@@ -166,6 +171,16 @@ func newTestVault(t *testing.T) (*vault, *fakeStore) {
 	v.keys.Store(&dekSet{deks: map[int][]byte{1: bytes.Repeat([]byte{0x01}, 32)}, current: 1})
 	v.cvv = newCVVCache(cvvCacheTTL, func() time.Time { return v.now() })
 	return v, s
+}
+
+// verifyTestReceipt verifies s with the test vaults' receipt public key and returns its contents.
+func verifyTestReceipt(t *testing.T, s string) receipt {
+	t.Helper()
+	r, ok := verifyReceipt(testReceiptPub(), s)
+	if !ok {
+		t.Fatalf("receipt (len %d) does not verify with the test public key", len(s))
+	}
+	return r
 }
 
 // mintSession builds a session token exactly as the platform does.
@@ -783,10 +798,11 @@ func wantErrBody(msg string) string {
 }
 
 const (
-	testKMSKey     = "projects/p1/locations/global/keyRings/r1/cryptoKeys/k1"
-	testHMACName   = "projects/p1/secrets/session-hmac"
-	testStripeName = "projects/p1/secrets/stripe-key"
-	testGCPToken   = "ya29.fake-access-token"
+	testKMSKey      = "projects/p1/locations/global/keyRings/r1/cryptoKeys/k1"
+	testHMACName    = "projects/p1/secrets/session-hmac"
+	testStripeName  = "projects/p1/secrets/stripe-key"
+	testReceiptName = "projects/p1/secrets/receipt-key"
+	testGCPToken    = "ya29.fake-access-token"
 )
 
 // newFakeMetadata serves the metadata token endpoint (requires Metadata-Flavor: Google) and

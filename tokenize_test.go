@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -196,9 +198,12 @@ func TestTokenize(t *testing.T) {
 			continue
 		}
 		var resp map[string]string
-		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil || len(resp) != 4 {
-			t.Errorf("%s: success body (len %d) is not a 4-field JSON object", c.name, rec.Body.Len())
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil || len(resp) != 5 {
+			t.Errorf("%s: success body (len %d) is not a 5-field JSON object", c.name, rec.Body.Len())
 			continue
+		}
+		if r, ok := verifyReceipt(testReceiptPub(), resp["receipt"]); !ok || r.Token != resp["token"] || r.Last4 != resp["last4"] {
+			t.Errorf("%s: receipt missing, invalid or not for this token", c.name)
 		}
 		if !tokenRe.MatchString(resp["token"]) || len(resp["last4"]) != 4 || resp["exp_month"] == "" || resp["exp_year"] == "" {
 			t.Errorf("%s: success body has wrong field shapes", c.name)
@@ -468,6 +473,105 @@ func TestTokenizeStoresName(t *testing.T) {
 	var oc card
 	if err := json.Unmarshal(old, &oc); err != nil || oc != (card{PAN: testPAN, ExpMonth: "12", ExpYear: "2030"}) {
 		t.Fatal("pre-name plaintext does not decode to a card without a name")
+	}
+}
+
+// The receipt is signed by the vault key and states exactly what was tokenized: the issued token,
+// the BIN and last four of the normalized PAN, the expiry and name as sent, and the vault's clock.
+// The BIN and the name travel only inside the receipt. Failure messages never print card data.
+func TestTokenizeReturnsReceipt(t *testing.T) {
+	cases := []struct {
+		name, pan, cardName, bin, last4 string
+	}{
+		{"16 digits with name", "4242 4242 4242 4242", "José Ñúñez", "42424242", "4242"},
+		{"16 digits without name", "4242-4242-4242-4242", "", "42424242", "4242"},
+		{"13 digits", "4222222222222", "J", "422222", "2222"},
+		{"19 digits", "4000000000000000006", "", "40000000", "0006"},
+	}
+	for _, c := range cases {
+		v, _ := newTestVault(t)
+		over := map[string]any{"pan": c.pan, "exp_month": "11", "exp_year": "2031"}
+		if c.cardName != "" {
+			over["name"] = c.cardName
+		}
+		rec := serveTokenize(v, tokRequest(tokCase{body: tokBody(over)}))
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s: status %d, want 200", c.name, rec.Code)
+			continue
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+			t.Errorf("%s: response (len %d) is not a JSON object", c.name, rec.Body.Len())
+			continue
+		}
+		keys := slices.Sorted(maps.Keys(raw))
+		if !slices.Equal(keys, []string{"exp_month", "exp_year", "last4", "receipt", "token"}) {
+			t.Errorf("%s: response keys %v, want token, last4, exp_month, exp_year, receipt", c.name, keys)
+		}
+		var resp tokenizeResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Errorf("%s: response does not decode", c.name)
+			continue
+		}
+		r := verifyTestReceipt(t, resp.Receipt)
+		if r.Token != resp.Token || !tokenRe.MatchString(r.Token) {
+			t.Errorf("%s: receipt token is not the issued token", c.name)
+		}
+		if r.BIN != c.bin || r.Last4 != c.last4 || r.Last4 != resp.Last4 {
+			t.Errorf("%s: receipt bin/last4 wrong (bin len %d)", c.name, len(r.BIN))
+		}
+		if r.ExpMonth != "11" || r.ExpYear != "2031" {
+			t.Errorf("%s: receipt expiry is not the request's", c.name)
+		}
+		if r.Name != c.cardName {
+			t.Errorf("%s: receipt name is not the request's", c.name)
+		}
+		if r.IAT != testNow.Unix() {
+			t.Errorf("%s: receipt iat %d, want %d", c.name, r.IAT, testNow.Unix())
+		}
+		if p := receiptPayload(t, resp.Receipt); c.cardName == "" && bytes.Contains(p, []byte(`"name"`)) {
+			t.Errorf("%s: payload has a name key for a card without a name", c.name)
+		}
+	}
+}
+
+// A failed store yields no receipt: the token it would name does not exist.
+func TestTokenizeNoReceiptOnStoreFailure(t *testing.T) {
+	v, s := newTestVault(t)
+	s.putErr = errors.New("store failed")
+	rec := serveTokenize(v, tokRequest(tokCase{body: tokBody(map[string]any{"name": "JANE Q DOE"})}))
+	if rec.Code != http.StatusInternalServerError || rec.Body.String() != wantErrBody(msgInternal) {
+		t.Fatalf("status %d, body len %d, want 500 internal error", rec.Code, rec.Body.Len())
+	}
+	if strings.Contains(rec.Body.String(), "receipt") || strings.Contains(rec.Body.String(), receiptPrefix) {
+		t.Fatal("failed store returned a receipt")
+	}
+}
+
+// A receipt's card fields, printed separately, never form a 13–19 digit Luhn-valid run, so a test
+// that prints them cannot trip the log leak scan; the full PAN still does.
+func TestReceiptDoesNotTripLeakScan(t *testing.T) {
+	v, _ := newTestVault(t)
+	rec := serveTokenize(v, tokRequest(tokCase{}))
+	var resp tokenizeResponse
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &resp) != nil {
+		t.Fatalf("status %d, want 200 with a JSON body", rec.Code)
+	}
+	r := verifyTestReceipt(t, resp.Receipt)
+	if r.BIN != "42424242" || r.Last4 != "4242" {
+		t.Fatal("receipt bin/last4 are not the test card's")
+	}
+	fields := r.BIN + " " + r.Last4
+	if offs := luhnWindowOffsets(fields); len(offs) != 0 {
+		t.Errorf("bin and last4 trip the scan at %d offsets", len(offs))
+	}
+	if offs := luhnWindowOffsets(joinDigitSeparators(fields)); len(offs) != 0 {
+		t.Errorf("bin and last4 with separators removed trip the scan at %d offsets", len(offs))
+	}
+	// The negative control: the full test PAN is found (at several window offsets, since
+	// shorter windows of 4242… are Luhn-valid too).
+	if len(luhnWindowOffsets(testPAN)) == 0 {
+		t.Error("full PAN not found by the scan")
 	}
 }
 

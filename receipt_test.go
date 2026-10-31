@@ -9,8 +9,9 @@ import (
 	"testing"
 )
 
-// testReceiptKey is a fixed test-only signing key, so receipts are reproducible.
-var testReceiptKey = ed25519.NewKeyFromSeed(bytes.Repeat([]byte{7}, 32))
+// testReceiptKey is the fixed test-only signing key derived from testReceiptSeed, so receipts are
+// reproducible and match the key every test vault signs with.
+var testReceiptKey = ed25519.NewKeyFromSeed(testReceiptSeed)
 
 func testReceiptPub() ed25519.PublicKey { return testReceiptKey.Public().(ed25519.PublicKey) }
 
@@ -141,7 +142,7 @@ func TestReceiptOmitsEmptyName(t *testing.T) {
 	want := `{"token":"tok_0123456789abcdef0123456789abcdef","bin":"42424242","last4":"4242",` +
 		`"exp_month":"12","exp_year":"2030","iat":1793456789}`
 	if string(p) != want {
-		t.Errorf("payload is not the compact JSON in key order: %s", p)
+		t.Errorf("payload (len %d) is not the compact JSON in key order", len(p))
 	}
 	if p := receiptPayload(t, signReceipt(testReceiptKey, testReceipt())); bytes.Contains(p, []byte(`"name"`)) {
 		t.Error("signed payload has a name key for a card without a name")

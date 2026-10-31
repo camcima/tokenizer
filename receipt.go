@@ -95,7 +95,9 @@ func verifyReceipt(pub ed25519.PublicKey, s string) (receipt, bool) {
 	if len(pub) != ed25519.PublicKeySize {
 		return receipt{}, false
 	}
-	parts := strings.Split(s, ".")
+	// At most five parts are split off, so a hostile input with many dots costs no more than a
+	// valid one; a fifth part means there were too many.
+	parts := strings.SplitN(s, ".", 5)
 	if len(parts) != 4 || parts[0]+"."+parts[1]+"." != receiptPrefix {
 		return receipt{}, false
 	}
