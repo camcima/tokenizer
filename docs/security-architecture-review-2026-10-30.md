@@ -1,6 +1,6 @@
 **PAN Vault — architecture and security review**
 
-Review date: 2026-10-30. Baseline: commit `1c67e9189d6eb22c710d7bf879261e833d5c420a`.
+Review date: 2026-10-30. Baseline: commit `a235b26215f1f62d38b40c52841ffe0a1d1d175c`.
 
 **Assessment: strong implementation discipline, with material gaps to resolve before handling production card data.** The small service, restricted database API, embedded catalog, strict parsers, and careful logging form a sound foundation. However, passing the current tests does not establish the stronger guarantees about sensitive-data lifetime, response confidentiality, compromise containment, or uninterrupted key rotation.
 
