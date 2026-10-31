@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -202,14 +203,14 @@ func TestSealUnseal(t *testing.T) {
 	dek := testDEK(t)
 	pt := []byte(`{"pan":"4242424242424242","exp_month":"12","exp_year":"2030"}`)
 
-	blob := seal(dek, pt)
+	blob := seal(dek, pt, nil)
 	if len(blob) != 12+len(pt)+16 {
 		t.Fatalf("blob len %d, want %d", len(blob), 12+len(pt)+16)
 	}
 	if bytes.Contains(blob, []byte("4242424242424242")) {
 		t.Fatal("blob contains plaintext PAN")
 	}
-	got, err := unseal(dek, blob)
+	got, err := unseal(dek, blob, nil)
 	if err != nil {
 		t.Fatal("round trip unseal failed")
 	}
@@ -218,7 +219,7 @@ func TestSealUnseal(t *testing.T) {
 	}
 
 	// Empty plaintext round-trips too.
-	if got, err := unseal(dek, seal(dek, nil)); err != nil || len(got) != 0 {
+	if got, err := unseal(dek, seal(dek, nil, nil), nil); err != nil || len(got) != 0 {
 		t.Fatal("empty plaintext round trip failed")
 	}
 
@@ -226,50 +227,102 @@ func TestSealUnseal(t *testing.T) {
 	for _, off := range []int{0, 20, len(blob) - 1} {
 		bad := bytes.Clone(blob)
 		bad[off] ^= 0x01
-		if _, err := unseal(dek, bad); err == nil {
+		if _, err := unseal(dek, bad, nil); err == nil {
 			t.Errorf("tampered byte at offset %d accepted", off)
 		}
 	}
 
 	// Wrong DEK.
-	if _, err := unseal(testDEK(t), blob); err == nil {
+	if _, err := unseal(testDEK(t), blob, nil); err == nil {
 		t.Error("wrong DEK accepted")
 	}
 
 	// Truncated blobs (shorter than nonce+tag) return an error, not a panic.
 	for n := 0; n < 28; n++ {
-		if _, err := unseal(dek, blob[:n]); err == nil {
+		if _, err := unseal(dek, blob[:n], nil); err == nil {
 			t.Errorf("blob of len %d accepted", n)
 		}
 	}
-	if _, err := unseal(dek, nil); err == nil {
+	if _, err := unseal(dek, nil, nil); err == nil {
 		t.Error("nil blob accepted")
 	}
 	// Truncated by one byte (tag damaged).
-	if _, err := unseal(dek, blob[:len(blob)-1]); err == nil {
+	if _, err := unseal(dek, blob[:len(blob)-1], nil); err == nil {
 		t.Error("blob truncated by one byte accepted")
 	}
 
 	// Non-AES-256 keys are refused by unseal.
 	for _, n := range []int{0, 16, 24, 31, 33} {
-		if _, err := unseal(make([]byte, n), blob); err == nil {
+		if _, err := unseal(make([]byte, n), blob, nil); err == nil {
 			t.Errorf("DEK of len %d accepted", n)
 		}
 	}
 
 	// Errors never carry plaintext or key material: they are static strings.
-	if _, err := unseal(dek, blob[:5]); err == nil || strings.Contains(err.Error(), "4242") {
+	if _, err := unseal(dek, blob[:5], nil); err == nil || strings.Contains(err.Error(), "4242") {
 		t.Error("unexpected error text")
 	}
 
 	// A fresh random nonce per seal.
 	nonces := make(map[string]bool, 10000)
 	for i := 0; i < 10000; i++ {
-		b := seal(dek, pt)
+		b := seal(dek, pt, nil)
 		nonces[string(b[:12])] = true
 	}
 	if len(nonces) != 10000 {
 		t.Fatalf("got %d distinct nonces from 10000 seals", len(nonces))
+	}
+}
+
+// A card ciphertext opens only with the additional data it was sealed with, so a blob copied
+// under another token fails closed. Every failure is errUnseal, never a panic.
+func TestSealUnsealAAD(t *testing.T) {
+	dek := testDEK(t)
+	pt := []byte(`{"pan":"4242424242424242","exp_month":"12","exp_year":"2030"}`)
+	tokA, tokB := newToken(), newToken()
+	blob := seal(dek, pt, cardAAD(tokA))
+
+	if want := "pan-vault/card/1\x00" + tokA; string(cardAAD(tokA)) != want {
+		t.Fatal("cardAAD is not the versioned prefix followed by the token")
+	}
+	got, err := unseal(dek, blob, cardAAD(tokA))
+	if err != nil || !bytes.Equal(got, pt) {
+		t.Fatal("round trip with the sealing AAD failed")
+	}
+
+	mustFail := func(what string, aad []byte) {
+		t.Helper()
+		defer func() {
+			if recover() != nil {
+				t.Errorf("%s: unseal panicked", what)
+			}
+		}()
+		out, err := unseal(dek, blob, aad)
+		if !errors.Is(err, errUnseal) || out != nil {
+			t.Errorf("%s: accepted, or failed with another error", what)
+		}
+	}
+	mustFail("another token", cardAAD(tokB))
+	mustFail("nil AAD", nil)
+	mustFail("empty AAD", []byte{})
+	mustFail("empty token", cardAAD(""))
+	mustFail("token one char short", cardAAD(tokA[:len(tokA)-1]))
+	mustFail("token one char long", cardAAD(tokA+"0"))
+	mustFail("bare token without prefix", []byte(tokA))
+	mustFail("prefix of another version", []byte("pan-vault/card/2\x00"+tokA))
+
+	// The primitive stays general: no AAD on both sides still round-trips, and a blob sealed
+	// without AAD does not open under a card AAD.
+	plain := seal(dek, pt, nil)
+	if got, err := unseal(dek, plain, nil); err != nil || !bytes.Equal(got, pt) {
+		t.Fatal("round trip without AAD failed")
+	}
+	if _, err := unseal(dek, plain, cardAAD(tokA)); !errors.Is(err, errUnseal) {
+		t.Error("a blob sealed without AAD opened under a card AAD")
+	}
+	// The AAD is authenticated, not encrypted: it never appears in the blob.
+	if bytes.Contains(blob, []byte(tokA)) {
+		t.Error("blob contains the token")
 	}
 }
 
@@ -281,7 +334,7 @@ func TestSealRejectsNonAES256Key(t *testing.T) {
 					t.Errorf("seal with DEK of len %d did not panic", n)
 				}
 			}()
-			seal(make([]byte, n), []byte("x"))
+			seal(make([]byte, n), []byte("x"), nil)
 		}()
 	}
 }
@@ -298,7 +351,8 @@ func TestCardJSONSealRoundTrip(t *testing.T) {
 		t.Fatalf("card JSON shape differs (len %d, want len %d)", len(pt), len(want))
 	}
 	dek := testDEK(t)
-	out, err := unseal(dek, seal(dek, pt))
+	tok := newToken()
+	out, err := unseal(dek, seal(dek, pt, cardAAD(tok)), cardAAD(tok))
 	if err != nil {
 		t.Fatal("unseal failed")
 	}

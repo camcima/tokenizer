@@ -503,7 +503,7 @@ func TestIntegrationRotateDEK(t *testing.T) {
 		t.Fatal("marshal card failed")
 	}
 	tok := newToken()
-	if err := dbPutCard(ctx, appDB, tok, seal(deks[cur], pt), "4242", cur); err != nil {
+	if err := dbPutCard(ctx, appDB, tok, seal(deks[cur], pt, cardAAD(tok)), "4242", cur); err != nil {
 		t.Fatalf("put_card: %v", err)
 	}
 
@@ -557,12 +557,12 @@ func TestIntegrationRotateDEK(t *testing.T) {
 	if err != nil || kv != vOld {
 		t.Fatalf("get_card: key_version=%d (want %d) err=%v", kv, vOld, err)
 	}
-	got, err := unseal(deks2[kv], ct)
+	got, err := unseal(deks2[kv], ct, cardAAD(tok))
 	var cd card
 	if err != nil || json.Unmarshal(got, &cd) != nil || cd.PAN != testPAN || cd.ExpMonth != "12" || cd.ExpYear != "2030" {
 		t.Error("the old token does not resolve to its card after rotation")
 	}
-	if _, err := unseal(deks2[vNew], ct); err == nil {
+	if _, err := unseal(deks2[vNew], ct, cardAAD(tok)); err == nil {
 		t.Error("the old ciphertext opens under the new DEK")
 	}
 }

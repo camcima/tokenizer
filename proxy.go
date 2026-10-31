@@ -172,7 +172,8 @@ func (v *vault) handleProxy(w http.ResponseWriter, r *http.Request) {
 		_ = v.refresh(ctx)
 		dek, _ = v.dek(keyVersion)
 	}
-	plaintext, err := unseal(dek, ciphertext) // a missing DEK (nil) fails unseal
+	// The token is the additional data: a ciphertext copied from another token's row fails here.
+	plaintext, err := unseal(dek, ciphertext, cardAAD(env.Token)) // a missing DEK (nil) fails unseal
 	if err == nil {
 		err = json.Unmarshal(plaintext, &c)
 	}

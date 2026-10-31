@@ -843,7 +843,7 @@ func TestProxyDecryptFailed(t *testing.T) {
 
 	// Authentic ciphertext whose plaintext is not a card record is a decrypt failure too.
 	tok3 := newToken()
-	s.rows[tok3] = fakeRow{ciphertext: seal(dekOf(v, 1), []byte("not json")), last4: "0000", keyVersion: 1}
+	s.rows[tok3] = fakeRow{ciphertext: seal(dekOf(v, 1), []byte("not json"), cardAAD(tok3)), last4: "0000", keyVersion: 1}
 	start = testLog.Len()
 	rec = serveInternal(v, tokensRequest(tok3, stripeTokensNoCVV))
 	if rec.Code != http.StatusInternalServerError || !strings.Contains(testLog.since(start), " ALERT decrypt_failed token="+tok3+" key_version=1 account=stripe_t\n") {
@@ -852,6 +852,40 @@ func TestProxyDecryptFailed(t *testing.T) {
 
 	if hits, _, _, _, _ := fp.last(); hits != 0 {
 		t.Fatal("decrypt failure reached the provider")
+	}
+}
+
+// A stored ciphertext is bound to its token: the same row copied under another token (same
+// ciphertext, same key version) fails as decrypt_failed before anything is sent or consumed.
+func TestProxyCiphertextNotPortable(t *testing.T) {
+	fp := newFakeProvider(t, nil)
+	v, s := proxyVault(t, fp)
+	tokA := seedCard(t, v, s, "")
+	tokB := newToken()
+	s.mu.Lock()
+	rowA := s.rows[tokA]
+	s.rows[tokB] = fakeRow{ciphertext: bytes.Clone(rowA.ciphertext), last4: rowA.last4, keyVersion: rowA.keyVersion}
+	s.mu.Unlock()
+	v.cvv.put(tokB, testCVV)
+
+	start := testLog.Len()
+	rec := serveInternal(v, tokensRequest(tokB, stripeTokensBody))
+	if rec.Code != http.StatusInternalServerError || rec.Body.String() != wantErrBody(msgInternal) {
+		t.Fatalf("status %d, body len %d, want 500 internal", rec.Code, rec.Body.Len())
+	}
+	if !strings.Contains(testLog.since(start), " ALERT decrypt_failed token="+tokB+" key_version=1 account=stripe_t\n") {
+		t.Fatal("no ALERT decrypt_failed line for the copied row")
+	}
+	if hits, _, _, _, _ := fp.last(); hits != 0 {
+		t.Fatal("a copied ciphertext reached the provider")
+	}
+	if v.cvv.take(tokB) != testCVV {
+		t.Fatal("a copied ciphertext consumed the CVV")
+	}
+
+	// The original row still works under its own token.
+	if rec := serveInternal(v, tokensRequest(tokA, stripeTokensNoCVV)); rec.Code != http.StatusOK {
+		t.Fatalf("original token: status %d, want 200", rec.Code)
 	}
 }
 
@@ -1161,7 +1195,7 @@ func TestProxyRefreshOnUnknownVersion(t *testing.T) {
 		t.Fatal("marshal card failed")
 	}
 	tok := newToken()
-	s.rows[tok] = fakeRow{ciphertext: seal(dek2, pt), last4: "4242", keyVersion: 2}
+	s.rows[tok] = fakeRow{ciphertext: seal(dek2, pt, cardAAD(tok)), last4: "4242", keyVersion: 2}
 	var calls atomic.Int32
 	v.refreshDEKs = func(context.Context) error {
 		calls.Add(1)
