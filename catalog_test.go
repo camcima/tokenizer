@@ -379,6 +379,21 @@ func TestEmbeddedCatalog(t *testing.T) {
 	}
 }
 
+// TestEmbeddedCatalogProdAccounts pins the prod account set of the embedded catalog. It is empty
+// today, so a prod boot is refused ("catalog has no accounts for env=prod",
+// TestBootRefusesEmptyAccountSet). When the first reviewed prod account lands, this test changes
+// to require at least one.
+func TestEmbeddedCatalogProdAccounts(t *testing.T) {
+	c, err := parseCatalog(catalogJSON, "prod")
+	if err != nil {
+		t.Fatalf("embedded catalog (prod): %v", err)
+	}
+	if n := len(c.accounts); n != 0 {
+		t.Errorf("embedded catalog has %d prod accounts; update this test to require at least one", n)
+	}
+	t.Log("the embedded catalog has no prod account, so a prod boot is refused: a reviewed prod account must be added before the first prod deploy")
+}
+
 // egress-hosts.<env>.txt are the files the infra repo's firewall check diffs against:
 // each must list exactly its environment's catalog account hosts, without ports.
 func TestEgressHostsMatchCatalog(t *testing.T) {
