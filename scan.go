@@ -115,7 +115,8 @@ var (
 // maxOccurrences caps the placeholder occurrences scanBody returns, and parseCatEndpoint refuses
 // an endpoint listing more positions, so the cap never refuses a request the catalog would accept:
 // every accepted occurrence sits at a listed position, and no two share an address (JSON objects
-// have no duplicate keys, and form placeholders are never under a repeatable "[]" key).
+// have no duplicate keys, form keys are unique unless they end in "[]", and form placeholders are
+// never under such a repeatable key).
 const maxOccurrences = 64
 
 // JSON nesting deeper than 64 objects/arrays is rejected. Provider bodies nest a

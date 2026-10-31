@@ -300,7 +300,7 @@ func TestScanOccurrenceCap(t *testing.T) {
 	for format, mk := range map[string]func(int) string{"json": jsonBody, "form": formBody} {
 		occs, err := scanBody(format, []byte(mk(maxOccurrences)))
 		if err != nil || len(occs) != maxOccurrences {
-			t.Errorf("%s: %d placeholders: %d occurrences, err %v", format, maxOccurrences, len(occs), err)
+			t.Fatalf("%s: %d placeholders: %d occurrences, err %v", format, maxOccurrences, len(occs), err)
 		}
 		if format == "json" && (occs[0].addr != "/0" || occs[maxOccurrences-1].addr != "/63") {
 			t.Errorf("json: addresses %q .. %q", occs[0].addr, occs[maxOccurrences-1].addr)
