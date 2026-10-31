@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"net/url"
@@ -410,6 +411,71 @@ func FuzzNormalizePAN(f *testing.F) {
 		}
 		if got != strings.NewReplacer(" ", "", "-", "").Replace(s) {
 			t.Fatal("accepted result is not the input with spaces and hyphens removed")
+		}
+	})
+}
+
+func FuzzVerifyReceipt(f *testing.F) {
+	plain := testReceipt()
+	named := testReceipt()
+	named.Name = "JANE Q DOE"
+	intl := testReceipt()
+	intl.Name = "Zoë Ångström 日本 \u2028"
+	short := testReceipt()
+	short.BIN = "422222"
+	short.Last4 = "2222"
+	good := signReceipt(testReceiptKey, intl)
+	parts := strings.Split(good, ".")
+	payloadPart, sigPart := parts[2], parts[3]
+	payload, _ := base64.RawURLEncoding.DecodeString(payloadPart)
+	sig, _ := base64.RawURLEncoding.DecodeString(sigPart)
+	flip := func(s string, i int) string {
+		b := []byte(s)
+		if b[i] == 'A' {
+			b[i] = 'B'
+		} else {
+			b[i] = 'A'
+		}
+		return string(b)
+	}
+	overCap := testReceipt()
+	overCap.Name = strings.Repeat("a", maxReceiptLen)
+	for _, s := range []string{
+		signReceipt(testReceiptKey, plain), signReceipt(testReceiptKey, named), good,
+		signReceipt(testReceiptKey, short), signReceipt(testReceiptKey, maxNameReceipt()),
+		receiptPrefix + flip(payloadPart, 10) + "." + sigPart,
+		receiptPrefix + payloadPart + "." + flip(sigPart, 10),
+		"rcpt.v2." + payloadPart + "." + sigPart,
+		signRawReceipt("rcpt.v2.", payloadPart),
+		signRawReceipt(receiptPrefix, base64.URLEncoding.EncodeToString(payload)),
+		receiptPrefix + payloadPart + "." + base64.URLEncoding.EncodeToString(sig),
+		signRawReceipt(receiptPrefix, base64.RawStdEncoding.EncodeToString(payload)),
+		receiptPrefix + payloadPart + "." + base64.RawStdEncoding.EncodeToString(sig),
+		receiptPrefix + payloadPart + "." + sigPart + "A",
+		receiptPrefix + payloadPart + "." + sigPart[:85],
+		receiptPrefix + payloadPart + "." + sigPart[:4] + "\r\n" + sigPart[4:],
+		receiptPrefix + payloadPart + "." + strings.Repeat("A", 64<<10),
+		signReceipt(testReceiptKey, overCap),
+		good + ".", good + ".x", "", "...", receiptPrefix, receiptPrefix + ".",
+	} {
+		f.Add(s)
+	}
+	pub := testReceiptPub()
+	f.Fuzz(func(t *testing.T, s string) {
+		got, ok := verifyReceipt(pub, s)
+		if !ok {
+			if got != (receipt{}) {
+				t.Fatal("rejected input returned a non-zero receipt")
+			}
+			return
+		}
+		// Accepted: s must be exactly the receipt the vault would sign for these contents, and within
+		// the length cap.
+		if len(s) > maxReceiptLen {
+			t.Fatal("accepted a receipt longer than the cap")
+		}
+		if signReceipt(testReceiptKey, got) != s {
+			t.Fatal("accepted receipt does not round-trip through signReceipt exactly")
 		}
 	})
 }

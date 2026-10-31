@@ -34,6 +34,12 @@ type receipt struct {
 
 var errReceipt = errors.New("invalid receipt")
 
+// maxReceiptLen bounds the input verifyReceipt looks at. The longest receipt the vault issues
+// (a 36-character token, 8 + 4 digits, the expiry, a 100-rune name whose every rune JSON-escapes
+// to six bytes, and the largest iat) is 1097 bytes, so the cap rejects nothing the vault signs
+// while keeping the cost of hostile input small and fixed.
+const maxReceiptLen = 2048
+
 // receiptFields is the exact set of keys a receipt payload may contain.
 var receiptFields = map[string]bool{
 	"token": true, "bin": true, "last4": true, "exp_month": true, "exp_year": true, "name": true, "iat": true,
@@ -44,10 +50,12 @@ var receiptFields = map[string]bool{
 var receiptB64 = base64.RawURLEncoding.Strict()
 
 // cardBIN returns the leading digits of a normalized card number that a receipt may carry: 8 when
-// the number has 16 or more digits, otherwise 6. Together with the last four this stays within
-// the PCI truncation limit and always leaves digits hidden, even for a 13-digit card.
+// the number has exactly 16 digits, otherwise 6. The PCI SSC truncation table allows the first 8
+// and last 4 digits only for 16-digit numbers; other lengths need the card brand's confirmation,
+// which the vault does not have, so they keep the conservative first 6. Together with the last
+// four this always leaves digits hidden, even for a 13-digit card.
 func cardBIN(pan string) string {
-	if len(pan) >= 16 {
+	if len(pan) == 16 {
 		return pan[:8]
 	}
 	return pan[:6]
@@ -89,8 +97,13 @@ func signReceipt(priv ed25519.PrivateKey, r receipt) string {
 // parts, the exact prefix and version, unpadded base64url with no other characters, a valid
 // signature over receiptPrefix + payload part, and a payload holding a single JSON object with
 // exactly the receipt's keys. The signature is checked before the payload is parsed, so
-// unauthenticated bytes never reach the JSON decoder. It never panics, whatever the input.
+// unauthenticated bytes never reach the JSON decoder. Input longer than maxReceiptLen, or with a
+// signature part of any length but 86, is rejected before any part is scanned or decoded, so the
+// work done on hostile input is bounded. It never panics, whatever the input.
 func verifyReceipt(pub ed25519.PublicKey, s string) (receipt, bool) {
+	if len(s) > maxReceiptLen {
+		return receipt{}, false
+	}
 	// ed25519.Verify panics on a public key of the wrong length.
 	if len(pub) != ed25519.PublicKeySize {
 		return receipt{}, false
@@ -99,6 +112,10 @@ func verifyReceipt(pub ed25519.PublicKey, s string) (receipt, bool) {
 	// valid one; a fifth part means there were too many.
 	parts := strings.SplitN(s, ".", 5)
 	if len(parts) != 4 || parts[0]+"."+parts[1]+"." != receiptPrefix {
+		return receipt{}, false
+	}
+	// 86 is the unpadded base64url length of a 64-byte signature.
+	if len(parts[3]) != 86 {
 		return receipt{}, false
 	}
 	// The base64 decoder skips CR and LF, so the alphabet is checked first: a part with CR or LF

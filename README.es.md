@@ -335,7 +335,7 @@ El payload es JSON compacto con estas claves, en este orden:
 ```
 
 - `token`: el token emitido para esta tarjeta.
-- `bin`: el **BIN** de la tarjeta, sus primeros 8 dígitos cuando el número de tarjeta tiene 16 dígitos o más, y si no sus primeros 6. Junto con `last4` se mantiene dentro de los límites de truncamiento de PCI DSS (como máximo los primeros 8 y los últimos 4 dígitos de un número de tarjeta de 16 dígitos o más, y los primeros 6 y los últimos 4 de uno más corto), así que incluso una tarjeta de 13 dígitos mantiene 3 dígitos ocultos.
+- `bin`: el **BIN** de la tarjeta: 8 dígitos para una tarjeta de 16 dígitos, 6 en otro caso. La forma de 8 dígitos sigue la tabla de truncamiento del PCI SSC para números de 16 dígitos (como máximo los primeros 8 y los últimos 4 dígitos); las demás longitudes usan 6 hasta que la guía de las marcas de tarjeta diga otra cosa. Junto con `last4` siempre quedan dígitos ocultos: incluso una tarjeta de 13 dígitos mantiene 3.
 - `last4`, `exp_month`, `exp_year`: los mismos valores que en la respuesta.
 - `name`: el nombre del titular exactamente como se envió. Se omite cuando la tarjeta se tokenizó sin nombre.
 - `iat`: cuándo emitió el vault el recibo, en segundos Unix.
@@ -348,7 +348,7 @@ El payload es JSON compacto con estas claves, en este orden:
 2. La plataforma verifica el recibo con la clave pública del vault, y comprueba que su `token` sea el token que recibió, antes de guardar nada de él. Un recibo inválido se rechaza entero, nunca se confía en una parte.
 3. La plataforma guarda el BIN, los últimos cuatro, el vencimiento y el nombre junto al token.
 
-**Por qué la plataforma puede guardar estos datos.** Un número de tarjeta truncado al BIN y los últimos cuatro, incluso con el vencimiento y el nombre, no es dato del titular de la tarjeta (CHD). El back end de la plataforma sigue fuera del CDE mientras guarde solo estos datos y cumpla tres reglas:
+**Por qué la plataforma puede guardar estos datos.** Un número de tarjeta truncado al BIN (8 dígitos para una tarjeta de 16 dígitos, 6 en otro caso) y los últimos cuatro, incluso con el vencimiento y el nombre, no es dato del titular de la tarjeta (CHD). Por eso guardar estos datos no mete el back end de la plataforma en el CDE; que el back end quede fuera del alcance depende además de su segmentación respecto del CDE y de la delimitación del alcance que haga el auditor (ver [§5](#5-cómo-el-vault-reduce-nuestro-alcance)). La plataforma debe además cumplir tres reglas:
 
 - **Los clientes ven solo los últimos cuatro.** El BIN junto con los últimos cuatro solo puede mostrarse al personal con una necesidad de negocio (requisito 3.4.1 de PCI DSS).
 - **Ningún hash del número de tarjeta.** Nunca guardar un hash del número de tarjeta junto al número truncado: juntos acotan una búsqueda por fuerza bruta, y PCI trata ese par como una brecha de control. El vault nunca produce un hash así.
@@ -755,7 +755,7 @@ sequenceDiagram
   }
   ```
 
-  El programa lee la entrada estándar igual que el vault lee el secreto: rechaza todo lo que no sean exactamente 64 caracteres hexadecimales, incluido un salto de línea final, así que una semilla que acepta es una con la que el vault arranca.
+  El programa lee la entrada estándar igual que el vault lee el secreto: rechaza todo lo que no sean exactamente 64 caracteres hexadecimales, incluido un salto de línea final, así que una semilla que acepta es una con la que el vault arranca. Se borra `seed.hex` en cuanto la semilla está guardada (`shred -u seed.hex` o equivalente); nunca se sube al repositorio ni se deja en la estación de trabajo.
 
   **Rotar** significa una semilla nueva y, por lo tanto, una clave pública nueva. Se sigue este orden: una instancia del vault puede arrancar en cualquier momento (autohealing, escalado, una caída), y una que arranca con una semilla cuya clave pública la plataforma todavía no acepta emite recibos que la plataforma rechaza.
 
@@ -895,7 +895,7 @@ Otros archivos: `catalog.json` (proveedores y cuentas, compilado en el binario),
 
 #### 11.4 Verificar un recibo
 
-Cualquier lenguaje con Ed25519 puede verificar un recibo (formato en [§6.2](#62-el-recibo-firmado)). Se divide en `.`: debe haber exactamente cuatro partes, y las dos primeras deben ser `rcpt` y `v1`. Las dos últimas deben ser base64url sin padding y no vacías (solo `A–Z`, `a–z`, `0–9`, `-` y `_`, sin `=`) y canónicas: los bits bajos sin usar del último carácter deben ser cero (el decodificador `Strict()` de Go rechaza cualquier otra cosa; en otros lenguajes, se recodifican los bytes decodificados y se exige que sean iguales a la parte recibida). Se decodifica la cuarta parte en una firma de 64 bytes, y se verifica con la clave pública del vault sobre los bytes ASCII de `rcpt.v1.` seguidos de la tercera parte exactamente como llegó. Solo entonces se decodifica la tercera parte, y se interpreta como un único objeto JSON con solo las claves del recibo, escritas exactamente, cada una como máximo una vez y sin nada después, donde toda clave salvo `name` está presente, `iat` es un entero JSON mayor que 0 y todo otro valor es un string JSON no vacío. Cualquier otra cosa invalida el recibo entero: nunca repararlo ni confiar en una parte. Después se comprueba que `token` sea el token que envió el navegador. La versión en Go de abajo sigue a `verifyReceipt` en `receipt.go`, que los tests del vault ejecutan contra los recibos que firma:
+Cualquier lenguaje con Ed25519 puede verificar un recibo (formato en [§6.2](#62-el-recibo-firmado)). Se rechaza todo lo que supere los 2048 bytes antes de mirarlo (el recibo más largo que emite el vault tiene 1097 bytes), y se limita el tamaño de la petición que lo trae. Se divide en `.`: debe haber exactamente cuatro partes, y las dos primeras deben ser `rcpt` y `v1`. Las dos últimas deben ser base64url sin padding y no vacías (solo `A–Z`, `a–z`, `0–9`, `-` y `_`, sin `=`) y canónicas: los bits bajos sin usar del último carácter deben ser cero (el decodificador `Strict()` de Go rechaza cualquier otra cosa; en otros lenguajes, se recodifican los bytes decodificados y se exige que sean iguales a la parte recibida). La cuarta parte debe tener exactamente 86 caracteres, comprobado antes de recorrerla o decodificarla. Se decodifica en una firma de 64 bytes, y se verifica con la clave pública del vault sobre los bytes ASCII de `rcpt.v1.` seguidos de la tercera parte exactamente como llegó. Solo entonces se decodifica la tercera parte, y se interpreta como un único objeto JSON con solo las claves del recibo, escritas exactamente, cada una como máximo una vez y sin nada después, donde toda clave salvo `name` está presente, `iat` es un entero JSON mayor que 0 y todo otro valor es un string JSON no vacío. Cualquier otra cosa invalida el recibo entero: nunca repararlo ni confiar en una parte. Después se comprueba que `token` sea el token que envió el navegador. La versión en Go de abajo sigue a `verifyReceipt` en `receipt.go`, que los tests del vault ejecutan contra los recibos que firma:
 
 ```go
 package receipt
@@ -923,6 +923,10 @@ type Receipt struct {
 
 var ErrInvalid = errors.New("invalid receipt")
 
+// maxReceiptLen is well above the longest receipt the vault issues (1097 bytes); longer input is
+// rejected before any work is done on it.
+const maxReceiptLen = 2048
+
 const b64url = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 
 var receiptKeys = map[string]bool{"token": true, "bin": true, "last4": true,
@@ -932,11 +936,15 @@ var receiptKeys = map[string]bool{"token": true, "bin": true, "last4": true,
 // The caller must also check that r.Token equals the token it received with the receipt; during a
 // key rotation, call Verify once per accepted public key.
 func Verify(pub ed25519.PublicKey, s string) (Receipt, error) {
-	if len(pub) != ed25519.PublicKeySize {
+	if len(s) > maxReceiptLen || len(pub) != ed25519.PublicKeySize {
 		return Receipt{}, ErrInvalid
 	}
 	parts := strings.SplitN(s, ".", 5)
 	if len(parts) != 4 || parts[0] != "rcpt" || parts[1] != "v1" {
+		return Receipt{}, ErrInvalid
+	}
+	// 86 is the unpadded base64url length of a 64-byte signature.
+	if len(parts[3]) != 86 {
 		return Receipt{}, ErrInvalid
 	}
 	// Go's base64 decoder skips CR and LF, so check the alphabet first.
@@ -1014,7 +1022,7 @@ func exactKeys(payload []byte) bool {
 | **AoC** | Attestation of Compliance: el resumen firmado de una evaluación PCI. |
 | **ASV** | Approved Scanning Vendor: realiza los escaneos externos de vulnerabilidades trimestrales. |
 | **Catálogo** | `catalog.json`: la lista compilada en el binario de proveedores, endpoints permitidos y nuestras cuentas, contra la que se verifica cada solicitud a `/proxy`. |
-| **BIN / IIN** | Los primeros 6 u 8 dígitos de un número de tarjeta, que identifican la marca y el banco emisor. Los emisores están pasando a BINs de 8 dígitos. El recibo del vault lleva los primeros 8 dígitos de un número de tarjeta de 16 dígitos o más, y los primeros 6 de uno más corto. |
+| **BIN / IIN** | Los primeros 6 u 8 dígitos de un número de tarjeta, que identifican la marca y el banco emisor. Los emisores están pasando a BINs de 8 dígitos. El recibo del vault lleva 8 dígitos para una tarjeta de 16 dígitos, 6 en otro caso. |
 | **CDE** | Cardholder Data Environment: las personas, procesos y sistemas que manejan datos de tarjeta, más todo lo que esté conectado a ellos. |
 | **CHD** | Cardholder Data: el PAN, más el nombre, el vencimiento y el código de servicio cuando se almacenan junto con él. |
 | **CMEK** | Customer-Managed Encryption Keys: almacenamiento en la nube cifrado con claves que controlamos nosotros. |
