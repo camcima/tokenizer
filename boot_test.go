@@ -919,6 +919,36 @@ func TestNewVault(t *testing.T) {
 // TestNewVaultDBDeadline: each putCard/getCard call runs under a 5s deadline derived from the
 // request context, so a saturated pool or a stalled server fails the request instead of
 // hanging it.
+// The refresher's list_deks call runs under dbCallTimeout, like every other database call.
+func TestDEKRefresherDBDeadline(t *testing.T) {
+	got := make(chan time.Duration, 1)
+	pc, err := pgx.ParseConfig("postgres://vault_app@127.0.0.1:1/vault?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := stdlib.OpenDB(*pc, stdlib.OptionBeforeConnect(func(ctx context.Context, _ *pgx.ConnConfig) error {
+		dl, ok := ctx.Deadline()
+		if !ok {
+			dl = time.Now().Add(time.Hour)
+		}
+		got <- time.Until(dl)
+		return errors.New("fake connect refused")
+	}))
+	defer db.Close()
+	v, _ := newTestVault(t)
+	before := v.keys.Load()
+	refresh := dekRefresher(v, config{env: "prod", kmsKey: testKMSKey}, db, nil, nil)
+	if refresh(context.Background()) == nil {
+		t.Fatal("no error from a refused connection")
+	}
+	if left := <-got; left > dbCallTimeout || left < dbCallTimeout-time.Second {
+		t.Errorf("list_deks deadline %v away, want ≤%v", left, dbCallTimeout)
+	}
+	if v.keys.Load() != before {
+		t.Error("a failed refresh replaced the snapshot")
+	}
+}
+
 func TestNewVaultDBDeadline(t *testing.T) {
 	type ctxKey struct{}
 	type seen struct {

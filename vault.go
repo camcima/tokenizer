@@ -98,6 +98,9 @@ const (
 	// dekRefreshMinGap bounds refreshes to one per window, however many requests carry an
 	// unknown (possibly forged) key version: each costs a list_deks call and possibly KMS calls.
 	dekRefreshMinGap = 10 * time.Second
+	// dekRefreshTimeout bounds one refresh: the list_deks call plus the KMS unwrap of every new
+	// version, and so how long calls queued behind it wait.
+	dekRefreshTimeout = 30 * time.Second
 )
 
 // dek returns the DEK for version from the current snapshot.
@@ -120,9 +123,14 @@ func (v *vault) currentDEK() (version int, dek []byte) {
 }
 
 // refresh runs refreshDEKs at most once at a time and at most once per dekRefreshMinGap,
-// counted from the end of the previous attempt, successful or not. A caller that arrives while
-// a refresh is in flight waits for it and then returns nil inside the window: the snapshot it
-// re-reads is the one that refresh published. A failed refresh keeps the current snapshot.
+// counted from the end of the previous attempt, successful or not. Calls that queue on refreshMu
+// behind a refresh in flight reach the rate-limit check after it completes and return nil without
+// running again; the snapshot it published is already in place. A failed refresh keeps the
+// current snapshot.
+//
+// refreshDEKs runs detached from ctx's cancellation, so a caller that disconnects does not fail
+// the attempt (which would suppress refreshes for every request for the rest of the window), and
+// under dekRefreshTimeout, which bounds how long queued calls can be held.
 func (v *vault) refresh(ctx context.Context) error {
 	if v.refreshDEKs == nil {
 		return nil
@@ -133,14 +141,17 @@ func (v *vault) refresh(ctx context.Context) error {
 	if gap := time.Now().UnixNano() - v.lastRefresh.Load(); gap >= 0 && gap < int64(dekRefreshMinGap) {
 		return nil
 	}
-	err := v.refreshDEKs(ctx)
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dekRefreshTimeout)
+	err := v.refreshDEKs(rctx)
+	cancel()
 	v.lastRefresh.Store(time.Now().UnixNano())
 	return err
 }
 
 // refreshLoop refreshes the DEK snapshot every period until ctx is cancelled. Errors are not
 // logged (they could carry KMS or database detail); the snapshot simply stays as it was. A
-// refresh in flight at cancellation runs on ctx too, so it is cut short with it.
+// refresh in flight at cancellation finishes first (refresh detaches it from ctx and bounds it by
+// dekRefreshTimeout); main does not wait for this loop, so it never delays shutdown.
 func (v *vault) refreshLoop(ctx context.Context, every time.Duration) {
 	t := time.NewTicker(every)
 	defer t.Stop()
