@@ -738,21 +738,33 @@ sequenceDiagram
   	"fmt"
   	"io"
   	"os"
-  	"strings"
   )
 
   func main() {
-  	in, _ := io.ReadAll(os.Stdin)
-  	seed, err := hex.DecodeString(strings.TrimSpace(string(in)))
+  	in, err := io.ReadAll(os.Stdin)
+  	if err != nil {
+  		fmt.Fprintln(os.Stderr, "cannot read standard input")
+  		os.Exit(1)
+  	}
+  	seed, err := hex.DecodeString(string(in))
   	if err != nil || len(seed) != ed25519.SeedSize {
-  		fmt.Fprintln(os.Stderr, "expected 64 hex characters")
+  		fmt.Fprintln(os.Stderr, "expected exactly 64 hex characters and nothing else")
   		os.Exit(1)
   	}
   	fmt.Println(base64.RawURLEncoding.EncodeToString(ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)))
   }
   ```
 
-  **Rotar** significa una semilla nueva y, por lo tanto, una clave pública nueva. Agregar la semilla nueva como una nueva versión del secreto (el vault lee la última versión al arrancar), agregar su clave pública a la lista de claves públicas aceptadas por la plataforma y luego reiniciar los vaults. Quitar la clave anterior cuando todas las instancias usen la semilla nueva y hayan terminado los checkouts que empezaron antes del cambio.
+  El programa lee la entrada estándar igual que el vault lee el secreto: rechaza todo lo que no sean exactamente 64 caracteres hexadecimales, incluido un salto de línea final, así que una semilla que acepta es una con la que el vault arranca.
+
+  **Rotar** significa una semilla nueva y, por lo tanto, una clave pública nueva. Se sigue este orden: una instancia del vault puede arrancar en cualquier momento (autohealing, escalado, una caída), y una que arranca con una semilla cuya clave pública la plataforma todavía no acepta emite recibos que la plataforma rechaza.
+
+  1. Generar la semilla nueva fuera de línea y derivar su clave pública con el `pubkey.go` de arriba.
+  2. Agregar esa clave pública a la lista de claves públicas aceptadas por la plataforma, y confirmar que el cambio está desplegado en todo lugar que verifica recibos.
+  3. Solo entonces agregar la semilla como una nueva versión del secreto (el vault lee la última versión al arrancar) y reiniciar los vaults.
+  4. Mantener ambas claves aceptadas hasta que todas las instancias usen la semilla nueva y hayan terminado los checkouts que empezaron antes del cambio. Después, quitar la clave anterior.
+
+  Durante el cambio, la plataforma verifica cada recibo contra cada clave aceptada, y lo acepta si alguna de ellas lo verifica.
 - **Política de tokens de traspaso.** El código de la plataforma nunca debe guardar, asociar ni reutilizar una tarjeta mediante un token de un solo uso devuelto por el vault (ver [§7.4](#74-lo-que-el-vault-no-puede-imponer-tokens-de-traspaso)).
 
 ---
@@ -883,7 +895,7 @@ Otros archivos: `catalog.json` (proveedores y cuentas, compilado en el binario),
 
 #### 11.4 Verificar un recibo
 
-Cualquier lenguaje con Ed25519 puede verificar un recibo (formato en [§6.2](#62-el-recibo-firmado)). Se divide en `.`: debe haber exactamente cuatro partes, y las dos primeras deben ser `rcpt` y `v1`. Las dos últimas deben ser base64url sin padding y no vacías (solo `A–Z`, `a–z`, `0–9`, `-` y `_`, sin `=`). Se decodifica la cuarta parte en una firma de 64 bytes, y se verifica con la clave pública del vault sobre los bytes ASCII de `rcpt.v1.` seguidos de la tercera parte exactamente como llegó. Solo entonces se decodifica la tercera parte, y se interpreta como un único objeto JSON con solo las claves del recibo, escritas exactamente, cada una como máximo una vez y sin nada después, donde toda clave salvo `name` está presente y no vacía, e `iat` es positivo. Cualquier otra cosa invalida el recibo entero: nunca repararlo, recodificarlo ni confiar en una parte. Después se comprueba que `token` sea el token que envió el navegador. La versión en Go de abajo sigue a `verifyReceipt` en `receipt.go`, que los tests del vault ejecutan contra los recibos que firma:
+Cualquier lenguaje con Ed25519 puede verificar un recibo (formato en [§6.2](#62-el-recibo-firmado)). Se divide en `.`: debe haber exactamente cuatro partes, y las dos primeras deben ser `rcpt` y `v1`. Las dos últimas deben ser base64url sin padding y no vacías (solo `A–Z`, `a–z`, `0–9`, `-` y `_`, sin `=`) y canónicas: los bits bajos sin usar del último carácter deben ser cero (el decodificador `Strict()` de Go rechaza cualquier otra cosa; en otros lenguajes, se recodifican los bytes decodificados y se exige que sean iguales a la parte recibida). Se decodifica la cuarta parte en una firma de 64 bytes, y se verifica con la clave pública del vault sobre los bytes ASCII de `rcpt.v1.` seguidos de la tercera parte exactamente como llegó. Solo entonces se decodifica la tercera parte, y se interpreta como un único objeto JSON con solo las claves del recibo, escritas exactamente, cada una como máximo una vez y sin nada después, donde toda clave salvo `name` está presente, `iat` es un entero JSON mayor que 0 y todo otro valor es un string JSON no vacío. Cualquier otra cosa invalida el recibo entero: nunca repararlo ni confiar en una parte. Después se comprueba que `token` sea el token que envió el navegador. La versión en Go de abajo sigue a `verifyReceipt` en `receipt.go`, que los tests del vault ejecutan contra los recibos que firma:
 
 ```go
 package receipt
@@ -917,6 +929,8 @@ var receiptKeys = map[string]bool{"token": true, "bin": true, "last4": true,
 	"exp_month": true, "exp_year": true, "name": true, "iat": true}
 
 // Verify returns the contents of receipt s if the vault key behind pub signed it.
+// The caller must also check that r.Token equals the token it received with the receipt; during a
+// key rotation, call Verify once per accepted public key.
 func Verify(pub ed25519.PublicKey, s string) (Receipt, error) {
 	if len(pub) != ed25519.PublicKeySize {
 		return Receipt{}, ErrInvalid

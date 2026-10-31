@@ -478,7 +478,8 @@ func TestTokenizeStoresName(t *testing.T) {
 
 // The receipt is signed by the vault key and states exactly what was tokenized: the issued token,
 // the BIN and last four of the normalized PAN, the expiry and name as sent, and the vault's clock.
-// The BIN and the name travel only inside the receipt. Failure messages never print card data.
+// The BIN and the name are returned only inside the receipt, never as top-level /tokenize fields.
+// Failure messages never print card data.
 func TestTokenizeReturnsReceipt(t *testing.T) {
 	cases := []struct {
 		name, pan, cardName, bin, last4 string

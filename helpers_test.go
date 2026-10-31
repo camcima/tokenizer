@@ -278,9 +278,12 @@ func TestMain(m *testing.M) {
 			code = 1
 		}
 	}
-	for _, s := range []string{testCVV, testSecret, payuTestAPIKey, testName, url.QueryEscape(testName)} {
+	// The receipt signing seed (as configured, in hex) and the private key derived from it (in the
+	// public key's encoding) must never be logged either.
+	for _, s := range []string{testCVV, testSecret, payuTestAPIKey, testName, url.QueryEscape(testName),
+		hex.EncodeToString(testReceiptSeed), base64.RawURLEncoding.EncodeToString(testReceiptKey)} {
 		if strings.Contains(out, s) {
-			fmt.Fprintln(os.Stderr, "LOG LEAK: test secret/CVV/name in log")
+			fmt.Fprintln(os.Stderr, "LOG LEAK: test secret/CVV/name/receipt key in log")
 			code = 1
 		}
 	}

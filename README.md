@@ -738,21 +738,33 @@ sequenceDiagram
   	"fmt"
   	"io"
   	"os"
-  	"strings"
   )
 
   func main() {
-  	in, _ := io.ReadAll(os.Stdin)
-  	seed, err := hex.DecodeString(strings.TrimSpace(string(in)))
+  	in, err := io.ReadAll(os.Stdin)
+  	if err != nil {
+  		fmt.Fprintln(os.Stderr, "cannot read standard input")
+  		os.Exit(1)
+  	}
+  	seed, err := hex.DecodeString(string(in))
   	if err != nil || len(seed) != ed25519.SeedSize {
-  		fmt.Fprintln(os.Stderr, "expected 64 hex characters")
+  		fmt.Fprintln(os.Stderr, "expected exactly 64 hex characters and nothing else")
   		os.Exit(1)
   	}
   	fmt.Println(base64.RawURLEncoding.EncodeToString(ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)))
   }
   ```
 
-  **Rotation** means a new seed, and so a new public key. Add the new seed as a new version of the secret (the vault reads the latest version at boot), add its public key to the platform's list of accepted public keys, then restart the vaults. Remove the old key once every instance runs the new seed and the checkouts that started before the switch have finished.
+  The program reads standard input exactly as the vault reads the secret: anything other than exactly 64 hex characters, a trailing newline included, is refused, so a seed it accepts is one the vault boots with.
+
+  **Rotation** means a new seed, and so a new public key. Follow this order: a vault instance can boot at any moment (autohealing, scale-out, a crash), and one that boots with a seed whose public key the platform doesn't accept yet issues receipts the platform rejects.
+
+  1. Generate the new seed offline and derive its public key with `pubkey.go` above.
+  2. Add that public key to the platform's list of accepted public keys, and confirm the change is deployed everywhere that verifies receipts.
+  3. Only then add the seed as a new version of the secret (the vault reads the latest version at boot) and restart the vaults.
+  4. Keep both keys accepted until every instance runs the new seed and the checkouts that started before the switch have finished. Then remove the old key.
+
+  During the changeover the platform verifies each receipt against every accepted key, and accepts it if any one of them verifies it.
 - **Hand-off token policy.** Platform code must never save, attach or reuse a card through a single-use token the vault returned (see [§7.4](#74-what-the-vault-cannot-enforce-hand-off-tokens)).
 
 ---
@@ -883,7 +895,7 @@ Other files: `catalog.json` (providers and accounts, compiled in), `egress-hosts
 
 #### 11.4 Verifying a receipt
 
-Any language with Ed25519 can verify a receipt (format in [§6.2](#62-the-signed-receipt)). Split it on `.`: there must be exactly four parts, and the first two must be `rcpt` and `v1`. The last two must be non-empty unpadded base64url (only `A–Z`, `a–z`, `0–9`, `-` and `_`, no `=`). Decode the fourth part into a 64-byte signature, and check it with the vault's public key over the ASCII bytes of `rcpt.v1.` followed by the third part exactly as received. Only then decode the third part, and parse it as a single JSON object with only the receipt's keys, spelled exactly, each at most once and nothing after it, where every key except `name` is present and non-empty and `iat` is positive. Anything else makes the whole receipt invalid: never repair, re-encode or partly trust it. Then check that `token` is the token the browser sent. The Go version below follows `verifyReceipt` in `receipt.go`, which the vault's tests run against the receipts it signs:
+Any language with Ed25519 can verify a receipt (format in [§6.2](#62-the-signed-receipt)). Split it on `.`: there must be exactly four parts, and the first two must be `rcpt` and `v1`. The last two must be non-empty unpadded base64url (only `A–Z`, `a–z`, `0–9`, `-` and `_`, no `=`) and canonical: the last character's unused low bits must be zero (Go's `Strict()` decoder rejects anything else; in other languages, re-encode the decoded bytes and require them to equal the part received). Decode the fourth part into a 64-byte signature, and check it with the vault's public key over the ASCII bytes of `rcpt.v1.` followed by the third part exactly as received. Only then decode the third part, and parse it as a single JSON object with only the receipt's keys, spelled exactly, each at most once and nothing after it, where every key except `name` is present, `iat` is a JSON integer greater than 0 and every other value is a non-empty JSON string. Anything else makes the whole receipt invalid: never repair or partly trust it. Then check that `token` is the token the browser sent. The Go version below follows `verifyReceipt` in `receipt.go`, which the vault's tests run against the receipts it signs:
 
 ```go
 package receipt
@@ -917,6 +929,8 @@ var receiptKeys = map[string]bool{"token": true, "bin": true, "last4": true,
 	"exp_month": true, "exp_year": true, "name": true, "iat": true}
 
 // Verify returns the contents of receipt s if the vault key behind pub signed it.
+// The caller must also check that r.Token equals the token it received with the receipt; during a
+// key rotation, call Verify once per accepted public key.
 func Verify(pub ed25519.PublicKey, s string) (Receipt, error) {
 	if len(pub) != ed25519.PublicKeySize {
 		return Receipt{}, ErrInvalid

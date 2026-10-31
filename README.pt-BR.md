@@ -738,21 +738,33 @@ sequenceDiagram
   	"fmt"
   	"io"
   	"os"
-  	"strings"
   )
 
   func main() {
-  	in, _ := io.ReadAll(os.Stdin)
-  	seed, err := hex.DecodeString(strings.TrimSpace(string(in)))
+  	in, err := io.ReadAll(os.Stdin)
+  	if err != nil {
+  		fmt.Fprintln(os.Stderr, "cannot read standard input")
+  		os.Exit(1)
+  	}
+  	seed, err := hex.DecodeString(string(in))
   	if err != nil || len(seed) != ed25519.SeedSize {
-  		fmt.Fprintln(os.Stderr, "expected 64 hex characters")
+  		fmt.Fprintln(os.Stderr, "expected exactly 64 hex characters and nothing else")
   		os.Exit(1)
   	}
   	fmt.Println(base64.RawURLEncoding.EncodeToString(ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)))
   }
   ```
 
-  **Rotacionar** significa uma semente nova e, portanto, uma chave pública nova. Adicione a semente nova como uma nova versão do segredo (o vault lê a versão mais recente no boot), adicione a chave pública dela à lista de chaves públicas aceitas pela plataforma e então reinicie os vaults. Remova a chave antiga quando todas as instâncias estiverem usando a semente nova e os checkouts iniciados antes da troca tiverem terminado.
+  O programa lê a entrada padrão do mesmo jeito que o vault lê o segredo: recusa tudo que não sejam exatamente 64 caracteres hexadecimais, incluindo uma quebra de linha no final, então uma semente que ele aceita é uma com a qual o vault sobe.
+
+  **Rotacionar** significa uma semente nova e, portanto, uma chave pública nova. Siga esta ordem: uma instância do vault pode subir a qualquer momento (autohealing, scale-out, uma queda), e uma que sobe com uma semente cuja chave pública a plataforma ainda não aceita emite recibos que a plataforma rejeita.
+
+  1. Gere a semente nova offline e derive a chave pública dela com o `pubkey.go` acima.
+  2. Adicione essa chave pública à lista de chaves públicas aceitas pela plataforma, e confirme que a mudança está implantada em todo lugar que verifica recibos.
+  3. Só então adicione a semente como uma nova versão do segredo (o vault lê a versão mais recente no boot) e reinicie os vaults.
+  4. Mantenha as duas chaves aceitas até que todas as instâncias estejam usando a semente nova e os checkouts iniciados antes da troca tenham terminado. Depois, remova a chave antiga.
+
+  Durante a troca, a plataforma verifica cada recibo contra cada chave aceita, e o aceita se qualquer uma delas o verificar.
 - **Política de tokens de hand-off.** O código da plataforma nunca deve salvar, vincular ou reutilizar um cartão por meio de um token de uso único retornado pelo vault (veja [§7.4](#74-o-que-o-vault-não-consegue-impor-tokens-de-hand-off)).
 
 ---
@@ -883,7 +895,7 @@ Outros arquivos: `catalog.json` (provedores e contas, compilado no binário), `e
 
 #### 11.4 Verificando um recibo
 
-Qualquer linguagem com Ed25519 consegue verificar um recibo (formato na [§6.2](#62-o-recibo-assinado)). Divida-o em `.`: devem existir exatamente quatro partes, e as duas primeiras devem ser `rcpt` e `v1`. As duas últimas devem ser base64url sem padding e não vazias (apenas `A–Z`, `a–z`, `0–9`, `-` e `_`, sem `=`). Decodifique a quarta parte em uma assinatura de 64 bytes, e verifique-a com a chave pública do vault sobre os bytes ASCII de `rcpt.v1.` seguidos da terceira parte exatamente como recebida. Só então decodifique a terceira parte, e interprete-a como um único objeto JSON com apenas as chaves do recibo, escritas exatamente, cada uma no máximo uma vez e sem nada depois, em que toda chave exceto `name` está presente e não vazia, e `iat` é positivo. Qualquer outra coisa invalida o recibo inteiro: nunca o conserte, recodifique ou aceite em parte. Depois confira que `token` é o token que o navegador enviou. A versão em Go abaixo segue `verifyReceipt` em `receipt.go`, que os testes do vault executam contra os recibos que ele assina:
+Qualquer linguagem com Ed25519 consegue verificar um recibo (formato na [§6.2](#62-o-recibo-assinado)). Divida-o em `.`: devem existir exatamente quatro partes, e as duas primeiras devem ser `rcpt` e `v1`. As duas últimas devem ser base64url sem padding e não vazias (apenas `A–Z`, `a–z`, `0–9`, `-` e `_`, sem `=`) e canônicas: os bits baixos não usados do último caractere devem ser zero (o decodificador `Strict()` do Go rejeita qualquer outra coisa; em outras linguagens, recodifique os bytes decodificados e exija que sejam iguais à parte recebida). Decodifique a quarta parte em uma assinatura de 64 bytes, e verifique-a com a chave pública do vault sobre os bytes ASCII de `rcpt.v1.` seguidos da terceira parte exatamente como recebida. Só então decodifique a terceira parte, e interprete-a como um único objeto JSON com apenas as chaves do recibo, escritas exatamente, cada uma no máximo uma vez e sem nada depois, em que toda chave exceto `name` está presente, `iat` é um inteiro JSON maior que 0 e todo outro valor é uma string JSON não vazia. Qualquer outra coisa invalida o recibo inteiro: nunca o conserte nem o aceite em parte. Depois confira que `token` é o token que o navegador enviou. A versão em Go abaixo segue `verifyReceipt` em `receipt.go`, que os testes do vault executam contra os recibos que ele assina:
 
 ```go
 package receipt
@@ -917,6 +929,8 @@ var receiptKeys = map[string]bool{"token": true, "bin": true, "last4": true,
 	"exp_month": true, "exp_year": true, "name": true, "iat": true}
 
 // Verify returns the contents of receipt s if the vault key behind pub signed it.
+// The caller must also check that r.Token equals the token it received with the receipt; during a
+// key rotation, call Verify once per accepted public key.
 func Verify(pub ed25519.PublicKey, s string) (Receipt, error) {
 	if len(pub) != ed25519.PublicKeySize {
 		return Receipt{}, ErrInvalid

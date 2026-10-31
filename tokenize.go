@@ -341,7 +341,8 @@ func (v *vault) handleTokenize(w http.ResponseWriter, r *http.Request) {
 		v.alertCVVCacheFull()
 	}
 	// The receipt is signed only once the card is stored, so it never names a token that does not
-	// exist. The BIN and the name leave the vault only inside it, and it is never logged.
+	// exist. The BIN and the name are returned to the browser only inside the receipt, never as
+	// top-level /tokenize fields, and the receipt is never logged.
 	rcpt := signReceipt(v.receiptPriv, receipt{
 		Token:    token,
 		BIN:      cardBIN(pan),

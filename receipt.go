@@ -101,8 +101,9 @@ func verifyReceipt(pub ed25519.PublicKey, s string) (receipt, bool) {
 	if len(parts) != 4 || parts[0]+"."+parts[1]+"." != receiptPrefix {
 		return receipt{}, false
 	}
-	// The base64 decoder skips CR and LF, so the alphabet is checked first: a part with any
-	// other character would otherwise decode to the same bytes as the original.
+	// The base64 decoder skips CR and LF, so the alphabet is checked first: a part with CR or LF
+	// inserted would otherwise decode to the same bytes as the original. Any other character
+	// outside the alphabet already fails decoding.
 	if !base64URLChars(parts[2]) || !base64URLChars(parts[3]) {
 		return receipt{}, false
 	}

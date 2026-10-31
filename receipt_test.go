@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -267,5 +268,73 @@ func TestReceiptSignatureCoversPrefix(t *testing.T) {
 	}
 	if _, ok := verifyReceipt(testReceiptPub(), signRawReceipt(receiptPrefix, payloadPart)); !ok {
 		t.Error("signature over prefix and payload part did not verify")
+	}
+}
+
+// readmeReceiptVerifier returns the fenced Go code of the "#### 11.4 " section of a README: the
+// receipt verifier published for the platform. Lines are returned as written, fences excluded.
+func readmeReceiptVerifier(doc string) (code string, blocks int) {
+	var b strings.Builder
+	inSection, inGo, inFence := false, false, false
+	for _, line := range strings.Split(doc, "\n") {
+		if !inFence && strings.HasPrefix(line, "#") {
+			if inSection {
+				break
+			}
+			inSection = strings.HasPrefix(line, "#### 11.4 ")
+			continue
+		}
+		if !inSection {
+			continue
+		}
+		if strings.HasPrefix(line, "```") {
+			if !inFence {
+				inFence, inGo = true, line == "```go"
+				if inGo {
+					blocks++
+				}
+			} else {
+				inFence, inGo = false, false
+			}
+			continue
+		}
+		if inGo {
+			b.WriteString(line)
+			b.WriteByte('\n')
+		}
+	}
+	return b.String(), blocks
+}
+
+// The receipt verifier published in the three READMEs is one piece of code: it must be the same
+// in every language and keep the checks verifyReceipt relies on (bounded split, canonical
+// base64url, signature over the prefixed payload part, no unknown keys).
+func TestReadmeReceiptVerifier(t *testing.T) {
+	want := []string{
+		`strings.SplitN(s, ".", 5)`,
+		`base64.RawURLEncoding.Strict()`,
+		`ed25519.Verify(pub, []byte("rcpt.v1."+parts[2])`,
+		`DisallowUnknownFields()`,
+	}
+	var first string
+	for i, f := range []string{"README.md", "README.es.md", "README.pt-BR.md"} {
+		doc, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("%s: %v", f, err)
+		}
+		code, blocks := readmeReceiptVerifier(string(doc))
+		if blocks == 0 {
+			t.Fatalf("%s: no Go block in the receipt verifier section", f)
+		}
+		for _, w := range want {
+			if !strings.Contains(code, w) {
+				t.Errorf("%s: verifier lacks %s", f, w)
+			}
+		}
+		if i == 0 {
+			first = code
+		} else if code != first {
+			t.Errorf("%s: verifier differs from README.md", f)
+		}
 	}
 }
