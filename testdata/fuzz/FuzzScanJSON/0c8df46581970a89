@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"card\":{\"number\":\"{{pan}}\",\"exp_month\":\"{{exp_month:int}}\",\"name\":\"{{name}}\"},\"amnt\":100}")

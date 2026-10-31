@@ -100,12 +100,27 @@ func TestParseCatalogValid(t *testing.T) {
 	}
 }
 
-// TestParseCatalogRejects applies one mutation per validation rule to testCatalogJSON. Each must be
-// rejected with an error naming the rule (want), and no error may name a secret resource.
-func TestParseCatalogRejects(t *testing.T) {
-	if _, err := parseCatalog([]byte(testCatalogJSON), "dev"); err != nil {
-		t.Fatalf("fixture rejected: %v", err)
+// catalogMutation is one rule violation applied to testCatalogJSON: the first old is replaced by
+// new, and parseCatalog must fail with an error containing want.
+type catalogMutation struct{ name, old, new, want string }
+
+// apply returns testCatalogJSON with m applied; ok is false when m.old is not in the fixture.
+func (m catalogMutation) apply() (data string, ok bool) {
+	switch m.name {
+	case "trailing data":
+		return testCatalogJSON + ` {}`, true
+	case "root not an object":
+		return `[]`, true
 	}
+	if !strings.Contains(testCatalogJSON, m.old) {
+		return "", false
+	}
+	return strings.Replace(testCatalogJSON, m.old, m.new, 1), true
+}
+
+// catalogMutations has one mutation per catalog validation rule. TestParseCatalogRejects checks
+// each; FuzzParseCatalog uses every mutated catalog as a seed.
+func catalogMutations() []catalogMutation {
 	const (
 		stripeAcct = `"stripe_t": {"provider": "stripe", "env": "dev", "host": "upstream.test", "base_path": ""`
 		adyenAcct  = `"adyen_br": {"provider": "adyen", "env": "dev", "host": "upstream.test", "base_path": "/checkout"`
@@ -113,7 +128,7 @@ func TestParseCatalogRejects(t *testing.T) {
 		cpiLine    = `"id": "confirm_payment_intent", "method": "POST", "path": "/v1/payment_intents/{id}/confirm", "query": ["expand[]"], "card_data": true,`
 		tokensLine = `"id": "tokens", "method": "POST", "path": "/v1/tokens", "card_data": true,`
 	)
-	cases := []struct{ name, old, new, want string }{
+	return []catalogMutation{
 		// Strict JSON, unknown keys, wrong types.
 		{"duplicate key", `"format": "form",`, `"format": "form", "format": "form",`, "strict JSON"},
 		{"trailing data", "", "", "strict JSON"}, // special-cased below
@@ -268,19 +283,19 @@ func TestParseCatalogRejects(t *testing.T) {
 			`"secrets": {"apiKey": "projects/pci-cde-dev/secrets/adyen-br-key", "live_apiKey": "projects/pci-cde-dev/secrets/adyen-br-key2"}`,
 			`account "adyen_br" secret "live_apiKey" and account "adyen_br_live" secret "apiKey" share dev variable VAULT_DEV_SECRET_ADYEN_BR_LIVE_APIKEY`},
 	}
-	for _, c := range cases {
-		data := testCatalogJSON
-		switch c.name {
-		case "trailing data":
-			data += ` {}`
-		case "root not an object":
-			data = `[]`
-		default:
-			if !strings.Contains(data, c.old) {
-				t.Errorf("%s: mutation target not in fixture", c.name)
-				continue
-			}
-			data = strings.Replace(data, c.old, c.new, 1)
+}
+
+// TestParseCatalogRejects applies one mutation per validation rule to testCatalogJSON. Each must be
+// rejected with an error naming the rule (want), and no error may name a secret resource.
+func TestParseCatalogRejects(t *testing.T) {
+	if _, err := parseCatalog([]byte(testCatalogJSON), "dev"); err != nil {
+		t.Fatalf("fixture rejected: %v", err)
+	}
+	for _, c := range catalogMutations() {
+		data, ok := c.apply()
+		if !ok {
+			t.Errorf("%s: mutation target not in fixture", c.name)
+			continue
 		}
 		_, err := parseCatalog([]byte(data), "dev")
 		if err == nil {

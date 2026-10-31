@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("0={{exp:mm/yy}}&1={{secret:Aa}000000000000}}")
