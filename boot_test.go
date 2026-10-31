@@ -1109,7 +1109,10 @@ func TestBootFailsFastOnTLSFiles(t *testing.T) {
 	certFile, keyFile, caFile := writeBootTLSFiles(t, dir)
 	missing := filepath.Join(dir, "missing.pem")
 	dev := envWith(testDevEnv(), map[string]string{"VAULT_CERT": certFile, "VAULT_KEY": keyFile, "VAULT_CLIENT_CA": caFile, "VAULT_DB_URL": bootBadDB})
-	prod := envWith(testProdEnv(), map[string]string{"VAULT_CERT": certFile, "VAULT_KEY": keyFile, "VAULT_CLIENT_CA": caFile, "VAULT_DB_URL": bootBadDB})
+	// The embedded catalog has no prod account, which refuses a prod boot right after the catalog
+	// (TestBootRefusesEmptyAccountSet), so the prod cases run against one that has.
+	prod := envWith(testProdEnv(), map[string]string{"VAULT_CERT": certFile, "VAULT_KEY": keyFile, "VAULT_CLIENT_CA": caFile, "VAULT_DB_URL": bootBadDB,
+		"PAN_VAULT_TEST_CATALOG": bootCatalogJSON("prod")})
 	for _, c := range []struct {
 		name string
 		env  map[string]string
@@ -1159,7 +1162,8 @@ func TestBootCatalogFailsFast(t *testing.T) {
 	certFile, keyFile, caFile := writeBootTLSFiles(t, t.TempDir())
 	files := map[string]string{"VAULT_CERT": certFile, "VAULT_KEY": keyFile, "VAULT_CLIENT_CA": caFile, "VAULT_DB_URL": bootBadDB}
 	dev := envWith(testDevEnv(), files)
-	prod := envWith(testProdEnv(), files)
+	// A prod account, so the prod control gets past the empty account set gate.
+	prod := envWith(testProdEnv(), envWith(files, map[string]string{"PAN_VAULT_TEST_CATALOG": bootCatalogJSON("prod")}))
 	const acctVar = "VAULT_DEV_SECRET_STRIPE_TEST_SECRETKEY"
 	for _, c := range []struct {
 		name string
@@ -1191,6 +1195,58 @@ func TestBootCatalogFailsFast(t *testing.T) {
 			}
 			if strings.Contains(stderr, "catalog loaded") {
 				t.Error("catalog loaded before the account secrets")
+			}
+		})
+	}
+}
+
+// bootCatalogJSON is a minimal valid catalog whose one account, stripe_test, belongs to env. A
+// boot subprocess runs against it through PAN_VAULT_TEST_CATALOG (see TestMain).
+func bootCatalogJSON(env string) string {
+	return `{
+  "providers": {"stripe": {"format": "form", "endpoints": [{"id": "tokens", "method": "POST", "path": "/v1/tokens", "card_data": true,
+    "headers": {"Authorization": "Bearer {{secret:secretKey}}"}, "positions": {"card[number]": "{{pan}}"}}]}},
+  "accounts": {"stripe_test": {"provider": "stripe", "env": "` + env + `", "host": "api.stripe.com", "base_path": "",
+    "secrets": {"secretKey": "projects/pci-cde-` + env + `/secrets/stripe-key"}, "values": {}}}
+}`
+}
+
+// TestBootRefusesEmptyAccountSet: a serve-mode boot whose catalog has no account for its
+// environment exits 1 right after the catalog is parsed, before the dev variable check, the
+// database, KMS or Secret Manager (VAULT_DB_URL is unparseable, so a boot past the gate fails
+// with the database reason). A vault with no account could never send a card anywhere.
+func TestBootRefusesEmptyAccountSet(t *testing.T) {
+	certFile, keyFile, caFile := writeBootTLSFiles(t, t.TempDir())
+	files := map[string]string{"VAULT_CERT": certFile, "VAULT_KEY": keyFile, "VAULT_CLIENT_CA": caFile, "VAULT_DB_URL": bootBadDB}
+	dev := envWith(testDevEnv(), files)
+	prod := envWith(testProdEnv(), files)
+	withCatalog := func(env map[string]string, catEnv string) map[string]string {
+		return envWith(env, map[string]string{"PAN_VAULT_TEST_CATALOG": bootCatalogJSON(catEnv)})
+	}
+	for _, c := range []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{"dev, only a prod account", withCatalog(dev, "prod"), "catalog has no accounts for env=dev"},
+		{"prod, only a dev account", withCatalog(prod, "dev"), "catalog has no accounts for env=prod"},
+		// Controls: with an account for the environment the boot proceeds to the database.
+		{"dev, a dev account", withCatalog(dev, "dev"), "VAULT_DB_URL cannot be parsed"},
+		{"prod, a prod account", withCatalog(prod, "prod"), "VAULT_DB_URL cannot be parsed"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			code, stderr := runMain(t, c.env)
+			if code != 1 {
+				t.Errorf("exit code %d, want 1", code)
+			}
+			if strings.Contains(stderr, testSecret) {
+				t.Fatal("stderr contains the secret value") // never print it
+			}
+			if !strings.Contains(stderr, " boot failed: "+c.want+"\n") {
+				t.Errorf("stderr %q lacks boot failure reason %q", stderr, c.want)
+			}
+			if strings.Contains(stderr, "catalog loaded") {
+				t.Error("catalog loaded before the database was opened")
 			}
 		})
 	}

@@ -681,6 +681,11 @@ func main() {
 		if err != nil {
 			fail(err.Error())
 		}
+		// With no account for this environment every /proxy call would be refused, so a vault
+		// that boots would look healthy while it can never send a card anywhere. Refuse instead.
+		if len(cat.accounts) == 0 {
+			fail("catalog has no accounts for env=" + cfg.env)
+		}
 		if err := checkDevSecretVars(cat, cfg.env, os.Environ()); err != nil {
 			fail(err.Error())
 		}

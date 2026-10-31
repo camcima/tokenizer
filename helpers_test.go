@@ -243,6 +243,13 @@ func (c *fakeClock) advance(d time.Duration) {
 // of length 13–19 (so a PAN embedded in a longer digit run is caught). Only offsets are printed.
 func TestMain(m *testing.M) {
 	if os.Getenv("PAN_VAULT_TEST_RUN_MAIN") == "1" {
+		// PAN_VAULT_TEST_CATALOG replaces the compiled-in catalog for this subprocess, so a boot
+		// test can run against an account set the embedded catalog does not have. It exists only
+		// in the test binary: the shipped binary never reads it and its catalog stays the
+		// compiled-in one.
+		if s, ok := os.LookupEnv("PAN_VAULT_TEST_CATALOG"); ok {
+			catalogJSON = []byte(s)
+		}
 		main() // a boot-sequence subprocess started by runMain; main always exits
 		return
 	}
