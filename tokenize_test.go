@@ -57,6 +57,10 @@ func TestTokenize(t *testing.T) {
 		{name: "upper path", target: "/TOKENIZE", wantStatus: 404, wantError: msgNotFound},
 		{name: "encoded path", target: "/%74okenize", wantStatus: 404, wantError: msgNotFound},
 		{name: "pan path", target: "/" + testPAN, wantStatus: 404, wantError: msgNotFound},
+		// The internal routes do not exist on the public listener, so a browser can never
+		// reach them: they are 404 like any other unknown path, not 401 or 405.
+		{name: "proxy path", target: "/proxy", wantStatus: 404, wantError: msgNotFound},
+		{name: "healthz path", method: "GET", target: "/healthz", wantStatus: 404, wantError: msgNotFound},
 
 		// 405: POST or OPTIONS only.
 		{name: "GET", method: "GET", wantStatus: 405, wantError: msgMethod},
