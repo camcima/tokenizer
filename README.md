@@ -676,7 +676,7 @@ The vault is only as safe as the environment it runs in. It belongs in its own l
 | `pci-keys-<env>` | Cloud KMS key ring with the HSM-protected key-encryption key. |
 | `pci-logs` | Audit log sink with Bucket Lock, retained for at least one year. |
 
-Org policies on the `pci` folder deny external IPs and service-account key creation, and require Shielded VMs and CMEK. There's no standing human IAM on the CDE project: break-glass access is time-boxed and goes through Access Approval.
+Org policies on the `pci` folder deny external IPs, service-account key creation, and Cloud SQL public IPs and authorized networks (`sql.restrictPublicIp`, `sql.restrictAuthorizedNetworks`), and require Shielded VMs and CMEK. There's no standing human IAM on the CDE project. Break-glass access is a Privileged Access Manager entitlement on that project: it names the roles it grants, the approvers and how many must approve, requires a justification, and caps the grant's duration. Its audit logs (`privilegedaccessmanager.googleapis.com`) record the entitlement and grant lifecycle and go to the `pci-logs` sink; what is done under a grant is logged by the target services, so their Data Access audit logs must be enabled. IAM Conditions with an expiry are only a weaker fallback, with no approval or justification step. Access Approval does not apply here: it governs Google personnel's access to Customer Data, not the customer's own staff.
 
 **Key rotation:**
 
@@ -1053,4 +1053,4 @@ func exactKeys(payload []byte) bool {
 | **Session token** | A short-lived HMAC ticket the platform gives the browser so it may call `/tokenize`. |
 | **Token** | A random stand-in for a card (`tok_` + 32 hex characters). Worthless outside the vault. |
 | **Velocity limit** | A cap on how often cards can be looked up, to stop bulk extraction. |
-| **VPC-SC** | VPC Service Controls: a Google Cloud perimeter that blocks data from leaving a set of projects. |
+| **VPC-SC** | VPC Service Controls: a Google Cloud perimeter that blocks data from leaving a set of projects through Google Cloud APIs (it does not govern database connections). |
