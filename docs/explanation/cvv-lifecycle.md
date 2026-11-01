@@ -14,7 +14,7 @@ The alternative to memory is some form of storage: the cards table, a separate t
 
 - it is gone when the process exits, crashes or is replaced;
 - it never reaches a backup, a replica or a log;
-- nothing outside the vault process can read it.
+- nothing that cannot read the vault process's memory can read it.
 
 The price is that the CVV is per instance, which is the subject of [the cross-instance residual](#the-cross-instance-residual) below.
 

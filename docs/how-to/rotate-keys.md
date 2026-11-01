@@ -41,7 +41,7 @@ The README recommends a new DEK every month and a 90-day KMS key rotation. The v
 - No `ALERT decrypt_failed … key_version=<N>` appears. A short burst is possible on one instance if KMS or the database was unreachable when it first met version N, or if its previous refresh had finished less than 10 seconds earlier, before the key existed; it clears with the next successful refresh.
 - Normally every instance holds the new key within one background period (5 minutes). A tick that falls within 10 seconds of another refresh is skipped, and a failed refresh is retried on the next tick.
 
-**Rollback:** there is none, and none is needed for a bad key: a key that does not unwrap is never stored. Neither `vault_app` nor `vault_rotator` can delete a DEK (only the table owner `vault_owner` can), and removing a row from `vault.deks` would make every card sealed under it fail with `decrypt_failed`. Never call `vault.add_dek` by hand with anything but a KMS-wrapped key: every instance unwraps every stored DEK at boot and refuses to boot if one fails (`unwrapDEKs` in `main.go`).
+**Rollback:** there is none, and none is needed for a bad key: a key that does not unwrap is never stored. Neither `vault_app` nor `vault_rotator` can delete a DEK (the table owner `vault_owner` and a superuser can), and removing a row from `vault.deks` would make every card sealed under it fail with `decrypt_failed`. Never call `vault.add_dek` by hand with anything but a KMS-wrapped key: every instance unwraps every stored DEK at boot and refuses to boot if one fails (`unwrapDEKs` in `main.go`).
 
 ## KMS key-encryption key
 

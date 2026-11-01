@@ -33,8 +33,9 @@ Step-by-step recipes for one task each, for readers who know the basics.
   egress rules, health checks and the probes that prove the separation holds.
 - [Add a provider](how-to/add-a-provider.md): the catalog change procedure, from qualifying the
   endpoint to the pull request.
-- [Rotate keys](how-to/rotate-keys.md): data encryption keys, the session HMAC key, the receipt
-  signing key, the platform client CA and TLS certificates, each with verification and rollback.
+- [Rotate keys](how-to/rotate-keys.md): data encryption keys, the KMS key-encryption key, the
+  session HMAC key, the receipt signing key, provider account secrets, the platform client CA and
+  TLS certificates, each with verification and rollback.
 - [Respond to alerts](how-to/respond-to-alerts.md): one runbook per `ALERT` line.
 
 ## Reference
@@ -82,7 +83,7 @@ Understanding-oriented pages: the why, the trade-offs and the alternatives.
 
 ## Keeping these pages correct
 
-Every claim in these pages is written from the code. Two checks run in CI and before every push:
+Every claim in these pages is written from the code. Two checks run in CI, and before every push on a clone that installed the hooks (`make hooks`):
 relative links and heading anchors must resolve (`make docs-links`), and every Mermaid diagram
 must parse (`make mermaid-check`). When you change behaviour, change the page that describes it in
 the same pull request.

@@ -212,7 +212,7 @@ so the title plus suffix must fit the 72-character subject rule. The title is pa
 
 ### Required checks
 
-The README states that the four workflows (CI, Integration, Image, Fuzz) are the required checks and that branch protection on `main` should require all four. Their job names are `ci`, `commits`, `integration`, `image` and `fuzz`. Branch protection settings live in the GitHub repository settings, not in this repository, so they cannot be verified from the files here.
+The README states that the four workflows (CI, Integration, Image, Fuzz) produce the required checks and that branch protection on `main` should require the five of them: `ci`, `commits`, `integration`, `image` and `fuzz`. Branch protection settings live in the GitHub repository settings, not in this repository, so they cannot be verified from the files here.
 
 ## See also
 

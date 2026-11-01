@@ -104,7 +104,7 @@ The product names in the diagram (external Application Load Balancer, internal p
 
    Connected as the rotator account with its IAM token, `SELECT has_function_privilege('vault.add_dek(bytea)', 'EXECUTE');` returns `true`. Prefer this to a real `vault -rotate-dek`, which would add a DEK on every IAM change.
 
-   Never call `vault.add_dek` with test bytes on a real database. At boot every instance unwraps every stored DEK through KMS and refuses to boot if any one fails (`unwrapDEKs` in `main.go`), and every refresh on running instances fails on the same row, so they never learn later DEKs either (`dekRefresher` in `main.go`). Neither `vault_app` nor `vault_rotator` can remove a row from `vault.deks`; only the table owner `vault_owner` can.
+   Never call `vault.add_dek` with test bytes on a real database. At boot every instance unwraps every stored DEK through KMS and refuses to boot if any one fails (`unwrapDEKs` in `main.go`), and every refresh on running instances fails on the same row, so they never learn later DEKs either (`dekRefresher` in `main.go`). Neither `vault_app` nor `vault_rotator` can remove a row from `vault.deks`; the table owner `vault_owner` and a superuser can.
 
 ### 3. Create the secrets
 
@@ -215,7 +215,7 @@ Roll out the instance group and confirm on each instance the six boot lines from
 … req listener=internal method=POST path=/proxy status=200 dur=…ms caller=<serial>
 ```
 
-Every `ALERT` line must page someone; see [Respond to alerts](respond-to-alerts.md).
+Every `ALERT` line must reach someone, at the severity [Respond to alerts](respond-to-alerts.md) gives it: most page, `session_token_invalid` and `cvv_cache_full` notify.
 
 ## Verification checklist
 
@@ -237,7 +237,7 @@ Every `ALERT` line must page someone; see [Respond to alerts](respond-to-alerts.
 | 14 | Session HMAC key and receipt seed are exactly 64 hex characters | The vault boots | Code |
 | 15 | The platform accepts the receipt public key logged at boot | Compare `receipt public key=…` with the platform's configuration | Configuration |
 | 16 | The readiness monitor gets `200 {"status":"ok"}` over mTLS | Monitor in step 10 | Code and configuration |
-| 17 | Every `ALERT` line pages | Log-based alerting | Configuration |
+| 17 | Every `ALERT` line reaches someone at its runbook severity | Log-based alerting | Configuration |
 
 ## See also
 

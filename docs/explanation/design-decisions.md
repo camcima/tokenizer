@@ -222,11 +222,11 @@ This page is for engineers and reviewers who want the reasoning behind PAN Vault
 - `make ci` adds gofmt, `go vet`, staticcheck, govulncheck, the dependency and vendor checks, the documentation checks (`docs-check`, with its link check, and `mermaid-check`), `comment-check` and gitleaks over the full git history, all with pinned tool versions.
 - `make itest` runs the database and end-to-end tests against a real `postgres:18`, and `make stripe-mock-test` sends platform-built requests through the embedded catalog to `stripe-mock`.
 - Opt-in lefthook hooks (`make hooks`) run gofmt, gitleaks and the comment rule before each commit, the conventional-commit rule on each message, and `make ci` before each push. CI repeats every one of these checks, so skipping a hook skips nothing.
-- Branch protection lives in the GitHub repository settings, not in this repository; the README says it should require the four workflows. Checked on 2026-10-31, `main` required five status checks (`ci`, `commits`, `integration`, `image`, `fuzz`, the jobs of the four workflows), up to date with `main`, and linear history, and the repository allowed only squash merges, with the pull request's title as the commit subject. The `commits` job checks that title, with its ` (#N)` suffix, against the conventional-commit rule.
+- Branch protection lives in the GitHub repository settings, not in this repository, so it cannot be verified from the files here. The README says `main` should require the five checks the four workflows produce (`ci`, `commits`, `integration`, `image`, `fuzz`), stay up to date with `main`, keep a linear history and take squash merges only, with the pull request's title as the commit subject. The `commits` job checks that title, with its ` (#N)` suffix, against the conventional-commit rule.
 
 **Consequences.**
 - The test code is larger than the service code.
-- A change cannot reach `main` without every check passing.
+- With that protection in place, a change cannot reach `main` without every check passing; the protection itself is a repository setting an administrator can change.
 
 ## 19. The never-logged list and the leak-scan `TestMain`
 

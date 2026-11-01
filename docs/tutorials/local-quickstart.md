@@ -452,7 +452,7 @@ curl -sS --cacert "$QS/ca.crt" https://localhost:19443/healthz
 ```
 
 ```
-curl: (56) OpenSSL SSL_read: OpenSSL/3.0.13: error:0A00045C:SSL routines::tlsv13 alert certificate required, errno 0
+curl: (56) OpenSSL SSL_read: OpenSSL/3.0.13: error:0A00045C:SSL routines::tlsv13 alert certificate required, errno 0   # the OpenSSL version and wording vary
 ```
 
 The TLS handshake fails before any HTTP request exists, so the vault never sees a request and writes no log line for it.
@@ -513,7 +513,7 @@ How to read them:
 
 - **Boot lines** (`config loaded`, `deks loaded`, `catalog loaded`, `receipt public key`, `listening`, `ready`) appear once, in that order. `deks loaded versions=1 current=1` is the dev data key.
 - **`req` lines** are the access log: exactly one per request, written by `guard` in `vault.go`. They carry the listener, method, path, status and duration. On the internal listener they add `caller=`, the client certificate's serial in the form `openssl x509 -serial` prints, which you noted in step 4. A path other than `/tokenize`, `/proxy` or `/healthz` is logged as `path=other`, so text typed into a URL never reaches the log.
-- **`ALERT` lines** are the lines that page someone in production. `session_token_invalid reason=hmac` came from the forged session token. `proxy_policy` names the account and endpoint as the catalog spells them (`-` when no endpoint matched) and a fixed reason. Session and policy alerts are each written at most once per second, so a burst of refusals produces fewer `ALERT` lines than `req` lines.
+- **`ALERT` lines** are the lines that reach an operator in production (most page, two only notify; see [Respond to alerts](../how-to/respond-to-alerts.md)). `session_token_invalid reason=hmac` came from the forged session token. `proxy_policy` names the account and endpoint as the catalog spells them (`-` when no endpoint matched) and a fixed reason. Session and policy alerts are each written at most once per second, so a burst of refusals produces fewer `ALERT` lines than `req` lines.
 
 Nothing else is ever logged: no card number, CVV, name, receipt, header or body. Search the log for the card number to confirm:
 
