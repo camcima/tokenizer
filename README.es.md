@@ -10,6 +10,8 @@ El navegador le entrega la tarjeta al vault. El vault la guarda bajo llave y dev
 
 Este documento está escrito para dos audiencias a la vez. Cada sección empieza con **La versión corta**, en lenguaje sencillo para cualquier persona. Luego continúa con **En profundidad**, para ingenieros, revisores de seguridad y auditores. Lee solo las versiones cortas para tener el panorama general, o lee todo para conocer la historia completa.
 
+¿Buscas la documentación detallada? La [carpeta `docs/`](docs/README.md) (solo en inglés) contiene un quickstart local, guías de integración y despliegue, la referencia completa de API, configuración, catálogo y límites, y las explicaciones de arquitectura, modelo de amenazas y diseño.
+
 ---
 
 ## Contenido

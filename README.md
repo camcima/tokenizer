@@ -10,6 +10,8 @@ The browser hands the card to the vault. The vault locks it away and gives back 
 
 This document is written for two audiences at once. Every section starts with **The short version**, in plain language for anyone. It then continues with **The deeper dive**, for engineers, security reviewers and auditors. Read only the short versions for the big picture, or read everything for the full story.
 
+Looking for the detailed documentation? The [`docs/` folder](docs/README.md) (English only) has a local quickstart, integration and deployment guides, the complete API, configuration, catalog and limits reference, and the architecture, threat model and design explanations.
+
 ---
 
 ## Contents

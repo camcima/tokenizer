@@ -10,6 +10,8 @@ O navegador entrega o cartão ao vault. O vault o guarda a sete chaves e devolve
 
 Este documento foi escrito para dois públicos ao mesmo tempo. Toda seção começa com **A versão curta**, em linguagem simples, para qualquer pessoa. Em seguida, continua com **Em profundidade**, para engenheiros, revisores de segurança e auditores. Leia apenas as versões curtas para ter a visão geral, ou leia tudo para ter a história completa.
 
+Procurando a documentação detalhada? A [pasta `docs/`](docs/README.md) (somente em inglês) contém um quickstart local, guias de integração e implantação, a referência completa de API, configuração, catálogo e limites, e as explicações de arquitetura, modelo de ameaças e design.
+
 ---
 
 ## Sumário
