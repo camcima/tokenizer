@@ -112,16 +112,29 @@ var (
 	errPlaceholder = errors.New("invalid placeholder use") // placeholder-looking text where it is not allowed
 )
 
+// maxOccurrences caps the placeholder occurrences scanBody returns, and parseCatEndpoint refuses
+// an endpoint listing more positions, so the cap never refuses a request the catalog would accept:
+// every accepted occurrence sits at a listed position, and no two share an address (JSON objects
+// have no duplicate keys, form keys are unique unless they end in "[]", and form placeholders are
+// never under such a repeatable key).
+const maxOccurrences = 64
+
 // JSON nesting deeper than 64 objects/arrays is rejected. Provider bodies nest a
 // handful of levels; the cap bounds work on pathological input well below encoding/json's own.
 const maxJSONDepth = 64
 
-// jsonNode is one token of a JSON body as walked by jsonWalk, in document order. Values carry the
-// JSON Pointer of the value; a "key" node carries the pointer of the member it names. text is the
-// decoded string (string, key) or the raw text (number, bool, null, object, array); [start, end)
-// is the raw span, strings including their quotes.
+// jsonNode is one token of a JSON body as walked by jsonWalk, in document order. A node does not
+// hold its JSON Pointer, which jsonPointer assembles on demand: parent is the index of the
+// enclosing object or array node (-1 for the root value) and seg the node's own reference token
+// with its leading "/" ("/" + escaped key, or "/" + array index; "" for the root). A "key" node has
+// the seg of the member it names, so its pointer is that member's. text is the decoded string
+// (string, key) or the raw text (number, bool, null) and is empty for an object or array, whose
+// text is the body slice [start, end); [start, end) is the raw span, strings including their
+// quotes. Storing pointers or container text per node would copy a long key or a large container
+// once per descendant, so memory would grow with the square of the body size.
 type jsonNode struct {
-	ptr        string
+	parent     int
+	seg        string
 	kind       string // key string number bool null object array
 	text       string
 	start, end int
@@ -130,10 +143,58 @@ type jsonNode struct {
 // jsonPointerEscaper escapes one RFC 6901 reference token ("~" first, then "/").
 var jsonPointerEscaper = strings.NewReplacer("~", "~0", "/", "~1")
 
-// jsonWalk parses b strictly and returns every key and value with its pointer and raw span. b must
+// jsonPointer returns the JSON Pointer of nodes[i], assembled from its own and its ancestors' segs
+// in one allocation. Segs are written root first by walking up to each ancestor in turn, which is
+// quadratic in the depth, at most maxJSONDepth+1.
+func jsonPointer(nodes []jsonNode, i int) string {
+	n, depth := 0, 0
+	for j := i; j >= 0; j = nodes[j].parent {
+		n += len(nodes[j].seg)
+		depth++
+	}
+	var b strings.Builder
+	b.Grow(n)
+	for d := depth - 1; d >= 0; d-- {
+		j := i
+		for range d {
+			j = nodes[j].parent
+		}
+		b.WriteString(nodes[j].seg)
+	}
+	return b.String()
+}
+
+// jsonPointerIs reports whether jsonPointer(nodes, i) equals addr, or with fold set whether the two
+// are equal under strings.EqualFold, without building the pointer. Under folding the comparison
+// goes token by token: '/' folds only to itself and never occurs inside an escaped token, so two
+// pointers fold-match exactly when they have the same tokens up to case.
+func jsonPointerIs(nodes []jsonNode, i int, addr string, fold bool) bool {
+	for ; i >= 0; i = nodes[i].parent {
+		seg := nodes[i].seg
+		if seg == "" {
+			continue // the root
+		}
+		if fold {
+			cut := strings.LastIndexByte(addr, '/')
+			if cut < 0 || !strings.EqualFold(addr[cut:], seg) {
+				return false
+			}
+			addr = addr[:cut]
+		} else {
+			if !strings.HasSuffix(addr, seg) {
+				return false
+			}
+			addr = addr[:len(addr)-len(seg)]
+		}
+	}
+	return addr == ""
+}
+
+// jsonWalk parses b strictly and returns every key and value with its position and raw span. b must
 // be valid UTF-8 holding exactly one JSON value (whitespace around it only), with no duplicate keys
 // in any object (compared after decoding escapes) and at most maxJSONDepth levels of nesting.
-// Any failure is errBody.
+// Any failure is errBody. With keep unset it performs every check but records no nodes and
+// returns nil, so validating a body costs no memory per token.
 // A string or key whose decoded text contains U+FFFD is rejected. encoding/json
 // silently decodes a lone surrogate escape ("\ud800") to U+FFFD, which other parsers reject or
 // keep, so such a body could be read differently by the provider; a literal or escaped U+FFFD is
@@ -147,17 +208,17 @@ var jsonPointerEscaper = strings.NewReplacer("~", "~0", "/", "~1")
 // starts at the first byte after the previous token's end that is not whitespace, ':' or ',', and
 // ends at the new InputOffset. Each span is checked against the token (quotes, delimiter byte,
 // number text) and any mismatch fails closed.
-func jsonWalk(b []byte) ([]jsonNode, error) {
+func jsonWalk(b []byte, keep bool) ([]jsonNode, error) {
 	if !utf8.Valid(b) {
 		return nil, errBody
 	}
 	type frame struct {
-		ptr   string
-		array bool
-		index int             // next array index
-		keys  map[string]bool // object keys seen
-		key   string          // pending member key (object)
-		node  int             // index of the container's node
+		array  bool
+		index  int             // next array index
+		keys   map[string]bool // object keys seen
+		hasKey bool            // a member key is pending its value (object)
+		seg    string          // the pending member's seg (kept walks only)
+		node   int             // index of the container's node (kept walks only)
 	}
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.UseNumber()
@@ -184,15 +245,18 @@ func jsonWalk(b []byte) ([]jsonNode, error) {
 		}
 
 		// An object member key.
-		if top != nil && !top.array && top.key == "" && tok != json.Delim('}') {
+		if top != nil && !top.array && !top.hasKey && tok != json.Delim('}') {
 			k, ok := tok.(string)
 			if !ok || !jsonStringSpan(b, start, end) || strings.ContainsRune(k, utf8.RuneError) ||
 				strings.ContainsFunc(k, func(r rune) bool { return r < 0x20 }) || top.keys[k] {
 				return nil, errBody
 			}
 			top.keys[k] = true
-			top.key = "/" + jsonPointerEscaper.Replace(k) // non-empty even for the "" key
-			nodes = append(nodes, jsonNode{ptr: top.ptr + top.key, kind: "key", text: k, start: start, end: end})
+			top.hasKey = true
+			if keep {
+				top.seg = "/" + jsonPointerEscaper.Replace(k) // non-empty even for the "" key
+				nodes = append(nodes, jsonNode{parent: top.node, seg: top.seg, kind: "key", text: k, start: start, end: end})
+			}
 			continue
 		}
 
@@ -202,28 +266,31 @@ func jsonWalk(b []byte) ([]jsonNode, error) {
 				return nil, errBody
 			}
 			stack = stack[:len(stack)-1]
-			nodes[top.node].end = end
-			nodes[top.node].text = string(b[nodes[top.node].start:end])
+			if keep {
+				nodes[top.node].end = end
+			}
 		} else {
-			// A value: its pointer comes from the enclosing container.
-			ptr := ""
+			// A value: its seg comes from the enclosing container.
+			n := jsonNode{parent: -1, start: start, end: end}
 			if top != nil {
+				n.parent = top.node
 				if top.array {
-					ptr = top.ptr + "/" + strconv.Itoa(top.index)
+					if keep {
+						n.seg = "/" + strconv.Itoa(top.index)
+					}
 					top.index++
 				} else {
-					ptr = top.ptr + top.key
-					top.key = ""
+					n.seg = top.seg
+					top.hasKey, top.seg = false, ""
 				}
 			}
-			n := jsonNode{ptr: ptr, start: start, end: end}
 			switch t := tok.(type) {
 			case json.Delim:
 				if end != start+1 || b[start] != byte(t) || len(stack) >= maxJSONDepth {
 					return nil, errBody
 				}
 				n.kind = "object"
-				f := &frame{ptr: ptr, node: len(nodes), keys: map[string]bool{}}
+				f := &frame{node: len(nodes), keys: map[string]bool{}}
 				if t == json.Delim('[') {
 					n.kind, f.array, f.keys = "array", true, nil
 				}
@@ -245,7 +312,9 @@ func jsonWalk(b []byte) ([]jsonNode, error) {
 			if n.kind != "string" && n.kind != "object" && n.kind != "array" && string(b[start:end]) != n.text {
 				return nil, errBody
 			}
-			nodes = append(nodes, n)
+			if keep {
+				nodes = append(nodes, n)
+			}
 		}
 
 		// The root value is complete: only whitespace may follow.
@@ -276,9 +345,10 @@ func jsonStringSpan(b []byte, start, end int) bool {
 }
 
 // jsonStrict checks that b is valid UTF-8 holding exactly one JSON value with no trailing data and
-// no duplicate keys at any depth (see jsonWalk). It returns errBody or nil.
+// no duplicate keys at any depth (see jsonWalk). It returns errBody or nil. It keeps no nodes, so
+// its memory is the decoder's plus each object's key set.
 func jsonStrict(b []byte) error {
-	_, err := jsonWalk(b)
+	_, err := jsonWalk(b, false)
 	return err
 }
 
@@ -365,16 +435,22 @@ func validFormKey(k string) bool {
 //     placeholder, and never under a "[]" key (repeatable, so not a unique position); a key
 //     containing "{{" is always an error.
 //
+// More than maxOccurrences occurrences is errPlaceholder. No request a catalog endpoint accepts
+// has more (see maxOccurrences), and each occurrence's address is a copy of its ancestors' keys, so
+// an unbounded count under a long key would cost memory growing with the square of the body size.
+//
 // Strictness failures (errBody) take precedence over placeholder failures.
 func scanBody(format string, body []byte) ([]occurrence, error) {
 	var occs []occurrence
 	switch format {
 	case "json":
-		nodes, err := jsonWalk(body)
+		nodes, err := jsonWalk(body, true)
 		if err != nil {
 			return nil, err
 		}
-		for _, n := range nodes {
+		// Addresses are built only once the count is known to be within the cap.
+		var at []int // node index of each occurrence
+		for i, n := range nodes {
 			if !strings.Contains(n.text, "{{") || (n.kind != "key" && n.kind != "string") {
 				continue
 			}
@@ -383,10 +459,14 @@ func scanBody(format string, body []byte) ([]occurrence, error) {
 			}
 			raw := string(body[n.start+1 : n.end-1])
 			ph, ok := parsePlaceholder(raw)
-			if !ok || raw != n.text {
+			if !ok || raw != n.text || len(occs) == maxOccurrences {
 				return nil, errPlaceholder
 			}
-			occs = append(occs, occurrence{addr: n.ptr, ph: ph, start: n.start, end: n.end})
+			occs = append(occs, occurrence{ph: ph, start: n.start, end: n.end})
+			at = append(at, i)
+		}
+		for k, i := range at {
+			occs[k].addr = jsonPointer(nodes, i)
 		}
 	case "form":
 		fields, err := formFields(body)
@@ -402,7 +482,7 @@ func scanBody(format string, body []byte) ([]occurrence, error) {
 			}
 			raw := string(body[f.start:f.end])
 			ph, ok := parsePlaceholder(raw)
-			if !ok || raw != f.value || strings.HasSuffix(f.key, "[]") {
+			if !ok || raw != f.value || strings.HasSuffix(f.key, "[]") || len(occs) == maxOccurrences {
 				return nil, errPlaceholder
 			}
 			occs = append(occs, occurrence{addr: f.key, ph: ph, start: f.start, end: f.end})
@@ -421,12 +501,15 @@ func scanBody(format string, body []byte) ([]occurrence, error) {
 func readField(format string, body []byte, addr string) (fieldValue, bool, error) {
 	switch format {
 	case "json":
-		nodes, err := jsonWalk(body)
+		nodes, err := jsonWalk(body, true)
 		if err != nil {
 			return fieldValue{}, false, err
 		}
-		for _, n := range nodes {
-			if n.kind != "key" && n.ptr == addr {
+		for i, n := range nodes {
+			if n.kind != "key" && jsonPointerIs(nodes, i, addr, false) {
+				if n.kind == "object" || n.kind == "array" {
+					return fieldValue{kind: n.kind, text: string(body[n.start:n.end])}, true, nil
+				}
 				return fieldValue{kind: n.kind, text: n.text}, true, nil
 			}
 		}

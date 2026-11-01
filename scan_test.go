@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/url"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -130,28 +132,188 @@ func TestScanJSON(t *testing.T) {
 // by slicing the raw text and unmarshalling it.
 func TestJSONSpans(t *testing.T) {
 	body := "{\"k\\u00e9y\":[\"a\\\"b\",\"\\ud83d\\ude00\",\"\u65e5\u672c\",{\"x\" :\"\\/\\b\\f\\n\\r\\t\"}], \"n\":-1.5e+3}"
-	nodes, err := jsonWalk([]byte(body))
+	nodes, err := jsonWalk([]byte(body), true)
 	if err != nil {
 		t.Fatalf("jsonWalk: %v", err)
 	}
 	strs := 0
-	for _, n := range nodes {
+	for i, n := range nodes {
 		raw := body[n.start:n.end]
 		switch n.kind {
 		case "string", "key":
 			strs++
 			var s string
 			if err := json.Unmarshal([]byte(raw), &s); err != nil || s != n.text {
-				t.Errorf("%s %s: span %q does not decode to the token", n.kind, n.ptr, raw)
+				t.Errorf("%s %s: span %q does not decode to the token", n.kind, jsonPointer(nodes, i), raw)
 			}
-		case "number", "object", "array":
+		case "number":
 			if raw != n.text {
-				t.Errorf("%s %s: span %q, text %q", n.kind, n.ptr, raw, n.text)
+				t.Errorf("%s %s: span %q, text %q", n.kind, jsonPointer(nodes, i), raw, n.text)
+			}
+		case "object", "array":
+			// Containers keep no text; their span is one complete JSON value of their kind.
+			if n.text != "" || !json.Valid([]byte(raw)) || raw[0] != map[string]byte{"object": '{', "array": '['}[n.kind] {
+				t.Errorf("%s %s: span %q, text %q", n.kind, jsonPointer(nodes, i), raw, n.text)
 			}
 		}
 	}
 	if strs != 7 {
 		t.Errorf("%d string/key nodes, want 7", strs)
+	}
+}
+
+// TestJSONPointer: pointers assembled from the nodes' segs, and compared in place exactly or up to
+// case, match the RFC 6901 pointer of every key and value.
+func TestJSONPointer(t *testing.T) {
+	body := `{"a":{"b/c":[1,{"~":true}]},"":"e","K":[[]],"x":{"k":null}}`
+	nodes, err := jsonWalk([]byte(body), true)
+	if err != nil {
+		t.Fatalf("jsonWalk: %v", err)
+	}
+	want := []string{
+		"", "/a", "/a", "/a/b~1c", "/a/b~1c", "/a/b~1c/0", "/a/b~1c/1", "/a/b~1c/1/~0", "/a/b~1c/1/~0",
+		"/", "/", "/K", "/K", "/K/0", "/x", "/x", "/x/k", "/x/k",
+	}
+	if len(nodes) != len(want) {
+		t.Fatalf("%d nodes, want %d", len(nodes), len(want))
+	}
+	for i, w := range want {
+		if got := jsonPointer(nodes, i); got != w {
+			t.Errorf("node %d (%s): pointer %q, want %q", i, nodes[i].kind, got, w)
+		}
+		if !jsonPointerIs(nodes, i, w, false) || !jsonPointerIs(nodes, i, w, true) {
+			t.Errorf("node %d: does not match its own pointer %q", i, w)
+		}
+		for _, other := range []string{w + "/0", w + "x", "/q" + w, "x" + w} {
+			if jsonPointerIs(nodes, i, other, false) || jsonPointerIs(nodes, i, other, true) {
+				t.Errorf("node %d (%q) matches %q", i, w, other)
+			}
+		}
+	}
+	// Folding matches what strings.EqualFold matches on the whole pointer, including a non-ASCII
+	// fold (KELVIN SIGN folds to "K") and nothing that differs in more than case.
+	for _, c := range []struct {
+		i    int
+		addr string
+		fold bool
+	}{
+		{1, "/A", true}, {4, "/A/B~1C", true}, {11, "/k", true}, {11, "/L", false}, {11, "/\u212a", true},
+		{13, "/k/0", true}, {16, "/X/K", true}, {4, "/a/b~1c/", false}, {4, "/a/b/c", false}, {9, "", false},
+		{0, "/", false},
+	} {
+		if strings.EqualFold(jsonPointer(nodes, c.i), c.addr) != c.fold {
+			t.Fatalf("case %q: fixture disagrees with strings.EqualFold", c.addr)
+		}
+		if got := jsonPointerIs(nodes, c.i, c.addr, true); got != c.fold {
+			t.Errorf("node %d fold-matches %q: %v, want %v", c.i, c.addr, got, c.fold)
+		}
+		if c.addr != jsonPointer(nodes, c.i) && jsonPointerIs(nodes, c.i, c.addr, false) {
+			t.Errorf("node %d exactly matches %q", c.i, c.addr)
+		}
+	}
+	if nodes, err := jsonWalk([]byte(body), false); err != nil || nodes != nil {
+		t.Errorf("validate-only walk: %d nodes, err %v", len(nodes), err)
+	}
+}
+
+// allocated returns the bytes f allocates.
+func allocated(f func()) int {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	f()
+	runtime.ReadMemStats(&after)
+	return int(after.TotalAlloc - before.TotalAlloc)
+}
+
+// TestJSONWalkMemoryBound: walking a body costs memory linear in its size. Three shapes would cost
+// memory growing with the square of the input if the walker or scanner copied per node: a long key
+// over a wide array (each element's JSON Pointer would copy the key), deep nesting around a long
+// string (each container's text would copy the string), and many placeholders under a long key
+// (each occurrence's address would copy the key). Each bound is the cost one feature adds over a
+// twin body without it, so encoding/json's own cost per token (its Token loop alone allocates about
+// 6x the wide body) cancels out.
+func TestJSONWalkMemoryBound(t *testing.T) {
+	wide := func(key string) []byte {
+		return []byte(`{"` + key + `":[` + strings.TrimSuffix(strings.Repeat("1,", 4000), ",") + `]}`)
+	}
+	many := func(key string) []byte {
+		return []byte(`{"` + key + `":[` + strings.TrimSuffix(strings.Repeat(`"{{pan}}",`, 2600), ",") + `]}`)
+	}
+	key, str, manyKey := strings.Repeat("k", 8000), strings.Repeat("s", 16000), strings.Repeat("k", 32000)
+	cases := []struct {
+		name          string
+		with, without []byte
+		limit         int
+	}{
+		{"an 8000-byte key over 4000 elements", wide(key), wide("k"), 8 * len(key)},
+		{"64 levels of nesting around a 16000-byte string",
+			[]byte(strings.Repeat("[", maxJSONDepth) + `"` + str + `"` + strings.Repeat("]", maxJSONDepth)),
+			[]byte(`"` + str + `"`), 2 * len(str)},
+	}
+	for _, c := range cases {
+		for _, b := range [][]byte{c.with, c.without} {
+			if err := jsonStrict(b); err != nil {
+				t.Fatalf("%s: jsonStrict: %v", c.name, err)
+			}
+			if occs, err := scanBody("json", b); err != nil || len(occs) != 0 {
+				t.Fatalf("%s: scanBody: %d occurrences, err %v", c.name, len(occs), err)
+			}
+		}
+		strict := allocated(func() { _ = jsonStrict(c.with) }) - allocated(func() { _ = jsonStrict(c.without) })
+		if strict >= c.limit {
+			t.Errorf("%s added %d bytes to jsonStrict, want < %d", c.name, strict, c.limit)
+		}
+		scan := allocated(func() { _, _ = scanBody("json", c.with) }) - allocated(func() { _, _ = scanBody("json", c.without) })
+		if scan >= c.limit {
+			t.Errorf("%s added %d bytes to scanBody, want < %d", c.name, scan, c.limit)
+		}
+	}
+
+	// 2600 placeholders (58 KB) are refused, and under a 32000-byte key cost no more than under a
+	// one-byte key: the cap is reached before any address is built.
+	manyLong, manyShort := many(manyKey), many("k")
+	for _, b := range [][]byte{manyLong, manyShort} {
+		if _, err := scanBody("json", b); !errors.Is(err, errPlaceholder) {
+			t.Fatalf("2600 placeholders: %v", err)
+		}
+	}
+	scan := allocated(func() { _, _ = scanBody("json", manyLong) }) - allocated(func() { _, _ = scanBody("json", manyShort) })
+	if scan >= 8*len(manyKey) {
+		t.Errorf("a %d-byte key over 2600 placeholders added %d bytes to scanBody, want < %d", len(manyKey), scan, 8*len(manyKey))
+	}
+}
+
+// TestScanOccurrenceCap: up to maxOccurrences placeholder occurrences are returned; one more is
+// errPlaceholder, unless the body also fails the strict parse.
+func TestScanOccurrenceCap(t *testing.T) {
+	jsonBody := func(n int) string {
+		return `[` + strings.TrimSuffix(strings.Repeat(`"{{signature}}",`, n), ",") + `]`
+	}
+	formBody := func(n int) string {
+		var parts []string
+		for i := range n {
+			parts = append(parts, "a"+strconv.Itoa(i)+"={{signature}}")
+		}
+		return strings.Join(parts, "&")
+	}
+	for format, mk := range map[string]func(int) string{"json": jsonBody, "form": formBody} {
+		occs, err := scanBody(format, []byte(mk(maxOccurrences)))
+		if err != nil || len(occs) != maxOccurrences {
+			t.Fatalf("%s: %d placeholders: %d occurrences, err %v", format, maxOccurrences, len(occs), err)
+		}
+		if format == "json" && (occs[0].addr != "/0" || occs[maxOccurrences-1].addr != "/63") {
+			t.Errorf("json: addresses %q .. %q", occs[0].addr, occs[maxOccurrences-1].addr)
+		}
+		if _, err := scanBody(format, []byte(mk(maxOccurrences+1))); !errors.Is(err, errPlaceholder) {
+			t.Errorf("%s: %d placeholders: %v", format, maxOccurrences+1, err)
+		}
+	}
+	if _, err := scanBody("json", []byte(jsonBody(maxOccurrences+1)+" {}")); !errors.Is(err, errBody) {
+		t.Errorf("json: too many placeholders and trailing data: %v", err)
+	}
+	if _, err := scanBody("form", []byte(formBody(maxOccurrences+1)+"&a0=x")); !errors.Is(err, errBody) {
+		t.Errorf("form: too many placeholders and a duplicate key: %v", err)
 	}
 }
 

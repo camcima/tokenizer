@@ -308,6 +308,27 @@ func TestCheckProxyArrayPosition(t *testing.T) {
 	}
 }
 
+// TestCheckProxyMemoryBound: the policy checks compare JSON Pointers in place, so a long key over a
+// wide array in an accepted body costs its own size a few times per walk of the body, never once per
+// element beneath it. The bound is the cost the key adds over a one-byte key, so the decoder's own
+// cost per token cancels out.
+func TestCheckProxyMemoryBound(t *testing.T) {
+	c := testCatalog(t, "127.0.0.1:9")
+	arr := "[" + strings.TrimSuffix(strings.Repeat("1,", 4000), ",") + "]"
+	key := strings.Repeat("k", 8000)
+	cost := func(key string) int {
+		e := validEnvelope("adyen")
+		e.Request.Body = strings.Replace(adyenBody, `{"amount"`, `{"`+key+`":`+arr+`,"amount"`, 1)
+		if _, perr := c.checkProxy(e); perr != nil {
+			t.Fatalf("checkProxy: %+v", perr)
+		}
+		return allocated(func() { _, _ = c.checkProxy(e) })
+	}
+	if n := cost(key) - cost("k"); n >= 64*len(key) {
+		t.Errorf("a %d-byte key over 4000 elements added %d bytes to checkProxy, want < %d", len(key), n, 64*len(key))
+	}
+}
+
 // TestCheckProxyHeaderCaseVariant: a credential header under any spelling of its
 // name must exactly equal the template, and is never carried into the plan.
 func TestCheckProxyHeaderCaseVariant(t *testing.T) {

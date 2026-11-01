@@ -155,7 +155,7 @@ func parseCatalog(data []byte, env string) (*catalog, error) {
 	}
 	// jsonWalk is jsonStrict's parser: one value, no duplicate keys at any depth, no trailing data,
 	// valid UTF-8. Its nodes also give every key's position for the exact-key check below.
-	nodes, err := jsonWalk(data)
+	nodes, err := jsonWalk(data, true)
 	if err != nil || nodes[0].kind != "object" {
 		return nil, errors.New("catalog: not strict JSON (one object, no duplicate keys or trailing data, valid UTF-8)")
 	}
@@ -216,8 +216,8 @@ func catExactKeys(nodes []jsonNode) error {
 		if n.kind != "key" {
 			continue
 		}
-		// n.ptr is the parent's pointer plus one escaped token; tokens contain no raw "/".
-		parentPtr := n.ptr[:strings.LastIndex(n.ptr, "/")]
+		// A key's parent is the object holding it; escaped tokens contain no raw "/".
+		parentPtr := jsonPointer(nodes, n.parent)
 		parent := strings.Split(parentPtr, "/")[1:]
 		var allowed map[string]bool
 		switch {
@@ -277,8 +277,8 @@ func parseCatProvider(name string, rp rawProvider) (*catProvider, error) {
 // parseCatEndpoint validates one endpoint rule of a provider with body format format.
 // Additional rules: (1) {{basic:}} is header-only, (2) the payu signer needs a json
 // provider (it reads body fields by JSON Pointer), (3) the whole-document address "" and empty JSON
-// Pointer tokens are rejected, and (4) form positions and pins may not use a repeatable "[]" key (it
-// names no single value).
+// Pointer tokens are rejected, (4) form positions and pins may not use a repeatable "[]" key (it
+// names no single value), and (5) at most maxOccurrences positions (scanBody's cap).
 // Every endpoint must have "card_data": true and list a {{pan}} position. The account credential
 // is only for card-carrying calls; calls without card data (payments with a provider token,
 // refunds, queries) are the platform's to make, with its own keys. A non-card endpoint would let
@@ -335,6 +335,9 @@ func parseCatEndpoint(format string, i int, re rawEndpoint) (*catEndpoint, error
 		e.headers[name] = re.Headers[k]
 	}
 
+	if len(re.Positions) > maxOccurrences {
+		return nil, fmt.Errorf("endpoint %q: more than %d positions", id, maxOccurrences)
+	}
 	hasPAN := false
 	for _, addr := range slices.Sorted(maps.Keys(re.Positions)) {
 		if !validCatAddress(format, addr) || (format == "form" && strings.HasSuffix(addr, "[]")) {
@@ -537,7 +540,7 @@ func validJSONPointer(p string) bool {
 // placeholder or rejected anyway), and form providers accept only string literals, since a form
 // field is always a string and any other literal could never match.
 func catLiteral(format string, raw json.RawMessage, allowNull bool) (fieldValue, bool) {
-	nodes, err := jsonWalk(raw)
+	nodes, err := jsonWalk(raw, true)
 	if err != nil || len(nodes) != 1 {
 		return fieldValue{}, false
 	}
