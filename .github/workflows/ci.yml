@@ -1,10 +1,11 @@
 name: CI
 
-# make ci: gofmt, go vet, staticcheck, govulncheck, the dependency and vendor checks, docs-check,
-# the comment rule, gitleaks over the full history, unit tests with the race detector, and the
-# build. The commits job applies the commit-msg hook's rule to every commit the event brings, so
-# each check a git hook enforces locally also fails CI, and on pull requests to the title as well:
-# main takes squash merges, whose commit message is the pull request's title.
+# make ci: gofmt, go vet, staticcheck, govulncheck, the dependency and vendor checks, docs-check
+# (with the documentation link check), the Mermaid render check, the comment rule, gitleaks over
+# the full history, unit tests with the race detector, and the build. The commits job applies the
+# commit-msg hook's rule to every commit the event brings, so each check a git hook enforces
+# locally also fails CI, and on pull requests to the title as well: main takes squash merges,
+# whose commit message is the pull request's title.
 on:
   push:
     branches: [main]
@@ -37,6 +38,12 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      # Node for `make mermaid-check`, which renders the docs' Mermaid diagrams with the pinned
+      # Mermaid CLI through npx. No npm cache: the repository has no package lockfile.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
 
       - name: make ci
         run: make ci

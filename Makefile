@@ -1,5 +1,5 @@
 .PHONY: build test lint vuln deps-check vendor-check image image-repro ci tools itest stripe-mock-test ci-all \
-        fuzz fuzz-long gitleaks hooks docs-check comment-check commit-check
+        fuzz fuzz-long gitleaks hooks docs-check docs-links mermaid-check comment-check commit-check
 
 # Tools from the module's toolchain (go.mod `toolchain go1.27.3`), not whatever is first on PATH.
 GOFMT   = $(shell go env GOROOT)/bin/gofmt
@@ -83,18 +83,19 @@ image-repro:
 	if [ "$$a" != "$$b" ]; then echo "image-repro: digests differ: $$a vs $$b"; exit 1; fi; \
 	echo "image-repro: ok $$a"
 
-ci: lint vuln deps-check vendor-check docs-check comment-check gitleaks test build
+ci: lint vuln deps-check vendor-check docs-check mermaid-check comment-check gitleaks test build
 
 # The three READMEs are one document in three languages. docs-check fails if any of them repeats
 # a retired claim (case-insensitive), or if their heading, table-row or Mermaid-block counts
-# differ, which catches a section, table row or diagram changed in one language only.
+# differ, which catches a section, table row or diagram changed in one language only. It runs
+# docs-links first.
 READMES       = README.md README.es.md README.pt-BR.md
 RETIRED_DOCS  = rewraps automatically|reenvuelve automáticamente|reencapsula automaticamente|\
                 keeps the platform out of PCI scope|mantiene la plataforma fuera del alcance|\
                 mantiene a la plataforma fuera del alcance|mantém a plataforma fora do escopo|\
                 created daily|se crea diariamente|se crea una nueva clave de datos cada día|\
                 criada diariamente
-docs-check:
+docs-check: docs-links
 	@fail=0; retired='$(RETIRED_DOCS)'; \
 	oldifs=$$IFS; IFS='|'; \
 	for p in $$retired; do \
@@ -109,6 +110,37 @@ docs-check:
 		fi; \
 	done; \
 	[ $$fail -eq 0 ] && echo "docs-check: ok"
+
+# Every link in the READMEs and docs/**/*.md must resolve to an existing, non-ignored file and,
+# with a #fragment, to a heading of the target Markdown file (rules in scripts/check-doc-links.sh).
+docs-links:
+	@scripts/check-doc-links.sh
+
+# Every ```mermaid block in the same files must render with the pinned Mermaid CLI, which fails
+# on a syntax error that GitHub would show as a broken diagram. npx installs the pinned version
+# on first use (Node is required; CI sets it up) and is asked once for the mmdc path, which saves
+# npx's start-up on every file. mmdc renders each block of a file to SVG and writes a rewritten
+# copy of the file; both go to a temp dir, never the working tree.
+# --no-sandbox: Chrome's sandbox needs unprivileged user namespaces, which some hosts refuse
+# (Ubuntu 23.10+ with AppArmor's default, many containers). The browser only renders this
+# repository's own diagrams, as the same user that `make ci` already runs the test code as.
+# A system Chrome is used when PUPPETEER_EXECUTABLE_PATH is set (puppeteer reads it).
+MERMAID_CLI_VERSION = 12.0.0
+NPX_MMDC = npx --yes --package @mermaid-js/mermaid-cli@$(MERMAID_CLI_VERSION)
+mermaid-check:
+	@files=$$(scripts/check-doc-links.sh --list) || { echo "mermaid-check: cannot list the documentation files"; exit 1; }; \
+	files=$$(grep -l '^```mermaid' $$files); \
+	mmdc=$$($(NPX_MMDC) -c 'command -v mmdc') && [ -x "$$mmdc" ] || { echo "mermaid-check: cannot install @mermaid-js/mermaid-cli@$(MERMAID_CLI_VERSION)"; exit 1; }; \
+	tmp=$$(mktemp -d) || exit 1; trap 'rm -rf "$$tmp"' EXIT; \
+	printf '{"args":["--no-sandbox"]}\n' > "$$tmp/puppeteer.json"; \
+	fail=0; n=0; \
+	for f in $$files; do \
+		n=$$((n+1)); mkdir -p "$$tmp/$$n"; \
+		if ! "$$mmdc" -q -p "$$tmp/puppeteer.json" -i "$$f" -o "$$tmp/$$n/out.md" >"$$tmp/log" 2>&1; then \
+			echo "mermaid-check: $$f does not render:"; cat "$$tmp/log"; fail=1; \
+		fi; \
+	done; \
+	[ $$fail -eq 0 ] && echo "mermaid-check: ok ($$n files)"
 
 # The comment rule of the pre-commit hook, over every tracked Go file outside vendor/.
 comment-check:

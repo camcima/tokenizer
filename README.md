@@ -10,6 +10,8 @@ The browser hands the card to the vault. The vault locks it away and gives back 
 
 This document is written for two audiences at once. Every section starts with **The short version**, in plain language for anyone. It then continues with **The deeper dive**, for engineers, security reviewers and auditors. Read only the short versions for the big picture, or read everything for the full story.
 
+Looking for the detailed documentation? The [`docs/` folder](docs/README.md) (English only) has a local quickstart, integration and deployment guides, the complete API, configuration, catalog and limits reference, and the architecture, threat model and design explanations.
+
 ---
 
 ## Contents
@@ -248,7 +250,7 @@ flowchart LR
 
 **What the platform sees:** tokens, `last4`, expiry month and year, the BIN (the first 6 or 8 digits) and the cardholder name from the signed receipt (see [§6.2](#62-the-signed-receipt)), and provider responses with any echoed card number replaced by `****4242`.
 
-**What the platform never sees:** a full card number or a CVV. There is no API that returns them.
+**What the platform never sees:** a full card number or a CVV returned by the vault. The vault never returns either itself, and no vault API does. A `/proxy` response is the provider's own response relayed: if it echoes this card's number, the vault masks it, and the catalog review excludes endpoints that echo card data (the masking's limits are in [§6.3](#63-proxy-platform--vault--provider)).
 
 **Where the line is enforced:**
 
@@ -552,7 +554,7 @@ With its own keys, the platform could also ask the provider to **save** the card
 
 #### 7.6 Nothing sensitive in logs, by construction
 
-There is exactly one access-log line per request:
+There is exactly one access-log line per request that reaches a handler. A request that Go's HTTP server rejects before that (oversized headers, a header read timeout, a failed TLS handshake) produces none:
 
 ```
 2026-10-30T15:04:05Z req listener=internal method=POST path=/proxy status=200 dur=183ms caller=0A1B2C
@@ -691,10 +693,10 @@ sequenceDiagram
     J->>KMS: decrypt(wrapped), verify round trip
     J->>DB: vault.add_dek(wrapped) → version N+1
     J-->>J: print version, exit
-    Note over V: each instance loads DEK N+1 within 5 minutes,<br/>or at once when a card sealed under it arrives.<br/>Older DEKs stay loaded, so old cards still decrypt
+    Note over V: each instance loads DEK N+1 at its next successful refresh:<br/>within about 5 minutes 10 seconds, or sooner when a card sealed under it arrives.<br/>Older DEKs stay loaded, so old cards still decrypt
 ```
 
-**Rotation schedule and key refresh.** Run `vault -rotate-dek` monthly (the trade-off is in [§8](#8-why-it-is-built-the-way-it-is)). No restart is needed afterwards. Every instance re-reads the key list every 5 minutes, and an instance that meets a card sealed under a key version it doesn't hold refreshes at once, at most once every 10 seconds, each refresh limited to 30 seconds. New keys are added to the ones an instance holds, and none is ever dropped, so a rolling restart is no longer needed and no longer causes `decrypt_failed`. One case remains: if KMS or the database is unreachable at the moment an instance first meets a new key version, or that instance's last refresh finished less than 10 seconds earlier, before the key existed, requests for cards under that key fail on that instance with `decrypt_failed` for up to 10 seconds (the refresh rate limit), and succeed once a refresh gets through.
+**Rotation schedule and key refresh.** Run `vault -rotate-dek` monthly (the trade-off is in [§8](#8-why-it-is-built-the-way-it-is)). No restart is needed afterwards. Every instance re-reads the key list in the background every 5 minutes, and an instance that meets a card sealed under a key version it doesn't hold refreshes at once. Both kinds of refresh share one limit, at most one every 10 seconds, and each refresh is limited to 30 seconds. So while KMS and the database are reachable, an instance picks up a new key within about 5 minutes and 10 seconds (one period, plus a background refresh skipped because another ran less than 10 seconds earlier), and at once when a card sealed under it arrives. If KMS or the database is unreachable, pickup waits until a refresh succeeds; meanwhile a card sealed under the new key still triggers an on-demand attempt, at most one every 10 seconds. New keys are added to the ones an instance holds, and none is ever dropped, so a rolling restart is no longer needed and no longer causes `decrypt_failed`. One case remains: if KMS or the database is unreachable at the moment an instance first meets a new key version, or that instance's last refresh finished less than 10 seconds earlier, before the key existed, requests for cards under that key fail on that instance with `decrypt_failed` for up to 10 seconds (the refresh rate limit), and succeed once a refresh gets through.
 
 **Responding to alerts:**
 
@@ -719,7 +721,7 @@ sequenceDiagram
   ```
 
   `VAULT_DB_URL` names that IAM username, URL-encoded and without a password, for example `postgres://pan-vault%40pci-cde-<env>.iam@<private-ip>:5432/vault?sslmode=verify-ca&sslrootcert=…`. In production the vault sends its service account's access token as the password (Cloud SQL IAM database authentication).
-- **Cloud SQL smoke test.** Before the first deploy to an environment, and after any change to its IAM users or database roles, check against the real Cloud SQL instance that the serving account can log in with its IAM token and call `put_card`, `get_card` and `list_deks`, but can't read any table or call `add_dek`, and that the rotator account can call `add_dek`. This is a step in the deploy pipeline, not a test in this repository.
+- **Cloud SQL smoke test.** Before the first deploy to an environment, and after any change to its IAM users or database roles, check against the real Cloud SQL instance that the serving account can log in with its IAM token and call `put_card`, `get_card` and `list_deks`, but can't read any table or call `add_dek`. Never test the rotator with a real `add_dek` call: it accepts any bytes, and every instance unwraps every DEK at boot and fails on any one it can't, so a junk row stops every instance from booting and makes running instances' key refreshes fail. Check the privileges instead: `SELECT has_function_privilege('vault.add_dek(bytea)', 'EXECUTE')` must return `true` as the rotator and `false` as `vault_app`, and `has_table_privilege` on `vault.cards`, `vault.deks` and `vault.access_log` must return `false` for both. This is a step in the deploy pipeline, not a test in this repository.
 - **A reviewed account for the environment.** The vault refuses to boot when the catalog has no account for its `VAULT_ENV` (`catalog has no accounts for env=prod`), because a vault that can't send a card anywhere would otherwise look healthy. The first prod deploy therefore needs a reviewed prod account in `catalog.json`, with its host in `egress-hosts.prod.txt`.
 - **Health checks.** The load balancers probe both listeners with plain TCP checks: the port accepts connections. Real readiness is checked separately, by a monitor that holds a platform client certificate and calls `GET /healthz` over mTLS, which also exercises the certificate chain and the database. There is deliberately no unauthenticated health route. The internal listener asks for a client certificate in the TLS handshake of every connection, and the vault serves nothing beyond `/tokenize`, `/proxy` and `/healthz`, so a probe path would mean either a new endpoint or weaker mTLS on the listener that serves `/proxy`.
 - **Raw card data access at each provider.** By default Stripe refuses API requests that contain full card numbers. Live-mode access requires Stripe's approval, backed by PCI evidence (typically an SAQ D or an Attestation of Compliance). Other providers have similar gates, such as Adyen's "API PCI Payments role".
@@ -793,7 +795,7 @@ Everything is driven by `make`. `make ci` runs the checks every change must pass
 
 ### The deeper dive
 
-**Requirements:** Go 1.27.3 (downloaded automatically through `GOTOOLCHAIN`), Docker, `psql`, `curl`, `make`.
+**Requirements:** Go 1.27.3 (downloaded automatically through `GOTOOLCHAIN`), Docker, `psql`, `curl`, `make`, and Node.js for `make mermaid-check`.
 
 | Command | What it does |
 |---|---|
@@ -803,22 +805,24 @@ Everything is driven by `make`. `make ci` runs the checks every change must pass
 | `make vuln` | govulncheck |
 | `make deps-check` / `make vendor-check` | Dependency allowlist, go.sum baseline, vendored code matches upstream |
 | `make docs-check` | The three READMEs repeat none of the retired claims and have the same number of headings, table rows and Mermaid diagrams |
+| `make docs-links` | Every relative link and heading anchor in the READMEs and `docs/**/*.md` resolves (run by `make docs-check`) |
+| `make mermaid-check` | Every Mermaid diagram in those files renders with the pinned Mermaid CLI (needs Node.js) |
 | `make comment-check` | No Go file refers to the spec or the design documents (`SPEC-DECISION`, `§`, `design doc`) |
 | `make gitleaks` | Secret scan of the whole git history (gitleaks, pinned, allowlist in `.gitleaks.toml`) |
-| `make ci` | lint + vuln + deps-check + vendor-check + docs-check + comment-check + gitleaks + test + build |
+| `make ci` | lint + vuln + deps-check + vendor-check + docs-check (with docs-links) + mermaid-check + comment-check + gitleaks + test + build |
 | `make itest` | Starts Postgres 18 in Docker, applies `schema.sql`, runs the DB and end-to-end tests. Override the port with `PG_PORT=…`. |
 | `make stripe-mock-test` | Sends platform-built requests through the embedded `catalog.json`'s Stripe endpoints to the official `stripe-mock`. Override the port with `STRIPE_MOCK_PORT=…`. |
 | `make image` / `make image-repro` | Builds the scratch image and prints its digest, or builds it twice and checks the digests match |
-| `make ci-all` | Everything above |
+| `make ci-all` | `make ci` + `make itest` + `make stripe-mock-test` + `make image-repro` (not `make image`) |
 | `make fuzz` / `make fuzz-long` | Runs each fuzz target for 20 seconds, or for `FUZZTIME` (default 10 minutes). A failing input is saved under `testdata/fuzz/`; commit it with the fix and `make test` replays it. |
 | `make commit-check` | Checks every commit message in `COMMIT_RANGE` (default `origin/main..HEAD`) against the conventional-commit rule |
 | `make hooks` | Installs the git hooks (lefthook) into this clone |
 
 `TestStripeLive` sends the same requests to the real Stripe test-mode API. It runs only when `VAULT_TEST_STRIPE_SECRET` holds a test-mode key (`sk_test_…`), which is never printed.
 
-**Continuous integration.** Four GitHub Actions workflows, each with its badge at the top of this file, are the required checks: **CI** (`make ci`, plus a job that runs `make commit-check` over the commits of the pull request or push), **Integration** (`make itest` and `make stripe-mock-test`), **Image** (`make image-repro`, then `make image`, keeping the digest as a build artifact) and **Fuzz** (`make fuzz` on pull requests, `make fuzz-long` nightly). Branch protection on `main` should require all four. `main` takes squash merges whose commit message is the pull request's title with GitHub's ` (#N)` suffix, so the commits job also checks that title, suffix included, against the same rule.
+**Continuous integration.** Four GitHub Actions workflows, each with its badge at the top of this file, produce the required checks: **CI** (`make ci`, plus a job that runs `make commit-check` over the commits of the pull request or push), **Integration** (`make itest` and `make stripe-mock-test`), **Image** (`make image-repro`, then `make image`, keeping the digest as a build artifact) and **Fuzz** (`make fuzz` on pull requests, `make fuzz-long` nightly). Branch protection on `main` should require the five checks these workflows produce: `ci`, `commits`, `integration`, `image` and `fuzz`. `main` takes squash merges whose commit message is the pull request's title with GitHub's ` (#N)` suffix, so the commits job also checks that title, suffix included, against the same rule.
 
-**Git hooks.** `make hooks` installs [lefthook](https://github.com/evilmartians/lefthook) hooks into your clone (opt-in). Before each commit they check that the staged Go files are gofmt-formatted, scan the staged changes with gitleaks, and reject Go files that refer to the spec or the design documents. Each commit message must be a conventional commit (`feat: …`, `fix(scan): …`, with at most 72 characters after the type), and each push runs `make ci`. CI runs every one of these checks too, so skipping a hook doesn't skip the check.
+**Git hooks.** `make hooks` installs [lefthook](https://github.com/evilmartians/lefthook) hooks into your clone (opt-in). Before each commit they check that the staged Go files are gofmt-formatted, scan the staged changes with gitleaks, and reject Go files that refer to the spec or the design documents. Each commit message must be a conventional commit (`feat: …`, `fix(scan): …`, with a subject of at most 72 characters after the `<type>[(<scope>)][!]: ` prefix), and each push runs `make ci`. CI runs every one of these checks too, so skipping a hook doesn't skip the check.
 
 #### 11.1 Configuration (environment only)
 
@@ -895,7 +899,7 @@ Other files: `catalog.json` (providers and accounts, compiled in), `egress-hosts
 
 #### 11.4 Verifying a receipt
 
-Any language with Ed25519 can verify a receipt (format in [§6.2](#62-the-signed-receipt)). Reject anything longer than 2048 bytes before looking at it (the longest receipt the vault issues is 1097 bytes), and cap the size of the request that carries it. Split it on `.`: there must be exactly four parts, and the first two must be `rcpt` and `v1`. The last two must be non-empty unpadded base64url (only `A–Z`, `a–z`, `0–9`, `-` and `_`, no `=`) and canonical: the last character's unused low bits must be zero (Go's `Strict()` decoder rejects anything else; in other languages, re-encode the decoded bytes and require them to equal the part received). The fourth part must be exactly 86 characters, checked before it is scanned or decoded. Decode it into a 64-byte signature, and check it with the vault's public key over the ASCII bytes of `rcpt.v1.` followed by the third part exactly as received. Only then decode the third part, and parse it as a single JSON object with only the receipt's keys, spelled exactly, each at most once and nothing after it, where every key except `name` is present, `iat` is a JSON integer greater than 0 and every other value is a non-empty JSON string. Anything else makes the whole receipt invalid: never repair or partly trust it. Then check that `token` is the token the browser sent. The Go version below follows `verifyReceipt` in `receipt.go`, which the vault's tests run against the receipts it signs:
+Any language with Ed25519 can verify a receipt (format in [§6.2](#62-the-signed-receipt)). Reject anything longer than 2048 bytes before looking at it (the longest receipt the vault issues is 1097 bytes), and cap the size of the request that carries it. Split it on `.`: there must be exactly four parts, and the first two must be `rcpt` and `v1`. The last two must be non-empty unpadded base64url (only `A–Z`, `a–z`, `0–9`, `-` and `_`, no `=`) and canonical: the last character's unused low bits must be zero (Go's `Strict()` decoder rejects anything else; in other languages, re-encode the decoded bytes and require them to equal the part received). The fourth part must be exactly 86 characters, checked before it is scanned or decoded. Decode it into a 64-byte signature, and check it with the vault's public key over the ASCII bytes of `rcpt.v1.` followed by the third part exactly as received. Only then decode the third part, and parse it as a single JSON object with only the receipt's keys, spelled exactly, each at most once and nothing after it, where every key except `name` is present, `iat` is a JSON integer greater than 0 and every other value is a non-empty JSON string. Anything else makes the whole receipt invalid: never repair or partly trust it. Then check that `token` is the token the browser sent. The Go version below follows `verifyReceipt` in `receipt.go`. `TestReadmeReceiptVerifier` keeps this block identical in the three languages and checks that it contains the load-bearing lines, and the vault's own tests run `verifyReceipt` against the receipts it signs:
 
 ```go
 package receipt
