@@ -1,5 +1,6 @@
 .PHONY: build test lint vuln deps-check vendor-check image image-repro ci tools itest stripe-mock-test ci-all \
-        fuzz fuzz-long gitleaks hooks docs-check docs-links mermaid-check comment-check commit-check
+        fuzz fuzz-long gitleaks hooks docs-check docs-links mermaid-check comment-check commit-check \
+        cover cover-html cover-check
 
 # Tools from the module's toolchain (go.mod `toolchain go1.27.3`), not whatever is first on PATH.
 GOFMT   = $(shell go env GOROOT)/bin/gofmt
@@ -220,22 +221,81 @@ tools:
 		current lefthook github.com/evilmartians/lefthook/v2 $(LEFTHOOK_VERSION) || { echo "tools: lefthook not at $(LEFTHOOK_VERSION) in $(TOOLBIN)"; exit 1; }; \
 	fi
 
-# Integration tests against a throwaway postgres:18 with trust auth, published on loopback only
-# (trust auth must never be reachable from the network); the container is always removed.
-itest:
-	@docker rm -f $(PG_NAME) >/dev/null 2>&1 || true
-	@trap 'docker rm -f $(PG_NAME) >/dev/null 2>&1' EXIT; trap 'exit 130' INT TERM; \
+# A throwaway postgres:18 with trust auth, published on loopback only (trust auth must never be
+# reachable from the network), with role vault_owner, database vault and schema.sql applied. It is a
+# shell fragment, not a target, so the container lives exactly as long as the recipe line that uses
+# it: the EXIT trap always removes it. itest and cover-check share this one definition.
+PG_TEST_URL = postgres://vault_owner@127.0.0.1:$(PG_PORT)/vault?sslmode=disable
+PG_UP = docker rm -f $(PG_NAME) >/dev/null 2>&1 || true; \
+	trap 'docker rm -f $(PG_NAME) >/dev/null 2>&1' EXIT; trap 'exit 130' INT TERM; \
 	docker run -d --name $(PG_NAME) -e POSTGRES_HOST_AUTH_METHOD=trust -p 127.0.0.1:$(PG_PORT):5432 postgres:18 >/dev/null || exit 1; \
 	ready=0; for i in $$(seq 1 60); do \
 		if psql -q postgres://postgres@127.0.0.1:$(PG_PORT)/postgres -c 'select 1' >/dev/null 2>&1; then ready=1; break; fi; \
 		sleep 1; \
 	done; \
-	[ $$ready -eq 1 ] || { echo "itest: postgres did not become ready"; exit 1; }; \
+	[ $$ready -eq 1 ] || { echo "$@: postgres did not become ready"; exit 1; }; \
 	psql -q -v ON_ERROR_STOP=1 postgres://postgres@127.0.0.1:$(PG_PORT)/postgres \
 		-c 'CREATE ROLE vault_owner LOGIN CREATEROLE;' -c 'CREATE DATABASE vault OWNER vault_owner;' || exit 1; \
-	psql -q -v ON_ERROR_STOP=1 postgres://vault_owner@127.0.0.1:$(PG_PORT)/vault -f schema.sql || exit 1; \
-	VAULT_TEST_DB_URL='postgres://vault_owner@127.0.0.1:$(PG_PORT)/vault?sslmode=disable' \
-		go test -race -count=1 -run Integration ./...
+	psql -q -v ON_ERROR_STOP=1 postgres://vault_owner@127.0.0.1:$(PG_PORT)/vault -f schema.sql || exit 1
+
+# Integration tests against the throwaway database above.
+itest:
+	@$(PG_UP); \
+	VAULT_TEST_DB_URL='$(PG_TEST_URL)' go test -race -count=1 -run Integration ./...
+
+# Statement coverage of the package, written as Go's binary coverage data so that the unit run and
+# the integration run merge per statement (adding two percentages would count a statement covered
+# by both twice). The integration run happens only when VAULT_TEST_DB_URL is set; without it the
+# figure is the unit tests' alone, and the last line says so. The unit run clears VAULT_TEST_DB_URL
+# so the integration tests run once, in their own run. No -race: it only slows the run. The boot
+# tests' main() subprocesses write their counters to the same directory (runMain passes it on).
+COVER_DIR = $(CURDIR)/cover
+cover:
+	@rm -rf "$(COVER_DIR)" && mkdir -p "$(COVER_DIR)/unit" || exit 1; \
+	VAULT_TEST_DB_URL= go test -count=1 -cover -covermode=atomic ./... -args -test.gocoverdir="$(COVER_DIR)/unit" || exit 1; \
+	inputs="$(COVER_DIR)/unit"; scope=unit; \
+	if [ -n "$$VAULT_TEST_DB_URL" ]; then \
+		mkdir -p "$(COVER_DIR)/integration" || exit 1; \
+		go test -count=1 -cover -covermode=atomic -run Integration ./... \
+			-args -test.gocoverdir="$(COVER_DIR)/integration" || exit 1; \
+		inputs="$$inputs,$(COVER_DIR)/integration"; scope=unit+integration; \
+	else \
+		echo "cover: VAULT_TEST_DB_URL is not set, so the integration tests did not run (make cover-check starts a database)"; \
+	fi; \
+	go tool covdata textfmt -i="$$inputs" -o "$(COVER_DIR)/cover.out" || exit 1; \
+	go tool cover -func="$(COVER_DIR)/cover.out" > "$(COVER_DIR)/func.txt" || exit 1; \
+	cat "$(COVER_DIR)/func.txt"; \
+	total=$$(awk '/^total:/ { sub(/%/, "", $$NF); print $$NF }' "$(COVER_DIR)/func.txt"); \
+	[ -n "$$total" ] || { echo "cover: no total in the coverage report"; exit 1; }; \
+	echo "cover: $$total% of statements ($$scope)" | tee "$(COVER_DIR)/summary.txt"
+
+# The HTML report of the last `make cover` (run first when there is none). It is written, not opened:
+# open cover/cover.html in a browser.
+cover-html:
+	@[ -f "$(COVER_DIR)/cover.out" ] || $(MAKE) --no-print-directory cover || exit 1; \
+	go tool cover -html="$(COVER_DIR)/cover.out" -o "$(COVER_DIR)/cover.html" && echo "cover-html: $(COVER_DIR)/cover.html"
+
+# COVERAGE_MIN is a regression guard, not a target: the merged unit+integration figure measured when
+# the gate was added (92.2%; unit alone 90.7%), rounded down to an integer, minus 1 point of slack so
+# that a small, legitimate change does not fail CI. Raise it when coverage rises; never lower it to
+# make a change pass. The figure is always the merged one: with VAULT_TEST_DB_URL unset, cover-check
+# starts its own database (PG_UP), as CI's integration job does.
+COVERAGE_MIN = 91
+cover-check:
+	@if [ -n "$$VAULT_TEST_DB_URL" ]; then \
+		$(MAKE) --no-print-directory cover || exit 1; \
+	else \
+		$(PG_UP); \
+		VAULT_TEST_DB_URL='$(PG_TEST_URL)' $(MAKE) --no-print-directory cover || exit 1; \
+	fi; \
+	grep -q '(unit+integration)$$' "$(COVER_DIR)/summary.txt" || { echo "cover-check: the integration tests did not run"; exit 1; }; \
+	total=$$(awk '/^total:/ { sub(/%/, "", $$NF); print $$NF }' "$(COVER_DIR)/func.txt"); \
+	if awk -v t="$$total" -v m="$(COVERAGE_MIN)" 'BEGIN { exit !(t + 0 >= m + 0) }'; then \
+		echo "cover-check: ok ($$total% >= COVERAGE_MIN $(COVERAGE_MIN)%)" | tee -a "$(COVER_DIR)/summary.txt"; \
+	else \
+		echo "cover-check: coverage $$total% is below COVERAGE_MIN $(COVERAGE_MIN)% (unit+integration)" | tee -a "$(COVER_DIR)/summary.txt"; \
+		exit 1; \
+	fi
 
 # Request-shape check of the catalog's Stripe endpoints against stripe-mock (Stripe's OpenAPI
 # definition); the container is always removed and the test's exit status is propagated.
@@ -251,4 +311,4 @@ stripe-mock-test:
 	VAULT_TEST_STRIPE_MOCK_URL=http://127.0.0.1:$(STRIPE_MOCK_PORT) \
 		go test -race -count=1 -run StripeMock -v ./...
 
-ci-all: ci itest stripe-mock-test image-repro
+ci-all: ci itest stripe-mock-test cover-check image-repro
