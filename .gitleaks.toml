@@ -26,4 +26,7 @@ regexes = [
   '''^sm_adyen_br_live_v1$''',
   # A fixed vault card token (tok_ + 32 hex) used by the policy tests; not a credential.
   '''^tok_0123456789abcdef0123456789abcdef$''',
+  # The Ed25519 public key of the fixed dev receipt seed 00…03, as the boot log prints it in the
+  # documentation's examples. A public key, derived from a published dev value.
+  '''^84FibkHnAn6kMb_jAJ6UvdJadGvuxGiUjWw8fF3JpUs$''',
 ]
