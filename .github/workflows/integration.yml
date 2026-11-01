@@ -2,7 +2,12 @@ name: Integration
 
 # make itest: the database and end-to-end tests against a throwaway postgres:18 container.
 # make stripe-mock-test: the embedded catalog's Stripe requests against stripe-mock (pinned by
-# digest). Docker is preinstalled on the runner; psql and curl wait for the containers.
+# digest). make cover-check: statement coverage of the unit and integration runs merged, against
+# COVERAGE_MIN (it starts its own throwaway database, with the same definition as make itest).
+# Docker is preinstalled on the runner; psql and curl wait for the containers.
+# badge: on a push to main only, after integration passed, publishes the coverage figure as a
+# shields.io endpoint file on the coverage-badge branch. It is the only job with a writable token,
+# and it runs no repository code: no checkout, just the figure from the coverage artifact and git.
 on:
   push:
     branches: [main]
@@ -39,3 +44,73 @@ jobs:
 
       - name: make stripe-mock-test
         run: make stripe-mock-test
+
+      - name: make cover-check
+        run: make cover-check
+
+      - name: make cover-html
+        if: ${{ !cancelled() && hashFiles('cover/cover.out') != '' }}
+        run: make cover-html
+
+      # Also when cover-check failed, so the summary shows the figure that failed it.
+      - name: Coverage summary
+        if: ${{ !cancelled() && hashFiles('cover/summary.txt') != '' }}
+        run: |
+          {
+            echo '### Coverage: the 15 least-covered functions'
+            echo
+            echo '```'
+            awk '!/^total:/ { v = $NF; sub(/%/, "", v); print v "\t" $0 }' cover/func.txt |
+              sort -n -k1,1 | head -n 15 | cut -f2-
+            grep '^total:' cover/func.txt
+            echo '```'
+            echo
+            cat cover/summary.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # summary.txt carries the figure to the badge job.
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() && hashFiles('cover/cover.out') != '' }}
+        with:
+          name: coverage
+          path: |
+            cover/cover.out
+            cover/cover.html
+            cover/summary.txt
+          retention-days: 14
+
+  badge:
+    needs: integration
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Writes only the coverage-badge branch; main is protected and never written.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage
+          path: coverage
+
+      # A fresh one-commit orphan branch holding only coverage.json, force-pushed, so the branch
+      # never grows. The token is used in this step only, through the push URL; GitHub masks it.
+      - name: Publish coverage badge
+        env:
+          TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          total=$(sed -n 's/^cover: \([0-9][0-9.]*\)% of statements (unit+integration)$/\1/p' coverage/summary.txt)
+          [ -n "$total" ] || { echo "no unit+integration coverage figure in summary.txt"; exit 1; }
+          color=$(awk -v t="$total" 'BEGIN {
+            if (t >= 90) print "brightgreen"; else if (t >= 80) print "green";
+            else if (t >= 70) print "yellow"; else if (t >= 60) print "orange"; else print "red" }')
+          dir=$(mktemp -d)
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$total" "$color" > "$dir/coverage.json"
+          cd "$dir"
+          git init -q -b coverage-badge
+          git add coverage.json
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -q -m "ci: coverage $total% at ${GITHUB_SHA::12}"
+          git push -q -f "https://x-access-token:${TOKEN}@github.com/${REPO}.git" coverage-badge

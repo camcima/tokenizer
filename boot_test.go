@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"errors"
+	"flag"
 	"io"
 	"log"
 	"maps"
@@ -1185,8 +1186,9 @@ func TestNewVaultDBDeadline(t *testing.T) {
 	stalled.Close()
 }
 
-// runMain runs main() in a subprocess of the test binary with exactly env (nothing inherited)
-// and args, and returns its exit code and stderr.
+// runMain runs main() in a subprocess of the test binary with exactly env (nothing inherited,
+// apart from the coverage directory of a coverage run) and args, and returns its exit code and
+// stderr.
 func runMain(t *testing.T, env map[string]string, args ...string) (int, string) {
 	t.Helper()
 	exe, err := os.Executable()
@@ -1197,6 +1199,11 @@ func runMain(t *testing.T, env map[string]string, args ...string) (int, string) 
 	defer cancel()
 	cmd := exec.CommandContext(ctx, exe, args...)
 	cmd.Env = []string{"PAN_VAULT_TEST_RUN_MAIN=1"}
+	// In a coverage run the subprocess writes its counters to -test.gocoverdir too, so main() is
+	// measured (not to GOCOVERDIR, which go test points at its own temporary directory).
+	if f := flag.Lookup("test.gocoverdir"); f != nil && f.Value.String() != "" {
+		cmd.Env = append(cmd.Env, "GOCOVERDIR="+f.Value.String())
+	}
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}

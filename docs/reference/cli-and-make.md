@@ -55,11 +55,14 @@ Run from the repository root. Go is taken from the module's toolchain (`toolchai
 | `comment-check` | `scripts/check-comments.sh` over every tracked `*.go` file outside `vendor/` | No Go file contains the markers `SPEC-DECISION`, `§` or `design doc`. |
 | `gitleaks` | `tools`, then `gitleaks git --redact --no-banner --verbose --config .gitleaks.toml .` | Secret scan of the full git history, with the allowlist in `.gitleaks.toml`. |
 | `ci` | `lint vuln deps-check vendor-check docs-check mermaid-check comment-check gitleaks test build` | The checks every change must pass. Because of `mermaid-check`, it needs Node and `npx`; the first run downloads the pinned Mermaid CLI. |
-| `itest` | Starts `postgres:18` as container `pan-vault-pg` with trust auth on `127.0.0.1:$(PG_PORT)`, waits up to 60 s for `psql`, creates role `vault_owner` and database `vault`, applies `schema.sql` as `vault_owner`, then `go test -race -count=1 -run Integration ./...` with `VAULT_TEST_DB_URL` set. The container is always removed. | Database and end-to-end tests. Needs Docker and `psql`. |
+| `itest` | Starts `postgres:18` as container `pan-vault-pg` with trust auth on `127.0.0.1:$(PG_PORT)`, waits up to 60 s for `psql`, creates role `vault_owner` and database `vault`, applies `schema.sql` as `vault_owner` (the `PG_UP` fragment, shared with `cover-check`), then `go test -race -count=1 -run Integration ./...` with `VAULT_TEST_DB_URL` set. The container is always removed. | Database and end-to-end tests. Needs Docker and `psql`. |
 | `stripe-mock-test` | Starts `stripe/stripe-mock` (v0.206.0, pinned by digest) as container `pan-vault-stripe-mock` on `127.0.0.1:$(STRIPE_MOCK_PORT)`, waits up to 60 s with `curl`, then `go test -race -count=1 -run StripeMock -v ./...` with `VAULT_TEST_STRIPE_MOCK_URL` set. The container is always removed. | Checks the embedded catalog's Stripe requests against stripe-mock. Needs Docker and `curl`. |
+| `cover` | Empties `cover/` (gitignored), then `go test -count=1 -cover -covermode=atomic ./... -args -test.gocoverdir=cover/unit` with `VAULT_TEST_DB_URL` cleared; when `VAULT_TEST_DB_URL` is set, also the same with `-run Integration` into `cover/integration`. Merges the directories with `go tool covdata textfmt` into `cover/cover.out`, prints `go tool cover -func` (also saved as `cover/func.txt`) and a last line `cover: NN.N% of statements (unit)` or `(unit+integration)` (also saved as `cover/summary.txt`). No race detector. | Statement coverage of the package. Without a database it says that the integration tests did not run. The boot tests' `main()` subprocesses write their counters to the same directory (`runMain` in `boot_test.go` passes it on as `GOCOVERDIR`). |
+| `cover-html` | `cover` first if `cover/cover.out` is missing, then `go tool cover -html` into `cover/cover.html` | HTML report of the last measurement (written, not opened). |
+| `cover-check` | `cover` with `VAULT_TEST_DB_URL` as given, or, when it is unset, inside a throwaway database started like `itest` (`PG_UP`); fails unless the integration tests ran and the total is at least `$(COVERAGE_MIN)`, and appends `cover-check: ok (…)` or the failure to `cover/summary.txt` | The coverage gate CI's integration job runs. Needs Docker and `psql` unless `VAULT_TEST_DB_URL` is set. |
 | `image` | `docker buildx build --provenance=false --build-arg SOURCE_DATE_EPOCH=0 --output type=docker,name=pan-vault:local,rewrite-timestamp=true,unpack=false .`, then prints the image ID | Build the image `pan-vault:local` and print its digest. |
 | `image-repro` | Builds the image twice with `--no-cache` and compares the IDs; prints `image-repro: ok <id>` or fails | Check that the build is reproducible. |
-| `ci-all` | `ci itest stripe-mock-test image-repro` | Everything CI runs except fuzzing and the commit checks. |
+| `ci-all` | `ci itest stripe-mock-test cover-check image-repro` | Everything CI runs except fuzzing and the commit checks. |
 | `fuzz` | Every `Fuzz*` target in the package, one after another, 20 s each | Short fuzz run (pull requests). |
 | `fuzz-long` | Every `Fuzz*` target for `$(FUZZTIME)` each | Long fuzz run (nightly). |
 | `tools` | Installs each pinned tool into `.tools/bin` with `GOTOOLCHAIN=go1.27.3`, replacing any binary there built from another version or toolchain | Called by `lint`, `vuln`, `gitleaks` and `hooks`; run it directly before using the hooks. |
@@ -70,7 +73,8 @@ Run from the repository root. Go is taken from the module's toolchain (`toolchai
 
 | Variable | Default | Used by |
 |---|---|---|
-| `PG_PORT` | `55432` | `itest`: loopback port for PostgreSQL |
+| `PG_PORT` | `55432` | `itest`, `cover-check`: loopback port for PostgreSQL |
+| `COVERAGE_MIN` | `91` | `cover-check`: minimum merged statement coverage, in percent. A regression guard: the 92.2% measured when the gate was added, rounded down, minus 1. Raise it when coverage rises. |
 | `STRIPE_MOCK_PORT` | `12111` | `stripe-mock-test`: loopback port for stripe-mock |
 | `FUZZTIME` | `10m` | `fuzz-long`: time per target |
 | `COMMIT_RANGE` | `origin/main..HEAD` | `commit-check` |
@@ -87,7 +91,7 @@ This table covers the variables a developer sets. `PAN_VAULT_TEST_RUN_MAIN` and 
 
 | Variable | Read by | Effect |
 |---|---|---|
-| `VAULT_TEST_DB_URL` | `integration_test.go` | Enables the `Integration` tests; set by `make itest`. |
+| `VAULT_TEST_DB_URL` | `integration_test.go`; the `cover` and `cover-check` targets | Enables the `Integration` tests; set by `make itest`. `make cover` adds the integration run when it is set; `make cover-check` uses it instead of starting a database. |
 | `VAULT_TEST_STRIPE_MOCK_URL` | `integration_test.go` | Enables `TestStripeMock`; set by `make stripe-mock-test`. |
 | `VAULT_TEST_STRIPE_SECRET` | `integration_test.go` | Enables `TestStripeLive` against the real Stripe test-mode API when it starts with `sk_test_`. Never printed. |
 
@@ -175,13 +179,14 @@ That is: a type, an optional scope of lowercase letters, digits and hyphens, an 
 
 ## GitHub Actions workflows
 
-All workflows run on `ubuntu-latest` with `permissions: contents: read` and check out without persisted credentials. Every job except `commits` installs Go from `go.mod` with `actions/setup-go@v5`.
+All workflows run on `ubuntu-latest` with `permissions: contents: read` and check out without persisted credentials. The one exception is the Integration workflow's `badge` job, which has `contents: write` at job level for the badge push described below. It runs only on a push to `main`, after `integration` passed, and runs no repository code: it does not check out the repository. Every job except `commits` and `badge` installs Go from `go.mod` with `actions/setup-go@v5`.
 
 | Workflow | File | Triggers | Job | Steps | Timeout |
 |---|---|---|---|---|---|
 | CI | `ci.yml` | push to `main`; `pull_request` (`opened`, `synchronize`, `reopened`, `edited`) | `ci` | Full-history checkout, Go, Node 22 (`actions/setup-node@v4`, for `mermaid-check`), `make ci` | 30 min |
 | CI | `ci.yml` | same | `commits` | `make commit-check` over the event's range; on pull requests, the title check below | 5 min |
-| Integration | `integration.yml` | push to `main`; `pull_request` | `integration` | Install `postgresql-client` and `curl`, `make itest`, `make stripe-mock-test` | 30 min |
+| Integration | `integration.yml` | push to `main`; `pull_request` | `integration` | Install `postgresql-client` and `curl`, `make itest`, `make stripe-mock-test`, `make cover-check` (enforces `COVERAGE_MIN` on the merged unit+integration figure), `make cover-html`; the 15 least-covered functions, the total and `cover/summary.txt` go to the job summary, and `cover/cover.out`, `cover/cover.html` and `cover/summary.txt` are uploaded as artifact `coverage` (14 days). | 30 min |
+| Integration | `integration.yml` | push to `main` only (`needs: integration`) | `badge` | Downloads artifact `coverage` and publishes the coverage badge from `summary.txt` (see below). No checkout, no Go. Not a required check. | 5 min |
 | Image | `image.yml` | push to `main`; `pull_request` | `image` | `make image-repro`, then `make image`; the last output line must match `^sha256:[0-9a-f]{64}$` and is uploaded as artifact `image-digest` (`image-digest.txt`) | 30 min |
 | Fuzz | `fuzz.yml` | `pull_request`; schedule `0 3 * * *` (03:00 UTC daily) | `fuzz` | `make fuzz` on pull requests, `make fuzz-long` on the schedule; on failure, `testdata/fuzz` is uploaded as artifact `fuzz-crashers` | 120 min |
 
@@ -209,6 +214,10 @@ so the title plus suffix must fit the 72-character subject rule. The title is pa
 |---|---|---|
 | CI | per pull request ref; per run for pushes | pull requests only; every push to `main` keeps its run |
 | Integration, Image, Fuzz | per ref | yes |
+
+### Coverage badge
+
+On a push to `main`, after the `integration` job passed, the `badge` job reads the merged figure from `summary.txt` in the `coverage` artifact, writes `coverage.json`, a [shields.io endpoint](https://shields.io/badges/endpoint-badge) file such as `{"schemaVersion":1,"label":"coverage","message":"92.2%","color":"brightgreen"}`, and force-pushes it as the only file of a fresh one-commit orphan branch `coverage-badge`, committed as `github-actions[bot]`. The push URL carries the job's token, used in that step only. The colour is `brightgreen` from 90%, `green` from 80, `yellow` from 70, `orange` from 60, otherwise `red`. The README badge reads the file from `raw.githubusercontent.com`; no third-party coverage service is involved. Branch protection applies to `main` only, so this push needs no exception.
 
 ### Required checks
 
