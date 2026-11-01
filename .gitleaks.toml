@@ -27,8 +27,10 @@ regexes = [
   '''^sk_test_placeholder$''',
   # Value returned by the fake Secret Manager for the prod Adyen account in the boot tests.
   '''^sm_adyen_br_live_v1$''',
-  # A fixed vault card token (tok_ + 32 hex) used by the policy tests; not a credential.
-  '''^tok_0123456789abcdef0123456789abcdef$''',
+  # Vault card tokens (tok_ + 32 hex): the fixed one the policy tests use, and the ones the
+  # tutorial shows from a throwaway local run. A token is a database key the vault hands out; it
+  # opens nothing without the vault's mTLS listener and velocity limits, so it is not a credential.
+  '''^tok_[0-9a-f]{32}$''',
   # The Ed25519 public key of the fixed dev receipt seed 00…03, as the boot log prints it in the
   # documentation's examples. A public key, derived from a published dev value.
   '''^84FibkHnAn6kMb_jAJ6UvdJadGvuxGiUjWw8fF3JpUs$''',
