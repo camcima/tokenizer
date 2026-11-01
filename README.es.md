@@ -676,7 +676,7 @@ El vault es tan seguro como el entorno en el que corre. Debe estar en sus propio
 | `pci-keys-<env>` | Key ring de Cloud KMS con la key-encryption key protegida por HSM. |
 | `pci-logs` | Sink de logs de auditoría con Bucket Lock, retenido durante al menos un año. |
 
-Las políticas de organización en la carpeta `pci` prohíben las IPs externas y la creación de claves de service account, y exigen Shielded VMs y CMEK. No hay IAM humano permanente en el proyecto del CDE: el acceso break-glass está acotado en el tiempo y pasa por Access Approval.
+Las políticas de organización en la carpeta `pci` prohíben las IPs externas, la creación de claves de service account, y las IPs públicas y las authorized networks de Cloud SQL (`sql.restrictPublicIp`, `sql.restrictAuthorizedNetworks`), y exigen Shielded VMs y CMEK. No hay IAM humano permanente en el proyecto del CDE. El acceso break-glass es un entitlement de Privileged Access Manager en ese proyecto: nombra los roles que otorga, los aprobadores y cuántos deben aprobar, exige una justificación, y limita la duración del grant. Sus audit logs (`privilegedaccessmanager.googleapis.com`) registran el ciclo de vida del entitlement y del grant y van al sink `pci-logs`; lo que se hace bajo un grant lo registran los servicios afectados, así que sus Data Access audit logs deben estar habilitados. Las IAM Conditions con vencimiento son solo una alternativa más débil, sin paso de aprobación ni de justificación. Access Approval no aplica aquí: gobierna el acceso del personal de Google a los Customer Data, no el del propio personal del cliente.
 
 **Rotación de claves:**
 
@@ -1053,4 +1053,4 @@ func exactKeys(payload []byte) bool {
 | **Token de sesión** | Un ticket HMAC de corta duración que la plataforma le da al navegador para que pueda llamar a `/tokenize`. |
 | **Token** | Un sustituto aleatorio de una tarjeta (`tok_` + 32 caracteres hexadecimales). No sirve de nada fuera del vault. |
 | **Límite de velocidad** | Un tope a la frecuencia con la que se pueden buscar tarjetas, para impedir la extracción masiva. |
-| **VPC-SC** | VPC Service Controls: un perímetro de Google Cloud que impide que los datos salgan de un conjunto de proyectos. |
+| **VPC-SC** | VPC Service Controls: un perímetro de Google Cloud que impide que los datos salgan de un conjunto de proyectos a través de las APIs de Google Cloud (no gobierna las conexiones a la base de datos). |

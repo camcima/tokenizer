@@ -122,14 +122,26 @@ Each catalog account names its credentials in its `secrets` map (for example `st
 
 **Steps, new CA key:**
 
-1. Issue new client certificates from the new CA to every platform service allowed to call `/proxy`, and nothing else.
-2. Give each platform client both certificates and let it present the one the server asks for. In TLS 1.3 the vault's listener names its trusted CA in the handshake, and a Go client can choose with `tls.Config.GetClientCertificate` and `CertificateRequestInfo.AcceptableCAs`. Without this, expect failed `/proxy` handshakes on instances that hold the other CA during the restart.
-3. Replace the file with the new CA on the instances and restart them one at a time.
-4. Once every instance runs the new CA, remove the old certificates from the platform clients and retire the old CA.
+The new CA must have a subject distinct from the old CA's, for example a generation suffix in the common name (`CN=Platform Client CA G2` after `CN=Platform Client CA G1`). A client holding two certificates chooses by name only: the listener names its CA's subject in the handshake, and a Go client sends the first chain in `tls.Config.Certificates` in which any certificate's issuer equals that name byte for byte, so two CAs with one subject cannot be told apart and a rolling restart fails `/proxy` handshakes on the instances that hold the other CA. For the same reason, do not include cross-signed CA certificates in client chains. If the new CA cannot have a distinct subject, use the coordinated switch below. Why the internal listener requires a client certificate at all is in the [threat model](../explanation/threat-model.md#listener-isolation-why-an-internet-attacker-cannot-reach-proxy).
+
+1. Issue the new CA with a distinct subject, then issue new client certificates from it to every platform service allowed to call `/proxy`, and nothing else.
+2. Verify the selection in staging before any production client holds both certificates, with the platform's own client code (a `curl` with one certificate does not test it): run one instance with the old CA and one with the new CA, and from a client holding both certificates call `GET /healthz` on each. Both must return `200`, and the access lines must show the serial of the old certificate on the first instance and of the new one on the second (`req listener=internal method=GET path=/healthz status=200 … caller=<serial>`). Repeat for every client stack in use. A failed handshake writes no vault log line; it shows only on the client.
+3. Give each production client both certificates, with the old chain first in `tls.Config.Certificates` until the restart in step 4 is complete. A client whose selection does not work then keeps sending the old chain, which every instance accepts until step 4 begins, instead of failing at once on every instance; step 2 is what catches it. A client on another TLS stack needs equivalent selection.
+4. Replace the file with the new CA on the instances and restart them one at a time.
+5. Once every instance runs the new CA, remove the old certificates from the platform clients and retire the old CA.
+
+**Steps, new CA key with the same subject (coordinated switch):**
+
+A rolling restart cannot work, because clients cannot tell the two CAs apart. Switch every client and every instance together and accept a short outage: `/tokenize` too while the instances restart, `/proxy` until both sides run the new CA.
+
+1. Issue new client certificates from the new CA to every platform service allowed to call `/proxy`, and nothing else. Do not install them yet.
+2. Agree a window with the platform teams. During it `/proxy` calls fail at the TLS handshake, so callers must retry after the window or pause the flows that need `/proxy`.
+3. In the window, put the new CA file where the instance template takes it from ([Deploy on Google Cloud](deploy-on-gcp.md), step 5) and replace every instance at once, for example a rolling replace of the managed instance group with a maximum unavailable of 100%. A replace recreates each VM from the template, so a file edited on a running instance is lost. At the same time, switch every platform client to the new certificate only.
+4. Retire the old CA once `/proxy` calls succeed again from every platform service.
 
 **Verify:** after each restart, the readiness monitor gets `200 {"status":"ok"}` from `GET /healthz` with a certificate from the new CA, and `/proxy` access lines show the serials of the new certificates (`req listener=internal … caller=<serial>`). A handshake rejected for an untrusted certificate never reaches a handler, so it writes no log line: watch the platform's own error rate. A bad CA file logs `boot failed: VAULT_CLIENT_CA: client CA: …`.
 
-**Rollback:** put the previous CA file back and restart. Platform clients must still hold certificates from that CA.
+**Rollback:** put the previous CA file back and restart. Platform clients must still hold certificates from that CA. After a coordinated switch, roll back the same way: every instance and every client together.
 
 ## TLS server certificate
 
@@ -139,12 +151,14 @@ One certificate and key (`VAULT_CERT`, `VAULT_KEY`) serve both listeners (`newSe
 
 **Steps:**
 
-1. Issue the new certificate from a CA the platform clients and the load balancer already trust, with the names they connect to.
-2. Replace both files on each instance (readable by UID 65532) and restart the instances one at a time. The pair is loaded once, at boot.
+1. Issue the new certificate with the names the platform clients and the load balancer connect to, including the name in the backend service's `tlsSettings.sni`. The platform clients must trust its issuing CA, and so must the load balancer: it trusts only the CAs in the Certificate Manager trust config named by its backend authentication config ([Deploy on Google Cloud](deploy-on-gcp.md), step 6), never a CA implicitly.
+2. If the issuing CA (or an intermediate) is new, add it to that trust config first, keeping the old one, and to the platform clients' trust stores. Until the trust config holds it, the load balancer answers `502` for every request routed to an instance with the new certificate.
+3. Replace both files on each instance (readable by UID 65532) and restart the instances one at a time. The pair is loaded once, at boot.
+4. Once every instance serves the new certificate, remove a CA that no longer issues the vault certificate from the trust config.
 
-**Verify:** each instance reaches `ready`; a mismatched or unreadable pair logs `boot failed: VAULT_CERT/VAULT_KEY: cannot load key pair`. Check the served certificate's dates from inside the platform VPC, for example with `openssl s_client -connect <internal-address>:9443 -cert monitor.pem -key monitor.key </dev/null | openssl x509 -noout -dates`, and confirm the readiness monitor still gets `200`.
+**Verify:** each instance reaches `ready`; a mismatched or unreadable pair logs `boot failed: VAULT_CERT/VAULT_KEY: cannot load key pair`. Check the served certificate's dates from inside the platform VPC, for example with `openssl s_client -connect <internal-address>:9443 -cert monitor.pem -key monitor.key </dev/null | openssl x509 -noout -dates`, and confirm the readiness monitor still gets `200`. From the internet, `POST https://<public>/tokenize` without a session token must still return the vault's `401` or `403`, not the load balancer's `502`.
 
-**Rollback:** put the previous files back and restart, as long as the previous certificate is still valid.
+**Rollback:** put the previous files back and restart, as long as the previous certificate is still valid and the trust config still holds its issuing CA.
 
 ## See also
 

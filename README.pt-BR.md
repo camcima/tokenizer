@@ -676,7 +676,7 @@ O vault só é tão seguro quanto o ambiente em que roda. Ele pertence a projeto
 | `pci-keys-<env>` | Key ring do Cloud KMS com a chave de criptografia de chaves protegida por HSM. |
 | `pci-logs` | Sink de audit logs com Bucket Lock, retidos por pelo menos um ano. |
 
-As org policies na pasta `pci` proíbem IPs externos e a criação de chaves de service account, e exigem Shielded VMs e CMEK. Não há IAM humano permanente no projeto do CDE: o acesso break-glass tem tempo limitado e passa pelo Access Approval.
+As org policies na pasta `pci` proíbem IPs externos, a criação de chaves de service account, e IPs públicos e authorized networks do Cloud SQL (`sql.restrictPublicIp`, `sql.restrictAuthorizedNetworks`), e exigem Shielded VMs e CMEK. Não há IAM humano permanente no projeto do CDE. O acesso break-glass é um entitlement do Privileged Access Manager nesse projeto: ele nomeia os roles que concede, os aprovadores e quantos precisam aprovar, exige uma justificativa, e limita a duração do grant. Seus audit logs (`privilegedaccessmanager.googleapis.com`) registram o ciclo de vida do entitlement e do grant e vão para o sink `pci-logs`; o que é feito sob um grant é registrado pelos serviços afetados, então os Data Access audit logs deles precisam estar habilitados. IAM Conditions com expiração são apenas uma alternativa mais fraca, sem etapa de aprovação nem de justificativa. O Access Approval não se aplica aqui: ele governa o acesso da equipe do Google aos Customer Data, não o da equipe do próprio cliente.
 
 **Rotação de chaves:**
 
@@ -1053,4 +1053,4 @@ func exactKeys(payload []byte) bool {
 | **Token de sessão** | Uma ficha HMAC de curta duração que a plataforma entrega ao navegador para que ele possa chamar `/tokenize`. |
 | **Token** | Um substituto aleatório para um cartão (`tok_` + 32 caracteres hexadecimais). Não vale nada fora do vault. |
 | **Limite de velocidade** | Um teto para a frequência com que cartões podem ser consultados, para impedir a extração em massa. |
-| **VPC-SC** | VPC Service Controls: um perímetro do Google Cloud que impede que dados saiam de um conjunto de projetos. |
+| **VPC-SC** | VPC Service Controls: um perímetro do Google Cloud que impede que dados saiam de um conjunto de projetos através das APIs do Google Cloud (não governa as conexões ao banco de dados). |

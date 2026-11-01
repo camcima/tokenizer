@@ -150,10 +150,16 @@ A healthy boot logs, in order: `config loaded env=prod`, `deks loaded versions=�
 
 ### 6. Build the public front door (port 8443)
 
-1. Create an external HTTPS load balancer whose only backend is the instance group's port 8443, using HTTPS to the backend.
-2. Attach a Cloud Armor policy with rate limiting on `/tokenize`.
-3. The public listener accepts only TLS 1.3. Confirm that the load balancer's connection to the backend negotiates TLS 1.3; otherwise every request fails, and a TCP health check does not show it.
-4. Do not route any other port to this backend service.
+1. Create a global external Application Load Balancer whose only backend is the instance group's port 8443, with HTTPS as the backend service protocol. Not the classic Application Load Balancer: it cannot authenticate its backends (sub-step 2).
+2. Make the load balancer authenticate the vault: by default it accepts any certificate a backend presents, so HTTPS alone encrypts this hop without proving that the backend is the vault ([threat model](../explanation/threat-model.md#listener-isolation-why-an-internet-attacker-cannot-reach-proxy)). Configure backend authenticated TLS:
+   1. Create a Certificate Manager trust config in location `global` whose trust store holds the root CA of the `VAULT_CERT` chain under `trustAnchors` and, if an intermediate CA issued `VAULT_CERT`, that intermediate under `intermediateCas`, and nothing else: `gcloud certificate-manager trust-configs import vault-backend-trust --source=trust_config.yaml --location=global`.
+   2. Create a backend authentication config that references the trust config, with `wellKnownRoots: NONE` so that certificates from public CAs are not also accepted: `gcloud network-security backend-authentication-configs import vault-backend-auth --source=backend_auth.yaml --location=global`.
+   3. Set the backend service's TLS settings: `tlsSettings.authenticationConfig` names the backend authentication config, and `tlsSettings.sni` is a DNS name in the vault certificate, so the load balancer also checks the name. Apply it with `gcloud compute backend-services export … --global`, edit the file, then `gcloud compute backend-services import … --global`.
+3. Run the negative test in staging, with the same trust config and backend service settings: put a backend behind the load balancer that presents a certificate from a CA not in the trust config (for example a self-signed certificate with the same name). `curl -s -o /dev/null -w '%{http_code}' -X POST https://<staging-public>/tokenize` must return `502`, not the vault's own `403` or `401`, and the load balancer's request log entry must give `ssl_certificate_verification_failed` as the reason. A request log exists only with logging enabled on the backend service (`gcloud compute backend-services update <backend-service> --enable-logging --global`). The health check does not show this: health check probers do not validate backend certificates against a trust config, and these checks are plain TCP anyway (step 10).
+4. Where backend authenticated TLS is not available for the load balancer type you chose, the hop from the load balancer to the vault relies on Google's network controls (the traffic stays on Google's network, and the firewall admits 8443 only from the load balancer's proxy ranges), not on a certificate check. The CDE owner must accept that in writing before the first production deploy.
+5. Attach a Cloud Armor policy with rate limiting on `/tokenize`.
+6. The public listener accepts only TLS 1.3. Confirm that the load balancer's connection to the backend negotiates TLS 1.3; otherwise every request fails, and a TCP health check does not show it.
+7. Do not route any other port to this backend service.
 
 The vault itself rejects a wrong `Origin` (`403`), a missing or bad session token (`401`) and any path but `/tokenize` (`404`), but it cannot rate-limit by client: that is Cloud Armor's job.
 
@@ -179,9 +185,22 @@ All of these are required configuration.
 
 The VMs have no external IPs (an org policy denies them), so provider traffic leaves through NAT. It cannot go through an HTTP forward proxy: the vault ignores proxy settings. The `prod` egress rule allows only `prod` hosts.
 
-### 9. Draw the VPC Service Controls perimeter
+### 9. Draw the VPC Service Controls perimeter and close the database's network path
 
-Put `pci-cde-<env>` and `pci-keys-<env>` in a VPC Service Controls perimeter that covers the services the vault uses (for example Cloud KMS, Secret Manager and Cloud SQL), so data in those services cannot be read from outside the perimeter.
+A VPC Service Controls perimeter restricts calls to Google Cloud APIs. It does not govern connections to the database: a Postgres connection to the Cloud SQL instance's IP address is not an API call, so the perimeter does not see it, whether the address is private or public. The database's network path needs its own controls.
+
+1. Put `pci-cde-<env>` and `pci-keys-<env>` in a VPC Service Controls perimeter that restricts the APIs the vault and its operators use: Cloud KMS, Secret Manager and the Cloud SQL Admin API, plus Cloud Storage, which Cloud SQL imports and exports go through. Calls to these APIs from outside the perimeter are refused, so keys, secrets and Cloud SQL administrative operations such as exports and clones cannot be reached from outside it.
+2. Enable VPC Service Controls on the private services access peering: `gcloud services vpc-peerings enable-vpc-service-controls --network=<cde-vpc> --service=servicenetworking.googleapis.com`. It removes the default internet route from the service producer network that holds the instance and sends Google API traffic from there to the restricted VIP, so the producer side reaches only the APIs the perimeter allows. Keep custom route export off on that peering, or a default route from the CDE VPC can be imported back.
+3. Give the Cloud SQL instance no public IP, and enforce the org policy constraint `constraints/sql.restrictPublicIp` on the `pci` folder. The constraint is not retroactive: confirm on the instance itself that public IP is off.
+4. Enforce `constraints/sql.restrictAuthorizedNetworks` on the same folder, and confirm that the instance has no authorized networks. This constraint is not retroactive either.
+5. Connect the instance by private IP through private services access in the CDE VPC. Cloud SQL accepts private-IP connections from RFC 1918 ranges without an authorized-network entry, so what can route to the allocated range is the network control on this path. VPC peering is not transitive: a VPC peered with the CDE VPC cannot reach the producer network. The exposure is elsewhere: a Cloud VPN tunnel or Cloud Interconnect attachment whose Cloud Router advertises the allocated range, and Shared VPC, where every service project attached to the CDE VPC is on the same network. Advertise no such route and attach no service projects.
+6. The egress rule for 5432 in step 8 limits which CDE hosts can connect only if the CDE VPC also has an egress rule that denies everything else: the implied egress rule allows all egress. Allow 5432 to the instance's private IP from the vault VMs and from the host that runs `vault -rotate-dek` (step 4), for example by target service account, and from nothing else.
+7. Keep the vault's own checks on: in `prod` it logs in with IAM database authentication and refuses to boot unless every connection verifies the server certificate (`openDB` in `main.go`, step 2).
+8. List what is connected to the CDE VPC:
+   - `gcloud compute networks peerings list --network=<cde-vpc>`: on the `servicenetworking-googleapis-com` peering, custom route export must be off;
+   - `gcloud compute vpn-tunnels list` and `gcloud compute interconnects attachments list`, and for each Cloud Router behind them, `gcloud compute routers describe` must not advertise the allocated range;
+   - `gcloud compute shared-vpc list-associated-resources <cde-project>` must list nothing.
+9. Run the negative test from every network that is connected, where a misconfiguration would show: the platform VPC, a temporary VM in another subnet of the CDE VPC running under a service account other than the vault's, any Shared VPC service project and any host behind a VPN tunnel or Interconnect attachment from the listing. A VM in an unrelated VPC proves nothing, because it has no route to the range anyway. From each, try `psql "host=<private-ip> port=5432 dbname=vault sslmode=verify-ca sslrootcert=server-ca.pem user=probe" -c 'select 1'`. The connection must fail before authentication, with a timeout or a refusal, not with a password or IAM error. `gcloud sql instances describe <instance> --format='value(settings.ipConfiguration.ipv4Enabled,settings.ipConfiguration.authorizedNetworks)'` must show `False` and no authorized networks.
 
 ### 10. Set up health checks and the readiness monitor
 
@@ -222,22 +241,24 @@ Every `ALERT` line must reach someone, at the severity [Respond to alerts](respo
 | # | Check | How | Enforced by |
 |---|---|---|---|
 | 1 | Only port 8443 is behind the external load balancer | Backend service configuration | Configuration |
-| 2 | `GET https://<public>/proxy` is `404` from the internet | Probe in step 11 | Code (route) and configuration (LB) |
-| 3 | Port 9443 is unreachable from the internet | Probe in step 11; no external forwarding rule targets 9443 | Configuration |
-| 4 | The internal front door is passthrough and reachable only from the platform VPC | Load balancer and PSC configuration | Configuration |
-| 5 | A connection to 9443 without a client certificate fails the handshake | Probe in step 11 | Code (`RequireAndVerifyClientCert`) |
-| 6 | `/proxy` access lines carry `caller=<serial>` of a platform certificate | Access log | Code |
-| 7 | Ingress rules allow 8443 and 9443 only from their front door and health-check ranges | Firewall rules | Configuration |
-| 8 | Egress allows only the providers in `egress-hosts.<env>.txt`, Google APIs and Cloud SQL | Firewall rules diffed against the file | Configuration (the file itself is checked against the catalog by `TestEgressHostsMatchCatalog`) |
-| 9 | Projects are inside the VPC-SC perimeter | Perimeter configuration | Configuration |
-| 10 | `VAULT_ENV=prod` | Instance template. A `dev` value also boots, and skips the database TLS check | Configuration |
-| 11 | No `VAULT_DEV_*` variable, `VAULT_DB_URL` with `sslmode=verify-ca` | The vault refuses to boot otherwise | Code, only once `VAULT_ENV=prod` |
-| 12 | Serving account cannot read tables or call `add_dek` | Smoke test in step 2 | Database grants |
-| 13 | At least one DEK exists | Boot line `deks loaded versions=… current=…` | Code |
-| 14 | Session HMAC key and receipt seed are exactly 64 hex characters | The vault boots | Code |
-| 15 | The platform accepts the receipt public key logged at boot | Compare `receipt public key=…` with the platform's configuration | Configuration |
-| 16 | The readiness monitor gets `200 {"status":"ok"}` over mTLS | Monitor in step 10 | Code and configuration |
-| 17 | Every `ALERT` line reaches someone at its runbook severity | Log-based alerting | Configuration |
+| 2 | The external load balancer authenticates the vault's certificate, or the CDE owner has accepted in writing that it does not | Backend service `tlsSettings.authenticationConfig`, a trust config holding only the CAs that issue the vault certificate, `wellKnownRoots: NONE`; the negative test in step 6 returns `502` | Configuration |
+| 3 | `GET https://<public>/proxy` is `404` from the internet | Probe in step 11 | Code (route) and configuration (LB) |
+| 4 | Port 9443 is unreachable from the internet | Probe in step 11; no external forwarding rule targets 9443 | Configuration |
+| 5 | The internal front door is passthrough and reachable only from the platform VPC | Load balancer and PSC configuration | Configuration |
+| 6 | A connection to 9443 without a client certificate fails the handshake | Probe in step 11 | Code (`RequireAndVerifyClientCert`) |
+| 7 | `/proxy` access lines carry `caller=<serial>` of a platform certificate | Access log | Code |
+| 8 | Ingress rules allow 8443 and 9443 only from their front door and health-check ranges | Firewall rules | Configuration |
+| 9 | Egress allows only the providers in `egress-hosts.<env>.txt`, Google APIs and Cloud SQL | Firewall rules diffed against the file | Configuration (the file itself is checked against the catalog by `TestEgressHostsMatchCatalog`) |
+| 10 | Projects are inside the VPC-SC perimeter, which restricts Cloud KMS, Secret Manager, the Cloud SQL Admin API and Cloud Storage | Perimeter configuration | Configuration |
+| 11 | Cloud SQL has no public IP and no authorized networks, and its private IP is reachable only from the CDE VPC | `gcloud sql instances describe`; `constraints/sql.restrictPublicIp` and `constraints/sql.restrictAuthorizedNetworks` enforced; the peering, VPN, Interconnect and Shared VPC listings in step 9; the negative test in step 9 fails to connect from every connected network | Configuration and org policy |
+| 12 | `VAULT_ENV=prod` | Instance template. A `dev` value also boots, and skips the database TLS check | Configuration |
+| 13 | No `VAULT_DEV_*` variable, `VAULT_DB_URL` with `sslmode=verify-ca` | The vault refuses to boot otherwise | Code, only once `VAULT_ENV=prod` |
+| 14 | Serving account cannot read tables or call `add_dek` | Smoke test in step 2 | Database grants |
+| 15 | At least one DEK exists | Boot line `deks loaded versions=… current=…` | Code |
+| 16 | Session HMAC key and receipt seed are exactly 64 hex characters | The vault boots | Code |
+| 17 | The platform accepts the receipt public key logged at boot | Compare `receipt public key=…` with the platform's configuration | Configuration |
+| 18 | The readiness monitor gets `200 {"status":"ok"}` over mTLS | Monitor in step 10 | Code and configuration |
+| 19 | Every `ALERT` line reaches someone at its runbook severity | Log-based alerting | Configuration |
 
 ## See also
 
